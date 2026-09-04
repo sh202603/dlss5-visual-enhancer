@@ -1,4 +1,4 @@
-"""``dlss5`` command-line entry point.
+"""``dlss5ve-cli`` command-line entry point.
 
 Conventions:
 - stdout is reserved for machine-readable output (``--json`` payloads, ``info``).
@@ -80,7 +80,7 @@ def _add_common(parser: argparse.ArgumentParser, settings: UISettings) -> None:
     )
     group.add_argument(
         "--ai-gpu", metavar="UUID", default=settings.ai_gpu_uuid,
-        help="AI Processing GPU UUID from 'dlss5 info', or auto (default: %(default)s).",
+        help="AI Processing GPU UUID from 'dlss5ve-cli info', or auto (default: %(default)s).",
     )
     group.add_argument(
         "--video-gpu", metavar="UUID", default=settings.video_gpu_uuid,
@@ -128,7 +128,7 @@ def _add_naming(parser: argparse.ArgumentParser, mode: str, suffix: str) -> None
 
 def build_parser(settings: UISettings) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="dlss5",
+        prog="dlss5ve-cli",
         description="DLSS 5 Visual Enhancer command line: Neural Rendering for images and videos, and DLSS Frame Generation.",
         epilog="Defaults come from config.ini (or --preset). Exit codes: 0 ok, 1 some inputs failed, 2 usage, 3 runtime/GPU unavailable, 130 interrupted.",
     )
@@ -520,7 +520,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         settings = _load_settings(argv)
     except UsageError as exc:
-        sys.stderr.write(f"dlss5: error: {exc}\n")
+        sys.stderr.write(f"dlss5ve-cli: error: {exc}\n")
         return EXIT_USAGE
     parser = build_parser(settings)
     args = parser.parse_args(argv)
@@ -546,15 +546,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         return EXIT_CANCELLED
     except UsageError as exc:
         reporter.finish()
-        sys.stderr.write(f"dlss5: error: {exc}\n")
+        sys.stderr.write(f"dlss5ve-cli: error: {exc}\n")
         return EXIT_USAGE
     except (ValueError, FileNotFoundError, TypeError) as exc:
         reporter.finish()
-        sys.stderr.write(f"dlss5: error: {exc}\n")
+        sys.stderr.write(f"dlss5ve-cli: error: {exc}\n")
         return EXIT_USAGE
     except RuntimeError as exc:
         reporter.finish()
-        sys.stderr.write(f"dlss5: runtime error: {exc}\n")
+        sys.stderr.write(f"dlss5ve-cli: runtime error: {exc}\n")
         return EXIT_RUNTIME
     except Exception:
         reporter.finish()

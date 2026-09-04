@@ -25,7 +25,7 @@ webui = [
 ]
 
 [project.scripts]
-dlss5 = "dlss5ve.cli.main:main"
+dlss5ve-cli = "dlss5ve.cli.main:main"
 
 [build-system]
 requires = ["setuptools>=77"]
