@@ -6,7 +6,7 @@ from pathlib import Path
 import time as _early_time
 
 try:
-    from src.core.terminal import TerminalUI as _EarlyTerminalUI
+    from dlss5ve.core.terminal import TerminalUI as _EarlyTerminalUI
 
     _early_ui = _EarlyTerminalUI(Path(__file__).with_name("logs"))
     _early_ui.enable_vt_mode()
@@ -19,21 +19,21 @@ except Exception:
 
 import gradio as gr
 
-from src.core.cache_cleanup import (
+from dlss5ve.core.cache_cleanup import (
     CACHE_MAX_AGE_SECONDS,
     CACHE_SWEEP_INTERVAL_SECONDS,
     cleanup_old_caches,
 )
-from src.core.dlss_architecture import apply_dlss_architecture, init_dlssnr_runtime
-from src.core.paths import LIVE_DIR, LOGS, OUTPUTS
-from src.core.runtime import prepare_runtime
-from src.core.terminal import init_console
-from src.frame_interpolation.ui import build_frame_interpolation_tab
-from src.image.decoder import initialize_image_runtime
-from src.image.ui import build_image_tab
-from src.live.ui import build_live_tab
-from src.settings.ui import bind_settings_events, build_settings_tab, initialize_settings
-from src.video.ui import build_video_tab
+from dlss5ve.core.dlss_architecture import apply_dlss_architecture, init_dlssnr_runtime
+from dlss5ve.core.paths import LIVE_DIR, LOGS, OUTPUTS
+from dlss5ve.core.runtime import prepare_runtime
+from dlss5ve.core.terminal import init_console
+from dlss5ve.frame_interpolation.ui import build_frame_interpolation_tab
+from dlss5ve.image.decoder import initialize_image_runtime
+from dlss5ve.image.ui import build_image_tab
+from dlss5ve.live.ui import build_live_tab
+from dlss5ve.settings.ui import bind_settings_events, build_settings_tab, initialize_settings
+from dlss5ve.video.ui import build_video_tab
 
 APP_CSS = r"""
 /* Keep the header links identical even when one URL has been visited. */
@@ -159,7 +159,7 @@ def main() -> None:
     LIVE_DIR.mkdir(exist_ok=True)
     # Drop leftover Live session dirs from dead runs (previous process is gone).
     try:
-        from src.live.pipeline import sweep_stale_live_dirs
+        from dlss5ve.live.pipeline import sweep_stale_live_dirs
 
         sweep_stale_live_dirs()
     except Exception:
