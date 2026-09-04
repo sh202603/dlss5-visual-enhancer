@@ -9,9 +9,9 @@ from ..core.ffmpeg.preview import (
     is_browser_playable, make_browser_preview, normalize_preview_encoding,
     resolve_final_preview, resolve_preview_codec, wants_compat_preview,
 )
-from ..settings.models import coerce_hdr_mode, parse_automatic_mask
-from ..settings.storage import current_preview_encoding, processing_gpu_settings
-from .models import ConversionOptions
+from ..settings.factory import video_options
+from ..settings.models import parse_automatic_mask
+from ..settings.storage import current_preview_encoding, current_settings
 from .processor import convert_video
 
 PREVIEW_SECONDS = 3.0
@@ -38,7 +38,7 @@ def _process_video(
     if not input_path:
         raise gr.Error("Choose a video first.")
     is_preview = preview_seconds is not None or preview_frames is not None
-    ai_gpu_uuid, video_gpu_uuid = processing_gpu_settings()
+    settings = current_settings()
     try:
         preview_mode = current_preview_encoding()
     except Exception:
@@ -52,14 +52,11 @@ def _process_video(
     else:
         effective_codec, effective_container = codec, container
         compat_preview = False
-    # HDR Mode only for allowed codecs. Compat (forced H.264) previews stay SDR
-    # 8-bit; user-encoded previews preserve the HDR choice.
-    effective_hdr = coerce_hdr_mode(effective_codec, hdr_mode) and (
-        not is_preview or not compat_preview
-    )
-    options = ConversionOptions(
-        ai_gpu_uuid=ai_gpu_uuid,
-        video_gpu_uuid=video_gpu_uuid,
+    # HDR Mode only for allowed codecs (the factory coerces it against the
+    # effective codec). Compat (forced H.264) previews stay SDR 8-bit;
+    # user-encoded previews preserve the HDR choice.
+    options = video_options(
+        settings,
         nr_preset=nr_preset,
         nr_style=nr_style,
         nr_intensity=nr_intensity,
@@ -72,7 +69,10 @@ def _process_video(
         codec=effective_codec,
         container=effective_container,
         quality=quality,
-        preserve_hdr=effective_hdr,
+        hdr_mode=hdr_mode and (not is_preview or not compat_preview),
+        # Previews always use Auto naming so they never collide with a final render.
+        rename_mode="Auto",
+        custom_suffix="_DLSS5",
         preview_seconds=preview_seconds,
         preview_frames=preview_frames,
         preview_compat=compat_preview,

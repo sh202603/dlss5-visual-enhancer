@@ -11,13 +11,13 @@ from ..core.ffmpeg import hdr_mode_supported
 from ..core.ffmpeg.preview import normalize_preview_encoding, resolve_final_preview
 from ..core.naming import RENAME_MODES
 from ..core.runtime import DLSS_MODEL_PRESETS, NR_PRESETS, NR_STYLES, UPSCALING_MODES
+from ..settings.factory import video_options
 from ..settings.models import (
     AUTOMATIC_MASK_CHOICES, CODEC_CHOICES, CONTAINER_CHOICES, QUALITY_CHOICES, UISettings,
-    automatic_mask_choice, coerce_hdr_mode, parse_automatic_mask,
+    automatic_mask_choice, parse_automatic_mask,
 )
-from ..settings.storage import current_preview_encoding, processing_gpu_settings
+from ..settings.storage import current_preview_encoding, current_settings
 from .batch import convert_videos
-from .models import ConversionOptions
 from .preview import (
     _process_video, normalize_video_paths, preview_one_frame, preview_video, update_video_preview_mode,
 )
@@ -142,10 +142,8 @@ def render_video_batch(
     paths = normalize_video_paths(input_paths)
     if not paths:
         raise gr.Error("Choose at least one video first.")
-    effective_hdr = coerce_hdr_mode(codec, hdr_mode)
-    options = ConversionOptions(
-        ai_gpu_uuid=processing_gpu_settings()[0],
-        video_gpu_uuid=processing_gpu_settings()[1],
+    options = video_options(
+        current_settings(),
         nr_preset=nr_preset,
         nr_style=nr_style,
         nr_intensity=nr_intensity,
@@ -158,7 +156,7 @@ def render_video_batch(
         codec=codec,
         container=container,
         quality=quality,
-        preserve_hdr=effective_hdr,
+        hdr_mode=hdr_mode,
         rename_mode=rename_mode,
         custom_suffix=custom_suffix,
     )

@@ -278,9 +278,14 @@ class _SettingsState:
 SETTINGS_STATE = _SettingsState()
 
 
-def processing_gpu_settings() -> tuple[str, str]:
+def current_settings() -> UISettings:
+    """Return the settings the UI last persisted, or config.ini when none were."""
     with SETTINGS_STATE.lock:
-        settings = SETTINGS_STATE.current or load_settings(CONFIG_PATH)
+        return SETTINGS_STATE.current or load_settings(CONFIG_PATH)
+
+
+def processing_gpu_settings() -> tuple[str, str]:
+    settings = current_settings()
     return settings.ai_gpu_uuid, settings.video_gpu_uuid
 
 

@@ -1,9 +1,23 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 
-ROOT = Path(__file__).resolve().parents[2]
+def _resolve_root() -> Path:
+    """Locate the checkout that carries bin/runtime and bin/ffmpeg.
+
+    The package normally lives inside that checkout (editable install or the
+    embedded interpreter), so the default is two levels above this file. When
+    the package is installed elsewhere, DLSS5VE_HOME must point at the checkout.
+    """
+    override = os.environ.get("DLSS5VE_HOME", "").strip()
+    if override:
+        return Path(override).expanduser().resolve()
+    return Path(__file__).resolve().parents[2]
+
+
+ROOT = _resolve_root()
 RUNTIME = ROOT / "bin" / "runtime"
 HOST_DIR = RUNTIME / "host"
 DLSS_DIR = RUNTIME / "dlss"

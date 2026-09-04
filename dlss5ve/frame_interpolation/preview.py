@@ -10,7 +10,8 @@ from ..core.ffmpeg.preview import (
     is_browser_playable, make_browser_preview, normalize_preview_encoding,
     resolve_preview_codec, wants_compat_preview,
 )
-from ..settings.storage import current_preview_encoding, processing_gpu_settings
+from ..settings.factory import frame_interpolation_options
+from ..settings.storage import current_preview_encoding, current_settings, processing_gpu_settings
 from .capabilities import probe_frame_interpolation_capabilities
 from .models import FrameInterpolationOptions
 from .processor import interpolate_video
@@ -117,14 +118,17 @@ def preview_frame_interpolation(
         codec, container, preview_mode
     )
     compat_preview = wants_compat_preview(codec, container, preview_mode)
-    options = FrameInterpolationOptions(
-        ai_gpu_uuid=processing_gpu_settings()[0],
-        video_gpu_uuid=processing_gpu_settings()[1],
+    # The preview never carried the HDR choice; keep it off as before.
+    options = frame_interpolation_options(
+        current_settings(),
         target_fps=target_fps,
         engine=engine,
         codec=effective_codec,
         container=effective_container,
         quality=quality,
+        hdr_mode=False,
+        rename_mode="Auto",
+        custom_suffix="_DLSSFG",
         preview_seconds=PREVIEW_SECONDS,
         preview_compat=compat_preview,
     )

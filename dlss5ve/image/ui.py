@@ -10,12 +10,13 @@ from PIL import Image
 
 from ..core.naming import RENAME_MODES
 from ..core.runtime import DLSS_MODEL_PRESETS, NR_PRESETS, NR_STYLES, UPSCALING_MODES
+from ..settings.factory import image_options
 from ..settings.models import AUTOMATIC_MASK_CHOICES, UISettings, automatic_mask_choice, parse_automatic_mask
-from ..settings.storage import processing_gpu_settings
+from ..settings.storage import current_settings
 from .decoder import decode_image
 from .encoder import take_image_preview
 from .batch import convert_images
-from .models import IMAGE_FORMATS, RAW_EXTENSIONS, ImageConversionOptions
+from .models import IMAGE_FORMATS, RAW_EXTENSIONS
 
 
 def rename_suffix_update(mode: str):
@@ -122,8 +123,8 @@ def render_image_batch(
         raise gr.Error("Choose at least one image first.")
     if isinstance(input_paths, str):
         input_paths = [input_paths]
-    options = ImageConversionOptions(
-        ai_gpu_uuid=processing_gpu_settings()[0],
+    options = image_options(
+        current_settings(),
         nr_preset=nr_preset,
         nr_style=nr_style,
         nr_intensity=nr_intensity,

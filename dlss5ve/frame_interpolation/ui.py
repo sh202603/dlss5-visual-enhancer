@@ -10,10 +10,11 @@ from ..core.batch_ui import BATCH_HEADERS, bind_batch_ui, build_path_controls
 from ..core.ffmpeg import hdr_mode_supported
 from ..core.ffmpeg.preview import normalize_preview_encoding, resolve_final_preview
 from ..core.naming import RENAME_MODES
-from ..settings.models import CODEC_CHOICES, CONTAINER_CHOICES, QUALITY_CHOICES, UISettings, coerce_hdr_mode
-from ..settings.storage import current_preview_encoding, processing_gpu_settings
+from ..settings.factory import frame_interpolation_options
+from ..settings.models import CODEC_CHOICES, CONTAINER_CHOICES, QUALITY_CHOICES, UISettings
+from ..settings.storage import current_preview_encoding, current_settings
 from .batch import interpolate_videos
-from .models import ENGINE_CHOICES, FPS_CHOICES, FrameInterpolationOptions
+from .models import ENGINE_CHOICES, FPS_CHOICES
 from .preview import normalize_video_paths, preview_frame_interpolation, update_frame_interpolation_preview_mode
 
 
@@ -43,16 +44,14 @@ def render_frame_interpolation_batch(
     paths = normalize_video_paths(input_paths)
     if not paths:
         raise gr.Error("Choose at least one video first.")
-    effective_hdr = coerce_hdr_mode(codec, hdr_mode)
-    options = FrameInterpolationOptions(
-        ai_gpu_uuid=processing_gpu_settings()[0],
-        video_gpu_uuid=processing_gpu_settings()[1],
+    options = frame_interpolation_options(
+        current_settings(),
         target_fps=target_fps,
         engine=engine,
         codec=codec,
         container=container,
         quality=quality,
-        hdr_mode=effective_hdr,
+        hdr_mode=hdr_mode,
         rename_mode=rename_mode,
         custom_suffix=custom_suffix,
     )

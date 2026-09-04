@@ -1,0 +1,23 @@
+# Runtime state created on demand by the app and the CLI.
+logs/
+outputs/
+jobs/
+config/
+live/
+
+# Vendored embedded interpreter and its site-packages (release package only).
+bin/python-*/
+
+# Release archives and local environments.
+*.zip
+.venv/
+__pycache__/
+*.egg-info/
+
+# Baseline renders and check outputs are large media; keep scripts and reports.
+design_docs/phase1_baseline/*/
+design_docs/phase4_check/*.mp4
+
+# Worker-rewritten ReShade state next to the host binaries.
+bin/runtime/host/ReShade.ini
+bin/runtime/host/ReShade.log

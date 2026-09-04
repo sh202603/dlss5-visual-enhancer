@@ -387,6 +387,7 @@ def convert_video(
             def write_frames() -> None:
                 writer_started = time.perf_counter()
                 written = 0
+                last_output_pts: int | None = None
                 nut = None
                 try:
                     nut = av.open(encoder.stdin, mode="w", format="nut")
@@ -408,6 +409,7 @@ def convert_video(
                         if item is stop_marker:
                             break
                         processed, output_pts = item
+                        last_output_pts = output_pts
                         output_frame = av.VideoFrame.from_ndarray(processed, format="rgba")
                         output_frame.pts = output_pts
                         output_frame.time_base = metadata["time_base"]
@@ -420,6 +422,21 @@ def convert_video(
                         nut.close()
                         nut = None
                 except BaseException as exc:
+                    encoder_code = encoder.poll()
+                    if encoder_code is not None and not isinstance(exc, Cancelled):
+                        # The encoder died underneath the writer; its own log
+                        # says why, the PyAV error only says "broken pipe".
+                        tail = "\n".join(encoder_logs[-20:]) or "(no encoder output)"
+                        exc = RuntimeError(
+                            f"The video encoder ({selected_encoder}) exited with code "
+                            f"{encoder_code} after {written} frames were written; "
+                            f"the render cannot continue.\nEncoder log:\n{tail}"
+                        ).with_traceback(exc.__traceback__)
+                    elif isinstance(exc, av.FFmpegError):
+                        exc = RuntimeError(
+                            f"Feeding frame {written} (pts {last_output_pts}) to the video "
+                            f"encoder failed: {exc}"
+                        ).with_traceback(exc.__traceback__)
                     record_pipeline_error(exc)
                 finally:
                     writer_stats["written_frames"] = written
@@ -733,6 +750,10 @@ def convert_video(
                 diagnostics={
                     "frame_accounting": frame_accounting,
                     "producer": producer_stats, "writer": writer_stats, "timings": timings,
+                    "encoder": {
+                        "exit_code": encoder.poll() if encoder is not None else None,
+                        "log_tail": list(encoder_logs)[-200:] if "encoder_logs" in locals() else [],
+                    },
                 },
             )
             raise RuntimeError(f"{exc}\nDiagnostic report: {report_path}") from exc
