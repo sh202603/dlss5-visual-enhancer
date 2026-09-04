@@ -136,6 +136,30 @@ Plain H.264/H.265/AV1 are CPU-based (libx264 / libx265 / libsvtav1) and never re
 
 Saved GPU selections use stable GPU identity. If a previously saved GPU is no longer available, that selection returns to Automatic rather than silently switching to another saved device.
 
+## Command line
+
+The same processing layer is available as a `dlss5` command for scripts and other programs. The portable package runs it with the embedded interpreter; a development checkout can also install it with uv.
+
+```powershell
+.\dlss5.bat info                                           # GPUs, encoders, frame generation, runtime builds
+.\dlss5.bat image photo.png --upscale 2 --format PNG
+.\dlss5.bat video clip.mp4 --codec "H.265 (NVIDIA NVENC)" --hdr --output-dir D:\out
+.\dlss5.bat interpolate D:\clips --fps 60                  # a folder processes its supported files in name order
+```
+
+```powershell
+uv sync                           # core: video and frame interpolation
+uv sync --extra image             # adds RAW, HEIF, and SVG decoding for images
+uv sync --extra webui             # adds gradio (implies image)
+uv run dlss5 info
+```
+
+- Defaults come from `config/config.ini`, the same file the WebUI writes. `--preset FILE` applies a preset exported from the Settings tab instead; flags override individual values on top. `--dlss-architecture` selects the Neural Rendering runtime build the same way the Settings tab does.
+- `--json` writes the batch result (the manifest from `logs/` plus the command) to stdout. Progress and the per-file summary go to stderr; `--progress json` turns progress into JSON Lines with one object per file state change, `--quiet` silences both.
+- Exit codes: 0 all inputs succeeded, 1 some failed, 2 usage error or missing input, 3 runtime or GPU unavailable, 130 interrupted. Ctrl+C stops the batch cleanly (incomplete output removed, finished files kept); a second Ctrl+C aborts.
+- `image` writes files only; add `--zip` for the ZIP the WebUI offers. One GPU render per process; two `dlss5` processes at once will both spawn workers.
+- To use the package from another project, add this checkout as an editable dependency (`uv add --editable <path to this folder>`). If the package ends up outside the checkout, point `DLSS5VE_HOME` at the checkout so the runtime binaries are found.
+
 ## License and third-party notices
 
 Original application code is licensed under the MIT License, copyright © 2026 Merserk. That license covers only original project code; it does not relicense or grant rights to any third-party software, model, binary, trademark, media, or other asset.
