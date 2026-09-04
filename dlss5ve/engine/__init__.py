@@ -1,0 +1,22 @@
+"""Frame-level engine API for embedding DLSS 5 in other pipelines.
+
+The processing packages work on files. These classes work on numpy frames so
+that another program (lada-ex, a custom pipeline) can stream frames through
+the native workers without touching files, Gradio, or torch:
+
+- ``NeuralRenderStream``: DLSS Neural Rendering (feature 18) with optional
+  DLSS upscaling, one RGBA frame in, one RGBA frame out.
+- ``FrameGenStream``: DLSS Frame Generation, one RGBA frame in, the generated
+  frames between it and the previous frame out.
+
+Both keep one worker process alive for the life of the stream. The workers
+stop after the frame count declared at setup, so the streams declare an
+effectively unbounded count and close early; see ``UNBOUNDED_FRAMES``.
+Neither takes the process-wide render slot (``core.jobs.active_job``): the
+caller owns the lifecycle and may pass its own ``JobController``.
+"""
+
+from .framegen import FrameGenStream
+from .neural import NeuralRenderStream, UNBOUNDED_FRAMES
+
+__all__ = ["FrameGenStream", "NeuralRenderStream", "UNBOUNDED_FRAMES"]

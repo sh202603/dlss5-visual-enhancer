@@ -5,6 +5,8 @@ from dataclasses import dataclass
 import cv2
 import numpy as np
 
+from ..core.motion import to_float16
+
 @dataclass(slots=True)
 class GuideFrame:
     motion: np.ndarray
@@ -23,6 +25,9 @@ class TemporalGuideGenerator:
         self.flow_height = max(64, int(round(height * scale / 2) * 2))
         self.previous_gray: np.ndarray | None = None
         self.zero_motion = np.zeros((height, width, 2), dtype=np.float16)
+        self._scale = np.array(
+            [width / self.flow_width, height / self.flow_height], dtype=np.float32
+        )
         self.dis = cv2.DISOpticalFlow_create(cv2.DISOPTICAL_FLOW_PRESET_MEDIUM)
         self.dis.setUseSpatialPropagation(True)
         self.dis.setFinestScale(1)
@@ -48,14 +53,12 @@ class TemporalGuideGenerator:
                 motion = self.zero_motion
             else:
                 motion = self.dis.calc(current, self.previous_gray, None)
-                motion = cv2.resize(
-                    motion,
-                    (self.width, self.height),
-                    interpolation=cv2.INTER_LINEAR,
+                # Scale at flow resolution, then upsample; see
+                # frame_interpolation.guides for the reasoning.
+                motion *= self._scale
+                motion = to_float16(
+                    cv2.resize(motion, (self.width, self.height), interpolation=cv2.INTER_LINEAR)
                 )
-                motion[..., 0] *= self.width / self.flow_width
-                motion[..., 1] *= self.height / self.flow_height
-                motion = np.ascontiguousarray(motion.astype(np.float16))
         self.previous_gray = current
         return GuideFrame(
             motion=motion,
