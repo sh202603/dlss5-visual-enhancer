@@ -14,9 +14,9 @@ bin/python-*/
 __pycache__/
 *.egg-info/
 
-# Baseline renders and check outputs are large media; keep scripts and reports.
-design_docs/phase1_baseline/*/
-design_docs/phase4_check/*.mp4
+# Local working notes, design documents, and baseline scripts stay out of the repository.
+CLAUDE.md
+design_docs/
 
 # Worker-rewritten ReShade state next to the host binaries.
 bin/runtime/host/ReShade.ini
