@@ -113,7 +113,6 @@ wheels = [
 
 [[package]]
 name = "dlss5ve"
-version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "av", marker = "sys_platform == 'win32'" },

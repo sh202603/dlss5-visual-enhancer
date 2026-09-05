@@ -9,6 +9,8 @@ from __future__ import annotations
 import importlib
 from typing import Any
 
+from .version import APP_VERSION, __version__
+
 _EXPORTS: dict[str, str] = {
     "probe_video": ".core.ffmpeg",
     "ImageBatchResult": ".neural_rendering.image",
@@ -47,7 +49,7 @@ _EXPORTS: dict[str, str] = {
     "upscale_videos": ".upscale.video.batch",
 }
 
-__all__ = sorted(_EXPORTS)
+__all__ = sorted(_EXPORTS) + ["APP_VERSION", "__version__"]
 
 
 def __getattr__(name: str) -> Any:

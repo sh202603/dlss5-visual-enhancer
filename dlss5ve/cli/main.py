@@ -34,6 +34,7 @@ from ..settings.models import CONTAINER_CHOICES, IMAGE_FORMAT_CHOICES, UISetting
 from ..settings.presets import import_settings_preset
 from ..settings.storage import SETTINGS_STATE, load_settings
 from ..upscale.video.models import HDR_PRECISIONS, SCALE_FACTORS
+from ..version import APP_VERSION, __version__
 from .progress import ProgressReporter
 
 EXIT_OK = 0
@@ -161,16 +162,27 @@ def _sizing_overrides(args: argparse.Namespace) -> dict[str, Any]:
     return overrides
 
 
+_BANNER = f"dlss5ve-cli {__version__} (DLSS 5 Visual Enhancer {APP_VERSION})"
+
+
+def _command(commands: Any, name: str, help_text: str) -> argparse.ArgumentParser:
+    """Add a subcommand whose --help and --version also show the version banner."""
+    parser = commands.add_parser(name, help=help_text, description=f"{_BANNER}: {help_text}")
+    parser.add_argument("--version", action="version", version=_BANNER)
+    return parser
+
+
 def build_parser(settings: UISettings) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="dlss5ve-cli",
-        description="DLSS 5 Visual Enhancer command line: Neural Rendering for images and videos, DLSS Frame Generation, and RTX Video Super Resolution / HDR.",
+        description=f"{_BANNER}: Neural Rendering for images and videos, DLSS Frame Generation, and RTX Video Super Resolution / HDR.",
         epilog="Defaults come from config.ini (or --preset). Exit codes: 0 ok, 1 some inputs failed, 2 usage, 3 runtime/GPU unavailable, 130 interrupted.",
     )
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__} (DLSS 5 Visual Enhancer {APP_VERSION})")
     commands = parser.add_subparsers(dest="command", metavar="COMMAND", required=True)
     inputs_help = "Files, or folders whose supported files are processed in name order (subfolders excluded)."
 
-    image = commands.add_parser("image", help="Neural Rendering and upscaling for images.")
+    image = _command(commands, "image", "Neural Rendering and upscaling for images.")
     image.add_argument("inputs", nargs="+", metavar="PATH", help=inputs_help)
     _add_common(image, settings)
     _add_neural(image, settings)
@@ -180,7 +192,7 @@ def build_parser(settings: UISettings) -> argparse.ArgumentParser:
     output.add_argument("--zip", action="store_true", help="Also write a ZIP of the successful outputs next to them.")
     _add_naming(image, settings.image_rename_mode, settings.image_custom_suffix)
 
-    video = commands.add_parser("video", help="Neural Rendering and upscaling for videos.")
+    video = _command(commands, "video", "Neural Rendering and upscaling for videos.")
     video.add_argument("inputs", nargs="+", metavar="PATH", help=inputs_help)
     _add_common(video, settings)
     _add_neural(video, settings)
@@ -188,7 +200,7 @@ def build_parser(settings: UISettings) -> argparse.ArgumentParser:
     _add_naming(video, settings.video_rename_mode, settings.video_custom_suffix)
     video.add_argument("--preview-seconds", type=float, metavar="SEC", help="Render only the first SEC seconds with the chosen codec.")
 
-    interpolate = commands.add_parser("interpolate", help="DLSS Frame Generation to a target frame rate.")
+    interpolate = _command(commands, "interpolate", "DLSS Frame Generation to a target frame rate.")
     interpolate.add_argument("inputs", nargs="+", metavar="PATH", help=inputs_help)
     _add_common(interpolate, settings)
     frame = interpolate.add_argument_group("frame generation")
@@ -201,7 +213,7 @@ def build_parser(settings: UISettings) -> argparse.ArgumentParser:
     _add_naming(interpolate, settings.frame_interpolation_rename_mode, settings.frame_interpolation_custom_suffix)
     interpolate.add_argument("--preview-seconds", type=float, metavar="SEC", help="Interpolate only the first SEC seconds with the chosen codec.")
 
-    upscale_image = commands.add_parser("upscale-image", help="RTX Video Super Resolution for images.")
+    upscale_image = _command(commands, "upscale-image", "RTX Video Super Resolution for images.")
     upscale_image.add_argument("inputs", nargs="+", metavar="PATH", help=inputs_help)
     _add_common(upscale_image, settings)
     _add_upscale_sizing(upscale_image, settings, "upscale_image_")
@@ -212,7 +224,7 @@ def build_parser(settings: UISettings) -> argparse.ArgumentParser:
     output.add_argument("--zip", action="store_true", help="Also write a ZIP of the successful outputs next to them.")
     _add_naming(upscale_image, settings.upscale_image_rename_mode, settings.upscale_image_custom_suffix)
 
-    upscale_video = commands.add_parser("upscale-video", help="RTX Video Super Resolution and RTX Video HDR for videos.")
+    upscale_video = _command(commands, "upscale-video", "RTX Video Super Resolution and RTX Video HDR for videos.")
     upscale_video.add_argument("inputs", nargs="+", metavar="PATH", help=inputs_help)
     _add_common(upscale_video, settings)
     _add_upscale_sizing(upscale_video, settings, "upscale_")
@@ -228,7 +240,7 @@ def build_parser(settings: UISettings) -> argparse.ArgumentParser:
     _add_naming(upscale_video, settings.upscale_rename_mode, settings.upscale_custom_suffix)
     upscale_video.add_argument("--preview-seconds", type=float, metavar="SEC", help="Process only the first SEC seconds.")
 
-    info = commands.add_parser("info", help="Show GPUs, encoders, frame-generation and RTX Video capabilities, and choices.")
+    info = _command(commands, "info", "Show the version, GPUs, encoders, frame-generation and RTX Video capabilities, and choices.")
     info.add_argument("--json", action="store_true", help="Write the report as JSON instead of text.")
     info.add_argument("--ai-gpu", metavar="UUID", default=settings.ai_gpu_uuid, help="GPU to probe for frame generation (default: %(default)s).")
     info.add_argument("--preset", metavar="FILE", help=argparse.SUPPRESS)
@@ -495,7 +507,9 @@ def collect_info(ai_gpu_uuid: str) -> dict[str, Any]:
     from ..core.runtime import prepare_runtime, validate_runtime_files
     from ..frame_interpolation.capabilities import probe_frame_interpolation_capabilities
 
-    report: dict[str, Any] = {"root": str(ROOT), "config": str(CONFIG_PATH)}
+    report: dict[str, Any] = {
+        "version": __version__, "app_version": APP_VERSION, "root": str(ROOT), "config": str(CONFIG_PATH),
+    }
     try:
         validate_runtime_files()
         report["runtime_files"] = "ok"
@@ -546,6 +560,7 @@ def collect_info(ai_gpu_uuid: str) -> dict[str, Any]:
 
 def _print_info(report: dict[str, Any]) -> None:
     out = sys.stdout
+    out.write(f"dlss5ve-cli {report['version']} | DLSS 5 Visual Enhancer {report['app_version']}\n")
     out.write(f"Root: {report['root']}\nConfig: {report['config']}\nRuntime files: {report['runtime_files']}\n\n")
     gpus = report["gpus"]
     if isinstance(gpus, str):

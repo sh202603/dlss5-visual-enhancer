@@ -161,6 +161,7 @@ uv run dlss5ve-cli info
 - Neural Rendering and RTX Video run in different workers, so combining them is two commands: `examples
 r_vsr_hdr.ps1 INPUT -OutputDir DIR -Scale 2` renders NR first (SDR, source size) and then applies VSR and RTX Video HDR to the result.
 - `--json` writes the batch result (the manifest from `logs/` plus the command) to stdout. Progress and the per-file summary go to stderr; `--progress json` turns progress into JSON Lines with one object per file state change, `--quiet` silences both.
+- `--version` (also the first line of `info` and `--help`) prints the package version and the upstream release it is built on; the package version follows the upstream release in its first two components.
 - Exit codes: 0 all inputs succeeded, 1 some failed, 2 usage error or missing input, 3 runtime or GPU unavailable, 130 interrupted. Ctrl+C stops the batch cleanly (incomplete output removed, finished files kept); a second Ctrl+C aborts.
 - `image` writes files only; add `--zip` for the ZIP the WebUI offers. One GPU render per process; two `dlss5ve-cli` processes at once will both spawn workers.
 - To use the package from another project, add this checkout as an editable dependency (`uv add --editable <path to this folder>`). If the package ends up outside the checkout, point `DLSS5VE_HOME` at the checkout so the runtime binaries are found.

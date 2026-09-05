@@ -1,6 +1,6 @@
 [project]
 name = "dlss5ve"
-version = "0.1.0"
+dynamic = ["version"]
 description = "DLSS 5 Visual Enhancer: NVIDIA DLSS 5 Neural Rendering and Frame Generation for images and videos"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -33,6 +33,9 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
 packages = { find = { where = ["."], include = ["dlss5ve", "dlss5ve.*"] } }
+
+[tool.setuptools.dynamic]
+version = { attr = "dlss5ve.version.__version__" }
 
 [tool.uv]
 environments = ["sys_platform == 'win32'"]
