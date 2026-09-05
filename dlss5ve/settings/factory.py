@@ -13,7 +13,7 @@ from dataclasses import fields
 from typing import Any
 
 from ..frame_interpolation.models import FrameInterpolationOptions
-from ..video.models import ConversionOptions
+from ..neural_rendering.video.models import ConversionOptions
 from .models import UISettings, coerce_hdr_mode
 
 
@@ -44,7 +44,7 @@ def _neural_values(settings: UISettings) -> dict[str, Any]:
 def image_options(settings: UISettings, **overrides: Any):
     # Imported lazily: the image package pulls in the optional decoders
     # (rawpy, pillow-heif, resvg) that video-only installs do not carry.
-    from ..image.models import ImageConversionOptions
+    from ..neural_rendering.image.models import ImageConversionOptions
 
     values = _neural_values(settings)
     values.update(

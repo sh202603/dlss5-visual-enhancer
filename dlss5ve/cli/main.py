@@ -7,8 +7,8 @@ Conventions:
   override individual values on top of that. Validation of the values lives
   in the processing layer and is not repeated here.
 - the effective UISettings are published to ``settings.storage.SETTINGS_STATE``
-  so that the DLSS Architecture staging and the GPU lookups the processors do
-  see the same values the flags produced.
+  so that the GPU lookups the processors and previews do see the same values
+  the flags produced.
 
 Exit codes: 0 all inputs succeeded, 1 some or all inputs failed, 2 usage error
 or missing input, 3 runtime or GPU unavailable, 130 interrupted by the user.
@@ -24,7 +24,6 @@ from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any, Sequence
 
-from ..core.dlss_architecture import DLSS_ARCHITECTURE_CHOICES
 from ..core.ffmpeg import CODEC_CHOICES, ENCODING_QUALITIES
 from ..core.jobs import cancel_active_job
 from ..core.naming import RENAME_MODES
@@ -85,10 +84,6 @@ def _add_common(parser: argparse.ArgumentParser, settings: UISettings) -> None:
     group.add_argument(
         "--video-gpu", metavar="UUID", default=settings.video_gpu_uuid,
         help="Video Processing (NVENC) GPU UUID, or auto (default: %(default)s).",
-    )
-    group.add_argument(
-        "--dlss-architecture", choices=DLSS_ARCHITECTURE_CHOICES, default=settings.dlss_architecture,
-        help="Neural Rendering runtime build staged into host/ before rendering; Auto follows the AI GPU (default: %(default)s).",
     )
     group.add_argument("--json", action="store_true", help="Write the batch result as JSON to stdout.")
     group.add_argument(
@@ -166,7 +161,7 @@ def build_parser(settings: UISettings) -> argparse.ArgumentParser:
     _add_naming(interpolate, settings.frame_interpolation_rename_mode, settings.frame_interpolation_custom_suffix)
     interpolate.add_argument("--preview-seconds", type=float, metavar="SEC", help="Interpolate only the first SEC seconds with the chosen codec.")
 
-    info = commands.add_parser("info", help="Show GPUs, encoders, frame-generation capabilities, runtime builds, and choices.")
+    info = commands.add_parser("info", help="Show GPUs, encoders, frame-generation capabilities, and choices.")
     info.add_argument("--json", action="store_true", help="Write the report as JSON instead of text.")
     info.add_argument("--ai-gpu", metavar="UUID", default=settings.ai_gpu_uuid, help="GPU to probe for frame generation (default: %(default)s).")
     info.add_argument("--preset", metavar="FILE", help=argparse.SUPPRESS)
@@ -204,14 +199,13 @@ def _resolve_inputs(values: Sequence[str], kind: str) -> list[Path]:
 def _publish_settings(settings: UISettings, args: argparse.Namespace) -> UISettings:
     """Make the effective settings visible to the processing layer.
 
-    The processors stage the DLSS Architecture build and the previews look up
-    GPUs through settings.storage, not through the Options they receive.
+    The previews and the Live pipeline look up GPUs through settings.storage,
+    not through the Options they receive.
     """
     effective = replace(
         settings,
         ai_gpu_uuid=args.ai_gpu,
         video_gpu_uuid=getattr(args, "video_gpu", settings.video_gpu_uuid),
-        dlss_architecture=args.dlss_architecture,
     )
     with SETTINGS_STATE.lock:
         SETTINGS_STATE.current = effective
@@ -273,7 +267,7 @@ def _payload(command: str, manifest_path: str, **extra: Any) -> dict[str, Any]:
 def run_image(args: argparse.Namespace, settings: UISettings, reporter: ProgressReporter) -> dict[str, Any]:
     inputs = _resolve_inputs(args.inputs, "image")
     try:
-        from ..image import convert_images
+        from ..neural_rendering.image import convert_images
     except ImportError as exc:
         raise RuntimeError(
             f"Image decoding packages are missing ({exc.name}). Install with the 'image' extra: uv sync --extra image"
@@ -301,7 +295,7 @@ def run_image(args: argparse.Namespace, settings: UISettings, reporter: Progress
 def run_video(args: argparse.Namespace, settings: UISettings, reporter: ProgressReporter) -> dict[str, Any]:
     inputs = _resolve_inputs(args.inputs, "video")
     from ..settings.factory import video_options
-    from ..video import convert_videos
+    from ..neural_rendering.video import convert_videos
 
     options = video_options(
         settings,
@@ -352,27 +346,6 @@ def run_interpolate(args: argparse.Namespace, settings: UISettings, reporter: Pr
     return _payload("interpolate", result.manifest_path)
 
 
-def _architecture_report() -> dict[str, Any]:
-    """Which Neural Rendering builds exist, and which one host/ currently holds."""
-    from ..core.dlss_architecture import _sha256, arch_dll_path, subfolder_for_choice
-    from ..core.paths import NEURAL_RUNTIME
-
-    host_hash = _sha256(NEURAL_RUNTIME)
-    builds: dict[str, dict[str, Any]] = {}
-    staged = None
-    for choice in DLSS_ARCHITECTURE_CHOICES:
-        subfolder = subfolder_for_choice(choice)
-        if subfolder is None:
-            continue
-        path = arch_dll_path(subfolder)
-        available = path.is_file()
-        matches = bool(available and host_hash and _sha256(path) == host_hash)
-        if matches:
-            staged = choice
-        builds[choice] = {"path": str(path), "available": available, "staged": matches}
-    return {"host_runtime": str(NEURAL_RUNTIME), "staged": staged, "builds": builds}
-
-
 def collect_info(ai_gpu_uuid: str) -> dict[str, Any]:
     """Gather what a caller needs to choose arguments; each probe fails independently."""
     from ..core.ffmpeg import probe_nvenc_codecs
@@ -404,16 +377,11 @@ def collect_info(ai_gpu_uuid: str) -> dict[str, Any]:
         report["frame_generation"] = asdict(probe_frame_interpolation_capabilities(ai_gpu_uuid))
     except Exception as exc:
         report["frame_generation"] = str(exc)
-    try:
-        report["dlss_architecture"] = _architecture_report()
-    except Exception as exc:
-        report["dlss_architecture"] = str(exc)
     report["choices"] = {
         "upscale": [factor for factor in UPSCALING_MODES],
         "nr_preset": list(NR_PRESETS),
         "nr_style": list(NR_STYLES),
         "dlss_model_preset": list(DLSS_MODEL_PRESETS),
-        "dlss_architecture": list(DLSS_ARCHITECTURE_CHOICES),
         "codec": list(CODEC_CHOICES),
         "container": list(CONTAINER_CHOICES),
         "encoding_quality": list(ENCODING_QUALITIES),
@@ -460,14 +428,6 @@ def _print_info(report: dict[str, Any]) -> None:
             out.write(f"  {capabilities['detail']}\n")
     else:
         out.write(f"Frame generation: {capabilities}\n")
-    architecture = report["dlss_architecture"]
-    if isinstance(architecture, dict):
-        out.write(f"DLSS Architecture builds (staged in host/: {architecture.get('staged') or 'none of these'}):\n")
-        for choice, build in architecture["builds"].items():
-            state = "available" if build["available"] else "missing"
-            out.write(f"  {choice}: {state}{' (staged)' if build['staged'] else ''}\n")
-    else:
-        out.write(f"DLSS Architecture builds: {architecture}\n")
     out.write("\nChoices:\n")
     for key, values in report["choices"].items():
         out.write(f"  {key}: {', '.join(f'{v:g}' if isinstance(v, float) else str(v) for v in values)}\n")

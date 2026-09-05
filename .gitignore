@@ -17,7 +17,3 @@ __pycache__/
 # Local working notes, design documents, and baseline scripts stay out of the repository.
 CLAUDE.md
 design_docs/
-
-# Worker-rewritten ReShade state next to the host binaries.
-bin/runtime/host/ReShade.ini
-bin/runtime/host/ReShade.log

@@ -4,7 +4,6 @@ from typing import Any
 
 import numpy as np
 
-from ..core.dlss_architecture import apply_dlss_architecture
 from ..core.gpu_selection import resolve_runtime_ai_gpu
 from ..core.jobs import JobController
 from ..core.runtime import (
@@ -12,7 +11,7 @@ from ..core.runtime import (
     resolve_upscaling_mode, verify_feature_18,
 )
 from ..settings.models import DEFAULT_SETTINGS, UISettings
-from ..video.guides import TemporalGuideGenerator
+from ..neural_rendering.video.guides import TemporalGuideGenerator
 
 # The DLSSG worker exits once the frame count declared at setup has been
 # delivered (verified 2026-09-03: frame N+1 breaks the pipe). Declaring the
@@ -65,9 +64,6 @@ class NeuralRenderStream:
         settings = settings or DEFAULT_SETTINGS
         prepared = prepare_runtime()
         gpu = resolve_runtime_ai_gpu(prepared.gpus, prepared.runtime_bundle, gpu_uuid)
-        # Stage the NR build selected by the settings before the worker maps
-        # the DLL; a failure keeps the current host copy and only warns.
-        self.dlss_architecture = apply_dlss_architecture(settings.dlss_architecture, gpu)
         self.factor, mode = resolve_upscaling_mode(factor)
         native = resolve_native_settings(settings)
         output_width, output_height = resolve_output_size(int(width), int(height), self.factor)
