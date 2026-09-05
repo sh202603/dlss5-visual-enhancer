@@ -33,6 +33,7 @@ from ..frame_interpolation.models import ENGINE_CHOICES, FPS_CHOICES
 from ..settings.models import CONTAINER_CHOICES, IMAGE_FORMAT_CHOICES, UISettings
 from ..settings.presets import import_settings_preset
 from ..settings.storage import SETTINGS_STATE, load_settings
+from ..upscale.video.models import HDR_PRECISIONS, SCALE_FACTORS
 from .progress import ProgressReporter
 
 EXIT_OK = 0
@@ -107,12 +108,14 @@ def _add_neural(parser: argparse.ArgumentParser, settings: UISettings) -> None:
     group.add_argument("--upscale", type=float, metavar="FACTOR", default=settings.upscaling_factor, help=f"One of {factors}; 1 is DLAA (default: %(default)s)")
 
 
-def _add_encoding(parser: argparse.ArgumentParser, codec: str, container: str, quality: str, hdr: bool) -> None:
+def _add_encoding(parser: argparse.ArgumentParser, codec: str, container: str, quality: str, hdr: bool | None) -> None:
+    """Codec flags; ``hdr`` is the HDR Mode default, or None when the command defines its own --hdr."""
     group = parser.add_argument_group("encoding")
     group.add_argument("--codec", choices=CODEC_CHOICES, default=codec, help="(default: %(default)s)")
     group.add_argument("--container", choices=CONTAINER_CHOICES, default=container, help="(default: %(default)s)")
     group.add_argument("--encoding-quality", choices=ENCODING_QUALITIES, default=quality, help="(default: %(default)s)")
-    group.add_argument("--hdr", action=argparse.BooleanOptionalAction, default=hdr, help="10-bit output that keeps HDR metadata; H.265, AV1, and ProRes only.")
+    if hdr is not None:
+        group.add_argument("--hdr", action=argparse.BooleanOptionalAction, default=hdr, help="10-bit output that keeps HDR metadata; H.265, AV1, and ProRes only.")
 
 
 def _add_naming(parser: argparse.ArgumentParser, mode: str, suffix: str) -> None:
@@ -121,10 +124,47 @@ def _add_naming(parser: argparse.ArgumentParser, mode: str, suffix: str) -> None
     group.add_argument("--suffix", default=suffix, help="Suffix for --rename Custom (default: %(default)s)")
 
 
+def _add_upscale_sizing(parser: argparse.ArgumentParser, settings: UISettings, prefix: str) -> None:
+    """RTX VSR quality and output size; defaults come from the upscale_* or upscale_image_* settings."""
+    def saved(name: str) -> Any:
+        return getattr(settings, prefix + name)
+
+    if saved("size_mode") == "Scale factor":
+        saved_size = f"{saved('scale_factor'):g}x from settings"
+    elif saved("aspect_lock"):
+        saved_size = f"{saved('width')} px wide from settings"
+    else:
+        saved_size = f"{saved('width')}x{saved('height')} from settings"
+    factors = ", ".join(f"{factor:g}" for _label, factor in SCALE_FACTORS)
+    group = parser.add_argument_group("sizing")
+    group.add_argument("--vsr-quality", type=int, metavar="1..4", default=saved("vsr_quality"), help="RTX Video Super Resolution quality (default: %(default)s)")
+    group.add_argument("--scale", type=float, metavar="FACTOR", default=None, help=f"Output size as a multiple of the source, at least 1; the WebUI offers {factors} (default: {saved_size})")
+    group.add_argument("--width", type=int, metavar="PX", default=None, help="Output width in pixels instead of --scale; the height follows the source aspect ratio unless --no-aspect-lock.")
+    group.add_argument("--height", type=int, metavar="PX", default=None, help="Output height in pixels; used with --width and --no-aspect-lock.")
+    group.add_argument("--aspect-lock", action=argparse.BooleanOptionalAction, default=saved("aspect_lock"), help="Derive the height from --width and the source aspect ratio.")
+
+
+def _sizing_overrides(args: argparse.Namespace) -> dict[str, Any]:
+    """Translate --scale / --width / --height into the size_mode the Options use."""
+    overrides: dict[str, Any] = {"aspect_lock": bool(args.aspect_lock)}
+    custom = args.width is not None or args.height is not None
+    if args.scale is not None and custom:
+        raise UsageError("Use either --scale or --width/--height, not both.")
+    if args.scale is not None:
+        overrides.update(size_mode="Scale factor", scale_factor=args.scale)
+    elif custom:
+        if args.width is None:
+            raise UsageError("--height needs --width; with --aspect-lock the height follows the width.")
+        overrides.update(size_mode="Custom dimensions", width=args.width)
+        if args.height is not None:
+            overrides["height"] = args.height
+    return overrides
+
+
 def build_parser(settings: UISettings) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="dlss5ve-cli",
-        description="DLSS 5 Visual Enhancer command line: Neural Rendering for images and videos, and DLSS Frame Generation.",
+        description="DLSS 5 Visual Enhancer command line: Neural Rendering for images and videos, DLSS Frame Generation, and RTX Video Super Resolution / HDR.",
         epilog="Defaults come from config.ini (or --preset). Exit codes: 0 ok, 1 some inputs failed, 2 usage, 3 runtime/GPU unavailable, 130 interrupted.",
     )
     commands = parser.add_subparsers(dest="command", metavar="COMMAND", required=True)
@@ -161,7 +201,34 @@ def build_parser(settings: UISettings) -> argparse.ArgumentParser:
     _add_naming(interpolate, settings.frame_interpolation_rename_mode, settings.frame_interpolation_custom_suffix)
     interpolate.add_argument("--preview-seconds", type=float, metavar="SEC", help="Interpolate only the first SEC seconds with the chosen codec.")
 
-    info = commands.add_parser("info", help="Show GPUs, encoders, frame-generation capabilities, and choices.")
+    upscale_image = commands.add_parser("upscale-image", help="RTX Video Super Resolution for images.")
+    upscale_image.add_argument("inputs", nargs="+", metavar="PATH", help=inputs_help)
+    _add_common(upscale_image, settings)
+    _add_upscale_sizing(upscale_image, settings, "upscale_image_")
+    output = upscale_image.add_argument_group("output")
+    output.add_argument("--format", choices=IMAGE_FORMAT_CHOICES, default=settings.upscale_image_output_format, help="(default: %(default)s)")
+    output.add_argument("--quality", type=int, metavar="1..100", default=settings.upscale_image_quality, help="Lossy quality for JPEG, WebP, AVIF (default: %(default)s)")
+    output.add_argument("--preserve-metadata", action=argparse.BooleanOptionalAction, default=settings.upscale_image_preserve_metadata, help="Keep EXIF, DPI, and XMP metadata from the source.")
+    output.add_argument("--zip", action="store_true", help="Also write a ZIP of the successful outputs next to them.")
+    _add_naming(upscale_image, settings.upscale_image_rename_mode, settings.upscale_image_custom_suffix)
+
+    upscale_video = commands.add_parser("upscale-video", help="RTX Video Super Resolution and RTX Video HDR for videos.")
+    upscale_video.add_argument("inputs", nargs="+", metavar="PATH", help=inputs_help)
+    _add_common(upscale_video, settings)
+    _add_upscale_sizing(upscale_video, settings, "upscale_")
+    upscale_video.add_argument("--vsr", action=argparse.BooleanOptionalAction, default=settings.upscale_vsr_enabled, help="RTX Video Super Resolution; --no-vsr keeps the source size and applies only RTX Video HDR.")
+    hdr = upscale_video.add_argument_group("RTX Video HDR")
+    hdr.add_argument("--hdr", action=argparse.BooleanOptionalAction, default=settings.upscale_hdr_enabled, help="Convert SDR to HDR10 with RTX Video HDR; H.265, AV1, and ProRes only.")
+    hdr.add_argument("--hdr-contrast", type=int, metavar="0..200", default=settings.upscale_hdr_contrast, help="(default: %(default)s)")
+    hdr.add_argument("--hdr-saturation", type=int, metavar="0..200", default=settings.upscale_hdr_saturation, help="(default: %(default)s)")
+    hdr.add_argument("--hdr-middle-gray", type=int, metavar="10..100", default=settings.upscale_hdr_middle_gray, help="(default: %(default)s)")
+    hdr.add_argument("--hdr-peak-luminance", type=int, metavar="400..2000", default=settings.upscale_hdr_peak_luminance, help="Display peak in nits (default: %(default)s)")
+    hdr.add_argument("--hdr-precision", choices=HDR_PRECISIONS, default=settings.upscale_hdr_precision, help="Frame format handed to the encoder (default: %(default)s)")
+    _add_encoding(upscale_video, settings.upscale_codec, settings.upscale_container, settings.upscale_quality, None)
+    _add_naming(upscale_video, settings.upscale_rename_mode, settings.upscale_custom_suffix)
+    upscale_video.add_argument("--preview-seconds", type=float, metavar="SEC", help="Process only the first SEC seconds.")
+
+    info = commands.add_parser("info", help="Show GPUs, encoders, frame-generation and RTX Video capabilities, and choices.")
     info.add_argument("--json", action="store_true", help="Write the report as JSON instead of text.")
     info.add_argument("--ai-gpu", metavar="UUID", default=settings.ai_gpu_uuid, help="GPU to probe for frame generation (default: %(default)s).")
     info.add_argument("--preset", metavar="FILE", help=argparse.SUPPRESS)
@@ -248,12 +315,12 @@ def _check_video_like(options: Any, *, neural: bool) -> None:
         raise UsageError("--preview-seconds must be a positive number of seconds.")
 
 
-def _check_output_dir(value: str | None) -> None:
+def _check_output_dir(value: str | None) -> str:
     """Create or validate the output directory before any GPU work starts."""
     from ..core.disk_paths import prepare_output_dir
 
     try:
-        prepare_output_dir(value)
+        return str(prepare_output_dir(value))
     except (OSError, ValueError) as exc:
         raise UsageError(f"--output-dir: {exc}") from exc
 
@@ -261,6 +328,10 @@ def _check_output_dir(value: str | None) -> None:
 def _payload(command: str, manifest_path: str, **extra: Any) -> dict[str, Any]:
     """The batch manifest written by the processing layer, plus the command."""
     manifest = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
+    if "status" not in manifest:
+        # The Upscale manifests carry only the cancelled flag; use the Neural
+        # Rendering vocabulary so callers see one status field.
+        manifest["status"] = "cancelled" if manifest.get("cancelled") else ("partial" if manifest.get("failures") else "success")
     return {"command": command, **manifest, "manifest_path": manifest_path, **extra}
 
 
@@ -346,6 +417,77 @@ def run_interpolate(args: argparse.Namespace, settings: UISettings, reporter: Pr
     return _payload("interpolate", result.manifest_path)
 
 
+def run_upscale_image(args: argparse.Namespace, settings: UISettings, reporter: ProgressReporter) -> dict[str, Any]:
+    inputs = _resolve_inputs(args.inputs, "image")
+    try:
+        from ..upscale.image.batch import upscale_images
+    except ImportError as exc:
+        raise RuntimeError(
+            f"Image decoding packages are missing ({exc.name}). Install with the 'image' extra: uv sync --extra image"
+        ) from exc
+    from ..settings.factory import upscale_image_options
+
+    options = upscale_image_options(
+        settings,
+        ai_gpu_uuid=args.ai_gpu,
+        vsr_quality=args.vsr_quality,
+        **_sizing_overrides(args),
+        output_format=args.format,
+        quality=args.quality,
+        preserve_metadata=bool(args.preserve_metadata),
+        rename_mode=args.rename,
+        custom_suffix=args.suffix,
+    )
+    options.validate()
+    output_directory = _check_output_dir(args.output_dir)
+    reporter.register(inputs)
+    result = upscale_images(
+        inputs, options, reporter, output_dir=args.output_dir, on_item_update=reporter.item_update,
+        generate_previews=False,
+    )
+    zip_path = None
+    if args.zip and result.successes and not result.cancelled:
+        # The Upscale batch leaves the archive to its caller, unlike Neural Rendering.
+        from ..core.disk_paths import create_media_archive
+
+        zip_path = create_media_archive(
+            [item.output_path for item in result.successes], args.output_dir, "RTXVIDEO_IMAGE_BATCH",
+        )
+    return _payload("upscale-image", result.manifest_path, output_directory=output_directory, zip_path=zip_path)
+
+
+def run_upscale_video(args: argparse.Namespace, settings: UISettings, reporter: ProgressReporter) -> dict[str, Any]:
+    inputs = _resolve_inputs(args.inputs, "video")
+    from ..settings.factory import upscale_video_options
+    from ..upscale.video.batch import upscale_videos
+
+    options = upscale_video_options(
+        settings,
+        ai_gpu_uuid=args.ai_gpu,
+        video_gpu_uuid=args.video_gpu,
+        vsr_enabled=bool(args.vsr),
+        vsr_quality=args.vsr_quality,
+        **_sizing_overrides(args),
+        hdr_enabled=bool(args.hdr),
+        hdr_contrast=args.hdr_contrast,
+        hdr_saturation=args.hdr_saturation,
+        hdr_middle_gray=args.hdr_middle_gray,
+        hdr_peak_luminance=args.hdr_peak_luminance,
+        hdr_precision=args.hdr_precision,
+        codec=args.codec,
+        container=args.container,
+        quality=args.encoding_quality,
+        rename_mode=args.rename,
+        custom_suffix=args.suffix,
+        preview_seconds=args.preview_seconds,
+    )
+    options.validate()
+    output_directory = _check_output_dir(args.output_dir)
+    reporter.register(inputs)
+    result = upscale_videos(inputs, options, reporter, output_dir=args.output_dir, on_item_update=reporter.item_update)
+    return _payload("upscale-video", result.manifest_path, output_directory=output_directory)
+
+
 def collect_info(ai_gpu_uuid: str) -> dict[str, Any]:
     """Gather what a caller needs to choose arguments; each probe fails independently."""
     from ..core.ffmpeg import probe_nvenc_codecs
@@ -377,6 +519,12 @@ def collect_info(ai_gpu_uuid: str) -> dict[str, Any]:
         report["frame_generation"] = asdict(probe_frame_interpolation_capabilities(ai_gpu_uuid))
     except Exception as exc:
         report["frame_generation"] = str(exc)
+    try:
+        from ..upscale.video.native import probe_capabilities
+
+        report["rtx_video"] = asdict(probe_capabilities(ai_gpu_uuid))
+    except Exception as exc:
+        report["rtx_video"] = str(exc)
     report["choices"] = {
         "upscale": [factor for factor in UPSCALING_MODES],
         "nr_preset": list(NR_PRESETS),
@@ -389,6 +537,9 @@ def collect_info(ai_gpu_uuid: str) -> dict[str, Any]:
         "fps": list(FPS_CHOICES),
         "engine": list(ENGINE_CHOICES),
         "rename": list(RENAME_MODES),
+        "vsr_quality": [1, 2, 3, 4],
+        "upscale_scale": [factor for _label, factor in SCALE_FACTORS],
+        "hdr_precision": list(HDR_PRECISIONS),
     }
     return report
 
@@ -428,6 +579,21 @@ def _print_info(report: dict[str, Any]) -> None:
             out.write(f"  {capabilities['detail']}\n")
     else:
         out.write(f"Frame generation: {capabilities}\n")
+    rtx_video = report["rtx_video"]
+    if isinstance(rtx_video, dict):
+        def state(capability: dict[str, Any]) -> str:
+            if capability.get("available"):
+                return "available"
+            return (
+                f"unavailable (needs driver {capability.get('min_driver_major', 0)}.{capability.get('min_driver_minor', 0)}, "
+                f"init result 0x{int(capability.get('init_result', 0) or 0):08X})"
+            )
+        out.write(
+            f"RTX Video: VSR {state(rtx_video.get('vsr') or {})} | HDR {state(rtx_video.get('hdr') or {})} "
+            f"| SDK {rtx_video.get('sdk_version')} | worker {rtx_video.get('worker_version')}\n"
+        )
+    else:
+        out.write(f"RTX Video: {rtx_video}\n")
     out.write("\nChoices:\n")
     for key, values in report["choices"].items():
         out.write(f"  {key}: {', '.join(f'{v:g}' if isinstance(v, float) else str(v) for v in values)}\n")
@@ -495,7 +661,10 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     settings = _publish_settings(settings, args)
     reporter = ProgressReporter("none" if args.quiet else args.progress)
-    handlers = {"image": run_image, "video": run_video, "interpolate": run_interpolate}
+    handlers = {
+        "image": run_image, "video": run_video, "interpolate": run_interpolate,
+        "upscale-image": run_upscale_image, "upscale-video": run_upscale_video,
+    }
     interrupt = _StopOnInterrupt()
     previous = signal.signal(signal.SIGINT, interrupt)
     try:

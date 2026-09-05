@@ -141,10 +141,12 @@ Saved GPU selections use stable GPU identity. If a previously saved GPU is no lo
 The same processing layer is available as a `dlss5ve-cli` command for scripts and other programs. The portable package runs it with the embedded interpreter; a development checkout can also install it with uv.
 
 ```powershell
-.\dlss5ve-cli.bat info                                           # GPUs, encoders, frame generation, runtime builds
+.\dlss5ve-cli.bat info                                           # GPUs, encoders, frame generation, RTX Video
 .\dlss5ve-cli.bat image photo.png --upscale 2 --format PNG
 .\dlss5ve-cli.bat video clip.mp4 --codec "H.265 (NVIDIA NVENC)" --hdr --output-dir D:\out
 .\dlss5ve-cli.bat interpolate D:\clips --fps 60                  # a folder processes its supported files in name order
+.\dlss5ve-cli.bat upscale-video clip.mp4 --scale 2 --hdr         # RTX Video Super Resolution plus RTX Video HDR
+.\dlss5ve-cli.bat upscale-image photo.jpg --width 3840 --format PNG
 ```
 
 ```powershell
@@ -154,7 +156,8 @@ uv sync --extra webui             # adds gradio (implies image)
 uv run dlss5ve-cli info
 ```
 
-- Defaults come from `config/config.ini`, the same file the WebUI writes. `--preset FILE` applies a preset exported from the Settings tab instead; flags override individual values on top. `--dlss-architecture` selects the Neural Rendering runtime build the same way the Settings tab does.
+- Defaults come from `config/config.ini`, the same file the WebUI writes. `--preset FILE` applies a preset exported from the Settings tab instead; flags override individual values on top.
+- `upscale-video` and `upscale-image` run RTX Video Super Resolution (and RTX Video HDR for video) with the Upscale tab's saved settings as defaults. `--scale FACTOR` or `--width PX` (with `--aspect-lock`, or `--height PX` with `--no-aspect-lock`) chooses the output size; `--no-vsr --hdr` converts SDR to HDR10 at the source size.
 - `--json` writes the batch result (the manifest from `logs/` plus the command) to stdout. Progress and the per-file summary go to stderr; `--progress json` turns progress into JSON Lines with one object per file state change, `--quiet` silences both.
 - Exit codes: 0 all inputs succeeded, 1 some failed, 2 usage error or missing input, 3 runtime or GPU unavailable, 130 interrupted. Ctrl+C stops the batch cleanly (incomplete output removed, finished files kept); a second Ctrl+C aborts.
 - `image` writes files only; add `--zip` for the ZIP the WebUI offers. One GPU render per process; two `dlss5ve-cli` processes at once will both spawn workers.

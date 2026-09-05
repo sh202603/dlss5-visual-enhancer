@@ -6,10 +6,13 @@ the values taken from ``settings`` and must name real Options fields, with
 one exception: ``hdr_mode`` is accepted for video and frame interpolation and
 is coerced against the effective codec before it lands in the Options
 (``preserve_hdr`` for video, ``hdr_mode`` for frame interpolation).
+
+The Upscale builders wrap the ``options_from_settings`` functions that the
+upscale package ships; only the override check is added here.
 """
 from __future__ import annotations
 
-from dataclasses import fields
+from dataclasses import fields, replace
 from typing import Any
 
 from ..frame_interpolation.models import FrameInterpolationOptions
@@ -17,11 +20,15 @@ from ..neural_rendering.video.models import ConversionOptions
 from .models import UISettings, coerce_hdr_mode
 
 
-def _build(cls: type, values: dict[str, Any], overrides: dict[str, Any]) -> Any:
+def _check_overrides(cls: type, overrides: dict[str, Any]) -> None:
     known = {field.name for field in fields(cls)}
     unknown = sorted(set(overrides) - known)
     if unknown:
         raise TypeError(f"Unknown {cls.__name__} field(s): {', '.join(unknown)}.")
+
+
+def _build(cls: type, values: dict[str, Any], overrides: dict[str, Any]) -> Any:
+    _check_overrides(cls, overrides)
     values.update(overrides)
     return cls(**values)
 
@@ -94,3 +101,19 @@ def frame_interpolation_options(
     codec = overrides.get("codec", values["codec"])
     values["hdr_mode"] = coerce_hdr_mode(codec, hdr_mode)
     return _build(FrameInterpolationOptions, values, overrides)
+
+
+def upscale_video_options(settings: UISettings, **overrides: Any):
+    from ..upscale.video.models import UpscaleOptions, options_from_settings
+
+    _check_overrides(UpscaleOptions, overrides)
+    return replace(options_from_settings(settings), **overrides)
+
+
+def upscale_image_options(settings: UISettings, **overrides: Any):
+    # Imported lazily for the same reason as image_options: the image models
+    # sit next to the optional decoders.
+    from ..upscale.image.models import ImageUpscaleOptions, options_from_settings
+
+    _check_overrides(ImageUpscaleOptions, overrides)
+    return replace(options_from_settings(settings), **overrides)
