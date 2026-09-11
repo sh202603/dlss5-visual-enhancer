@@ -80,7 +80,7 @@ function Invoke-Stage {
 #     so that stage 2 sees the original base names.
 $stage1 = Invoke-Stage 'Neural Rendering' (@(
     'video') + $InputPath + @(
-    '--upscale', '1', '--no-hdr',
+    '--nr-scale', '1', '--no-hdr',
     '--codec', $Codec, '--container', 'MP4',
     '--rename', 'Copy',
     '--output-dir', $stageDir, '--json') + $NrArgs)

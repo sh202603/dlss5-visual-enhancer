@@ -9,6 +9,10 @@ Conventions:
 - the effective UISettings are published to ``settings.storage.SETTINGS_STATE``
   so that the GPU lookups the processors and previews do see the same values
   the flags produced.
+- the ``--json`` payload is built from the batch result the processing layer
+  returns; since v8 the processing layer writes no manifest files, only the
+  session log (``logs/app-<stamp>.log``), whose path the payload carries as
+  ``log_path``.
 
 Exit codes: 0 all inputs succeeded, 1 some or all inputs failed, 2 usage error
 or missing input, 3 runtime or GPU unavailable, 130 interrupted by the user.
@@ -28,7 +32,7 @@ from ..core.ffmpeg import CODEC_CHOICES, ENCODING_QUALITIES
 from ..core.jobs import cancel_active_job
 from ..core.naming import RENAME_MODES
 from ..core.paths import CONFIG_PATH, ROOT
-from ..core.runtime import DLSS_MODEL_PRESETS, NR_PRESETS, NR_STYLES, UPSCALING_MODES
+from ..core.runtime import NR_STYLES, UPSCALING_MODES
 from ..frame_interpolation.models import ENGINE_CHOICES, FPS_CHOICES
 from ..settings.models import CONTAINER_CHOICES, IMAGE_FORMAT_CHOICES, UISettings
 from ..settings.presets import import_settings_preset
@@ -42,6 +46,8 @@ EXIT_PARTIAL = 1
 EXIT_USAGE = 2
 EXIT_RUNTIME = 3
 EXIT_CANCELLED = 130
+
+NR_SCALE_CHOICES = tuple(UPSCALING_MODES)
 
 
 class UsageError(ValueError):
@@ -85,7 +91,7 @@ def _add_common(parser: argparse.ArgumentParser, settings: UISettings) -> None:
     )
     group.add_argument(
         "--video-gpu", metavar="UUID", default=settings.video_gpu_uuid,
-        help="Video Processing (NVENC) GPU UUID, or auto (default: %(default)s).",
+        help="Video Processing (NVENC) GPU UUID, or auto (default: %(default)s). Neural Rendering with --nr-gpu encodes on the AI GPU and ignores this.",
     )
     group.add_argument("--json", action="store_true", help="Write the batch result as JSON to stdout.")
     group.add_argument(
@@ -95,18 +101,31 @@ def _add_common(parser: argparse.ArgumentParser, settings: UISettings) -> None:
     group.add_argument("--quiet", action="store_true", help="Suppress progress and the per-file summary on stderr.")
 
 
-def _add_neural(parser: argparse.ArgumentParser, settings: UISettings) -> None:
+def _add_neural(parser: argparse.ArgumentParser, settings: UISettings, *, video: bool) -> None:
     group = parser.add_argument_group("neural rendering")
-    group.add_argument("--nr-preset", choices=tuple(NR_PRESETS), default=settings.nr_preset, help="(default: %(default)s)")
     group.add_argument("--nr-style", choices=tuple(NR_STYLES), default=settings.nr_style, help="(default: %(default)s)")
     group.add_argument("--nr-intensity", type=float, metavar="0..2", default=settings.nr_intensity, help="(default: %(default)s)")
+    group.add_argument("--nr-passes", type=int, metavar="1..4", default=settings.nr_passes, help="Multi Pass: number of Neural Rendering passes (default: %(default)s)")
     group.add_argument("--local-tone", type=float, metavar="0..2", default=settings.local_tone_strength, help="Local Tone Strength (default: %(default)s)")
     group.add_argument("--local-structure", type=float, metavar="0..2", default=settings.local_structure_strength, help="Local Structure Strength (default: %(default)s)")
     group.add_argument("--skin-structure", type=float, metavar="-1..2", default=settings.skin_structure_strength, help="Skin Structure Strength; -1 is the native default (default: %(default)s)")
     group.add_argument("--automatic-mask", action=argparse.BooleanOptionalAction, default=settings.automatic_mask, help="Experimental runtime-generated mask.")
-    group.add_argument("--dlss-model-preset", choices=tuple(DLSS_MODEL_PRESETS), default=settings.dlss_model_preset, help="(default: %(default)s)")
-    factors = ", ".join(f"{factor:g}" for factor in UPSCALING_MODES)
-    group.add_argument("--upscale", type=float, metavar="FACTOR", default=settings.upscaling_factor, help=f"One of {factors}; 1 is DLAA (default: %(default)s)")
+    scales = ", ".join(f"{factor:g}" for factor in NR_SCALE_CHOICES)
+    group.add_argument(
+        "--nr-scale", type=float, choices=NR_SCALE_CHOICES, metavar="FACTOR", default=settings.upscaling_factor,
+        help=f"Resolution entering Neural Rendering as a fraction of the source: {scales}; below 1 is a Lanczos downscale, the output keeps that size (default: %(default)s)",
+    )
+    group.add_argument("--nr-gpu", action=argparse.BooleanOptionalAction, default=settings.nr_gpu_mode, help="Processing Engine Path: keep frames in VRAM (CUDA/D3D12 interop); --no-nr-gpu stages through system memory.")
+
+    composition = parser.add_argument_group("composition")
+    composition.add_argument("--color-strength", type=float, metavar="0..1", default=settings.nr_color_strength, help="NR Color Strength; 0 keeps the source colour (default: %(default)s)")
+    composition.add_argument("--tone-preservation", type=float, metavar="0..1", default=settings.tone_preservation, help="Tone Preservation; 1 keeps the source tone (default: %(default)s)")
+    composition.add_argument("--face-skin-protection", type=float, metavar="0..1", default=settings.face_skin_protection, help="(default: %(default)s)")
+    composition.add_argument("--grain-preservation", type=float, metavar="0..1", default=settings.grain_preservation, help="(default: %(default)s)")
+    composition.add_argument("--nr-mask", metavar="FILE", default=None, help="Custom NR Mask image; luminance times alpha limits where Neural Rendering is applied.")
+    composition.add_argument("--mask-feather", type=int, metavar="0..128", default=settings.mask_feather, help="Blur radius of the Custom NR Mask in output pixels (default: %(default)s)")
+    if video:
+        composition.add_argument("--shimmer-suppression", type=float, metavar="0..1", default=settings.shimmer_suppression, help="Temporal stabilization of fine detail between frames (default: %(default)s)")
 
 
 def _add_encoding(parser: argparse.ArgumentParser, codec: str, container: str, quality: str, hdr: bool | None) -> None:
@@ -182,23 +201,26 @@ def build_parser(settings: UISettings) -> argparse.ArgumentParser:
     commands = parser.add_subparsers(dest="command", metavar="COMMAND", required=True)
     inputs_help = "Files, or folders whose supported files are processed in name order (subfolders excluded)."
 
-    image = _command(commands, "image", "Neural Rendering and upscaling for images.")
+    image = _command(commands, "image", "Neural Rendering for images.")
     image.add_argument("inputs", nargs="+", metavar="PATH", help=inputs_help)
     _add_common(image, settings)
-    _add_neural(image, settings)
+    _add_neural(image, settings, video=False)
     output = image.add_argument_group("output")
     output.add_argument("--format", choices=IMAGE_FORMAT_CHOICES, default=settings.image_format, help="(default: %(default)s)")
     output.add_argument("--quality", type=int, metavar="1..100", default=settings.image_quality, help="Lossy quality for JPEG, WebP, AVIF (default: %(default)s)")
     output.add_argument("--zip", action="store_true", help="Also write a ZIP of the successful outputs next to them.")
     _add_naming(image, settings.image_rename_mode, settings.image_custom_suffix)
 
-    video = _command(commands, "video", "Neural Rendering and upscaling for videos.")
+    video = _command(commands, "video", "Neural Rendering for videos.")
     video.add_argument("inputs", nargs="+", metavar="PATH", help=inputs_help)
     _add_common(video, settings)
-    _add_neural(video, settings)
+    _add_neural(video, settings, video=True)
     _add_encoding(video, settings.codec, settings.container, settings.quality, settings.hdr_mode)
     _add_naming(video, settings.video_rename_mode, settings.video_custom_suffix)
-    video.add_argument("--preview-seconds", type=float, metavar="SEC", help="Render only the first SEC seconds with the chosen codec.")
+    output = video.add_argument_group("output")
+    output.add_argument("--zip", action="store_true", help="Also write a ZIP of the successful outputs next to them (two or more inputs).")
+    output.add_argument("--preview-seconds", type=float, metavar="SEC", help="Render only the first SEC seconds with the chosen codec.")
+    output.add_argument("--preview-frames", type=int, metavar="N", help="Render only the first N frames with the chosen codec.")
 
     interpolate = _command(commands, "interpolate", "DLSS Frame Generation to a target frame rate.")
     interpolate.add_argument("inputs", nargs="+", metavar="PATH", help=inputs_help)
@@ -240,7 +262,7 @@ def build_parser(settings: UISettings) -> argparse.ArgumentParser:
     _add_naming(upscale_video, settings.upscale_rename_mode, settings.upscale_custom_suffix)
     upscale_video.add_argument("--preview-seconds", type=float, metavar="SEC", help="Process only the first SEC seconds.")
 
-    info = _command(commands, "info", "Show the version, GPUs, encoders, frame-generation and RTX Video capabilities, and choices.")
+    info = _command(commands, "info", "Show the version, GPUs, encoders, the Neural Rendering bridge, frame-generation and RTX Video capabilities, and choices.")
     info.add_argument("--json", action="store_true", help="Write the report as JSON instead of text.")
     info.add_argument("--ai-gpu", metavar="UUID", default=settings.ai_gpu_uuid, help="GPU to probe for frame generation (default: %(default)s).")
     info.add_argument("--preset", metavar="FILE", help=argparse.SUPPRESS)
@@ -292,18 +314,34 @@ def _publish_settings(settings: UISettings, args: argparse.Namespace) -> UISetti
 
 
 def _neural_overrides(args: argparse.Namespace) -> dict[str, Any]:
-    return {
+    """The Neural Rendering flags as Options fields; the mask file is validated here."""
+    from ..core.nr_composition import inspect_nr_mask
+
+    try:
+        nr_mask = inspect_nr_mask(args.nr_mask)
+    except ValueError as exc:
+        raise UsageError(f"--nr-mask: {exc}") from exc
+    overrides = {
         "ai_gpu_uuid": args.ai_gpu,
-        "nr_preset": args.nr_preset,
         "nr_style": args.nr_style,
         "nr_intensity": args.nr_intensity,
+        "nr_passes": args.nr_passes,
         "local_tone_strength": args.local_tone,
         "local_structure_strength": args.local_structure,
         "skin_structure_strength": args.skin_structure,
+        "nr_color_strength": args.color_strength,
+        "tone_preservation": args.tone_preservation,
+        "face_skin_protection": args.face_skin_protection,
+        "grain_preservation": args.grain_preservation,
+        "mask_feather": args.mask_feather,
+        "nr_mask": nr_mask,
         "automatic_mask": bool(args.automatic_mask),
-        "dlss_model_preset": args.dlss_model_preset,
-        "upscaling_factor": args.upscale,
+        "nr_gpu_mode": bool(args.nr_gpu),
+        "upscaling_factor": args.nr_scale,
     }
+    if hasattr(args, "shimmer_suppression"):
+        overrides["shimmer_suppression"] = args.shimmer_suppression
+    return overrides
 
 
 def _check_video_like(options: Any, *, neural: bool) -> None:
@@ -325,6 +363,11 @@ def _check_video_like(options: Any, *, neural: bool) -> None:
     preview = getattr(options, "preview_seconds", None)
     if preview is not None and not preview > 0:
         raise UsageError("--preview-seconds must be a positive number of seconds.")
+    frames = getattr(options, "preview_frames", None)
+    if frames is not None and frames <= 0:
+        raise UsageError("--preview-frames must be a positive number of frames.")
+    if preview is not None and frames is not None:
+        raise UsageError("Use either --preview-seconds or --preview-frames, not both.")
 
 
 def _check_output_dir(value: str | None) -> str:
@@ -337,14 +380,32 @@ def _check_output_dir(value: str | None) -> str:
         raise UsageError(f"--output-dir: {exc}") from exc
 
 
-def _payload(command: str, manifest_path: str, **extra: Any) -> dict[str, Any]:
-    """The batch manifest written by the processing layer, plus the command."""
-    manifest = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
-    if "status" not in manifest:
-        # The Upscale manifests carry only the cancelled flag; use the Neural
-        # Rendering vocabulary so callers see one status field.
-        manifest["status"] = "cancelled" if manifest.get("cancelled") else ("partial" if manifest.get("failures") else "success")
-    return {"command": command, **manifest, "manifest_path": manifest_path, **extra}
+def _payload(command: str, result: Any, options: Any, output_directory: str, **extra: Any) -> dict[str, Any]:
+    """The batch result as one JSON document.
+
+    ``successes`` and ``failures`` are the processing layer's result
+    dataclasses; ``status`` uses one vocabulary for every command
+    (``success``, ``partial``, ``cancelled``). ``options`` replaces a Custom
+    NR Mask selection with its summary so no temporary path leaks.
+    """
+    from ..core.nr_composition import report_options
+
+    successes = [asdict(item) for item in result.successes]
+    failures = [asdict(item) for item in result.failures]
+    cancelled = bool(result.cancelled)
+    status = "cancelled" if cancelled else ("partial" if failures else "success")
+    has_mask = any(field == "nr_mask" for field in getattr(type(options), "__dataclass_fields__", {}))
+    return {
+        "command": command,
+        "status": status,
+        "cancelled": cancelled,
+        "output_directory": output_directory,
+        "log_path": result.manifest_path,
+        "options": report_options(options) if has_mask else asdict(options),
+        "successes": successes,
+        "failures": failures,
+        **extra,
+    }
 
 
 def run_image(args: argparse.Namespace, settings: UISettings, reporter: ProgressReporter) -> dict[str, Any]:
@@ -355,6 +416,7 @@ def run_image(args: argparse.Namespace, settings: UISettings, reporter: Progress
         raise RuntimeError(
             f"Image decoding packages are missing ({exc.name}). Install with the 'image' extra: uv sync --extra image"
         ) from exc
+    from ..core.runtime import resolve_native_settings, resolve_upscaling_mode
     from ..settings.factory import image_options
 
     options = image_options(
@@ -365,14 +427,16 @@ def run_image(args: argparse.Namespace, settings: UISettings, reporter: Progress
         rename_mode=args.rename,
         custom_suffix=args.suffix,
     )
-    _check_output_dir(args.output_dir)
+    resolve_native_settings(options)
+    resolve_upscaling_mode(options.upscaling_factor)
+    output_directory = _check_output_dir(args.output_dir)
     reporter.register(inputs)
     result = convert_images(
         inputs, options, reporter, output_dir=args.output_dir, on_item_update=reporter.item_update,
         # Thumbnails for the browser gallery are a WebUI concern.
         generate_previews=False, create_zip=bool(args.zip),
     )
-    return _payload("image", result.manifest_path, zip_path=result.zip_path)
+    return _payload("image", result, options, output_directory, zip_path=result.zip_path)
 
 
 def run_video(args: argparse.Namespace, settings: UISettings, reporter: ProgressReporter) -> dict[str, Any]:
@@ -391,14 +455,21 @@ def run_video(args: argparse.Namespace, settings: UISettings, reporter: Progress
         rename_mode=args.rename,
         custom_suffix=args.suffix,
         preview_seconds=args.preview_seconds,
+        preview_frames=args.preview_frames,
         # The CLI has no browser to please: previews keep the caller's codec.
         preview_compat=False,
     )
     _check_video_like(options, neural=True)
-    _check_output_dir(args.output_dir)
+    output_directory = _check_output_dir(args.output_dir)
     reporter.register(inputs)
-    result = convert_videos(inputs, options, reporter, output_dir=args.output_dir, on_item_update=reporter.item_update)
-    return _payload("video", result.manifest_path)
+    result = convert_videos(
+        inputs, options, reporter, output_dir=args.output_dir, on_item_update=reporter.item_update,
+        create_archive=bool(args.zip),
+    )
+    return _payload(
+        "video", result, options, output_directory,
+        zip_path=result.archive_path, zip_error=result.archive_error or None,
+    )
 
 
 def run_interpolate(args: argparse.Namespace, settings: UISettings, reporter: ProgressReporter) -> dict[str, Any]:
@@ -423,10 +494,10 @@ def run_interpolate(args: argparse.Namespace, settings: UISettings, reporter: Pr
     )
     _check_video_like(options, neural=False)
     options.target_rate  # raises ValueError for an unsupported FPS choice
-    _check_output_dir(args.output_dir)
+    output_directory = _check_output_dir(args.output_dir)
     reporter.register(inputs)
     result = interpolate_videos(inputs, options, reporter, output_dir=args.output_dir, on_item_update=reporter.item_update)
-    return _payload("interpolate", result.manifest_path)
+    return _payload("interpolate", result, options, output_directory)
 
 
 def run_upscale_image(args: argparse.Namespace, settings: UISettings, reporter: ProgressReporter) -> dict[str, Any]:
@@ -465,7 +536,7 @@ def run_upscale_image(args: argparse.Namespace, settings: UISettings, reporter: 
         zip_path = create_media_archive(
             [item.output_path for item in result.successes], args.output_dir, "RTXVIDEO_IMAGE_BATCH",
         )
-    return _payload("upscale-image", result.manifest_path, output_directory=output_directory, zip_path=zip_path)
+    return _payload("upscale-image", result, options, output_directory, zip_path=zip_path)
 
 
 def run_upscale_video(args: argparse.Namespace, settings: UISettings, reporter: ProgressReporter) -> dict[str, Any]:
@@ -497,7 +568,7 @@ def run_upscale_video(args: argparse.Namespace, settings: UISettings, reporter: 
     output_directory = _check_output_dir(args.output_dir)
     reporter.register(inputs)
     result = upscale_videos(inputs, options, reporter, output_dir=args.output_dir, on_item_update=reporter.item_update)
-    return _payload("upscale-video", result.manifest_path, output_directory=output_directory)
+    return _payload("upscale-video", result, options, output_directory)
 
 
 def collect_info(ai_gpu_uuid: str) -> dict[str, Any]:
@@ -530,6 +601,18 @@ def collect_info(ai_gpu_uuid: str) -> dict[str, Any]:
     except Exception as exc:
         report["encoders"] = str(exc)
     try:
+        # Loading the bridge DLL reads its version and checks the frame ABI;
+        # NGX itself is initialized only by a render session.
+        from ..core.neural_bridge import BRIDGE_ABI_VERSION, BRIDGE_MANAGER
+        from ..core.paths import DLSSNR_BRIDGE
+
+        BRIDGE_MANAGER._load()
+        report["neural_bridge"] = {
+            "path": str(DLSSNR_BRIDGE), "version": BRIDGE_MANAGER.version, "abi_version": BRIDGE_ABI_VERSION,
+        }
+    except Exception as exc:
+        report["neural_bridge"] = str(exc)
+    try:
         report["frame_generation"] = asdict(probe_frame_interpolation_capabilities(ai_gpu_uuid))
     except Exception as exc:
         report["frame_generation"] = str(exc)
@@ -540,10 +623,9 @@ def collect_info(ai_gpu_uuid: str) -> dict[str, Any]:
     except Exception as exc:
         report["rtx_video"] = str(exc)
     report["choices"] = {
-        "upscale": [factor for factor in UPSCALING_MODES],
-        "nr_preset": list(NR_PRESETS),
+        "nr_scale": list(NR_SCALE_CHOICES),
         "nr_style": list(NR_STYLES),
-        "dlss_model_preset": list(DLSS_MODEL_PRESETS),
+        "nr_passes": [1, 2, 3, 4],
         "codec": list(CODEC_CHOICES),
         "container": list(CONTAINER_CHOICES),
         "encoding_quality": list(ENCODING_QUALITIES),
@@ -581,6 +663,11 @@ def _print_info(report: dict[str, Any]) -> None:
         out.write(f"FFmpeg encoders: {', '.join(available) or 'none'}\n")
     else:
         out.write(f"FFmpeg encoders: {encoders}\n")
+    bridge = report["neural_bridge"]
+    if isinstance(bridge, dict):
+        out.write(f"Neural Rendering bridge: {bridge.get('version')} | frame ABI {bridge.get('abi_version')}\n")
+    else:
+        out.write(f"Neural Rendering bridge: {bridge}\n")
     capabilities = report["frame_generation"]
     if isinstance(capabilities, dict):
         state = "available" if capabilities.get("available") else "unavailable"
@@ -623,9 +710,11 @@ def _summarize(payload: dict[str, Any], stream) -> None:
         error = str(item["error"]).splitlines()[0] if item["error"] else ""
         stream.write(f"{state} {Path(item['input_path']).name}: {error}\n")
     extra = f" | zip: {payload['zip_path']}" if payload.get("zip_path") else ""
+    if payload.get("zip_error"):
+        extra += f" | zip failed: {payload['zip_error']}"
     stream.write(
         f"{payload['status']}: {len(payload['successes'])} ok, {len(payload['failures'])} failed"
-        f" | output: {payload.get('output_directory')} | manifest: {payload['manifest_path']}{extra}\n"
+        f" | output: {payload['output_directory']} | log: {payload['log_path']}{extra}\n"
     )
 
 

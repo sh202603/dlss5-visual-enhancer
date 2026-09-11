@@ -209,7 +209,8 @@ The same processing layer is available as a `dlss5ve-cli` command for scripts an
 
 ```powershell
 .\dlss5ve-cli.bat info                                           # GPUs, encoders, frame generation, RTX Video
-.\dlss5ve-cli.bat image photo.png --upscale 2 --format PNG
+.\dlss5ve-cli.bat image photo.png --nr-passes 2 --format PNG
+.\dlss5ve-cli.bat image photo.png --color-strength 0 --tone-preservation 1  # Detail-Only composition
 .\dlss5ve-cli.bat video clip.mp4 --codec "H.265 (NVIDIA NVENC)" --hdr --output-dir D:\out
 .\dlss5ve-cli.bat interpolate D:\clips --fps 60                  # a folder processes its supported files in name order
 .\dlss5ve-cli.bat upscale-video clip.mp4 --scale 2 --hdr         # RTX Video Super Resolution plus RTX Video HDR
@@ -224,13 +225,14 @@ uv run dlss5ve-cli info
 ```
 
 - Defaults come from `config/config.ini`, the same file the WebUI writes. `--preset FILE` applies a preset exported from the Settings tab instead; flags override individual values on top.
+- `image` and `video` expose every Neural Rendering control of the WebUI: `--nr-style`, `--nr-intensity`, `--nr-passes`, the tone and structure strengths, the composition controls (`--color-strength`, `--tone-preservation`, `--face-skin-protection`, `--grain-preservation`), `--nr-mask FILE` with `--mask-feather`, `--nr-scale` (1, 0.75, 0.5, 0.25: the resolution entering Neural Rendering; enlargement is `upscale-*`), `--nr-gpu/--no-nr-gpu` (Processing Engine Path), and for video `--shimmer-suppression`. With `--nr-gpu` and an NVENC codec the whole decode, render, and encode path stays on the AI GPU and `--video-gpu` is not used.
 - `upscale-video` and `upscale-image` run RTX Video Super Resolution (and RTX Video HDR for video) with the Upscale tab's saved settings as defaults. `--scale FACTOR` or `--width PX` (with `--aspect-lock`, or `--height PX` with `--no-aspect-lock`) chooses the output size; `--no-vsr --hdr` converts SDR to HDR10 at the source size.
 - Neural Rendering and RTX Video run in different workers, so combining them is two commands: `examples
 r_vsr_hdr.ps1 INPUT -OutputDir DIR -Scale 2` renders NR first (SDR, source size) and then applies VSR and RTX Video HDR to the result.
-- `--json` writes the batch result (the manifest from `logs/` plus the command) to stdout. Progress and the per-file summary go to stderr; `--progress json` turns progress into JSON Lines with one object per file state change, `--quiet` silences both.
+- `--json` writes the batch result to stdout: `status` (`success`, `partial`, `cancelled`), `output_directory`, `log_path` (the session log in `logs/`), the effective `options`, and the per-file `successes` and `failures` with their dimensions, frame counts, and bridge diagnostics. Progress and the per-file summary go to stderr; `--progress json` turns progress into JSON Lines with one object per file state change, `--quiet` silences both.
 - `--version` (also the first line of `info` and `--help`) prints the package version and the upstream release it is built on; the package version follows the upstream release in its first two components.
 - Exit codes: 0 all inputs succeeded, 1 some failed, 2 usage error or missing input, 3 runtime or GPU unavailable, 130 interrupted. Ctrl+C stops the batch cleanly (incomplete output removed, finished files kept); a second Ctrl+C aborts.
-- `image` writes files only; add `--zip` for the ZIP the WebUI offers. One GPU render per process; two `dlss5ve-cli` processes at once will both spawn workers.
+- `image`, `video`, and `upscale-image` write files only; add `--zip` for the ZIP the WebUI offers. `video` also takes `--preview-seconds SEC` or `--preview-frames N` for a short test render. One GPU render per process; two `dlss5ve-cli` processes at once will both initialise the Neural Rendering runtime.
 - To use the package from another project, add this checkout as an editable dependency (`uv add --editable <path to this folder>`). If the package ends up outside the checkout, point `DLSS5VE_HOME` at the checkout so the runtime binaries are found.
 
 ## License and third-party notices

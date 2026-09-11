@@ -1,20 +1,22 @@
 [project]
 name = "dlss5ve"
 dynamic = ["version"]
-description = "DLSS 5 Visual Enhancer: NVIDIA DLSS 5 Neural Rendering and Frame Generation for images and videos"
+description = "DLSS 5 Visual Enhancer: NVIDIA DLSS 5 Neural Rendering, Frame Generation, and RTX Video for images and videos"
 readme = "README.md"
 requires-python = ">=3.12"
 license = "MIT"
 license-files = ["LICENSE"]
 dependencies = [
     "numpy>=2.0",
-    "av>=16.1",
+    # PyAV 18: VideoFrame.from_dlpack and owned CUDA hwaccel devices (v8 NVDEC/NVENC path).
+    "av>=18.1",
     "opencv-python-headless>=4.10",
+    # The Custom NR Mask and the render note are decoded with Pillow in core.
+    "pillow>=11",
 ]
 
 [project.optional-dependencies]
 image = [
-    "pillow>=11",
     "rawpy>=0.25",
     "pillow-heif>=1.0",
     "resvg-py>=0.5",

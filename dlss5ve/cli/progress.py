@@ -84,7 +84,7 @@ class ProgressReporter:
                 "elapsed_seconds": round(float(update.elapsed_seconds), 3),
             }
             if update.index is None:
-                record["manifest_path"] = update.manifest_path
+                record["log_path"] = update.manifest_path
             else:
                 record["input"] = self._names.get(update.index, "")
             self._write(json.dumps(record) + "\n")

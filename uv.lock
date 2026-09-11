@@ -118,18 +118,17 @@ dependencies = [
     { name = "av", marker = "sys_platform == 'win32'" },
     { name = "numpy", marker = "sys_platform == 'win32'" },
     { name = "opencv-python-headless", marker = "sys_platform == 'win32'" },
+    { name = "pillow", marker = "sys_platform == 'win32'" },
 ]
 
 [package.optional-dependencies]
 image = [
-    { name = "pillow", marker = "sys_platform == 'win32'" },
     { name = "pillow-heif", marker = "sys_platform == 'win32'" },
     { name = "rawpy", marker = "sys_platform == 'win32'" },
     { name = "resvg-py", marker = "sys_platform == 'win32'" },
 ]
 webui = [
     { name = "gradio", marker = "sys_platform == 'win32'" },
-    { name = "pillow", marker = "sys_platform == 'win32'" },
     { name = "pillow-heif", marker = "sys_platform == 'win32'" },
     { name = "rawpy", marker = "sys_platform == 'win32'" },
     { name = "resvg-py", marker = "sys_platform == 'win32'" },
@@ -137,12 +136,12 @@ webui = [
 
 [package.metadata]
 requires-dist = [
-    { name = "av", specifier = ">=16.1" },
+    { name = "av", specifier = ">=18.1" },
     { name = "dlss5ve", extras = ["image"], marker = "extra == 'webui'" },
     { name = "gradio", marker = "extra == 'webui'", specifier = ">=6.0" },
     { name = "numpy", specifier = ">=2.0" },
     { name = "opencv-python-headless", specifier = ">=4.10" },
-    { name = "pillow", marker = "extra == 'image'", specifier = ">=11" },
+    { name = "pillow", specifier = ">=11" },
     { name = "pillow-heif", marker = "extra == 'image'", specifier = ">=1.0" },
     { name = "rawpy", marker = "extra == 'image'", specifier = ">=0.25" },
     { name = "resvg-py", marker = "extra == 'image'", specifier = ">=0.5" },
