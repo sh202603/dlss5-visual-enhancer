@@ -4,6 +4,7 @@ outputs/
 jobs/
 config/
 live/
+temp/
 
 # Vendored embedded interpreter and its site-packages (release package only).
 bin/python-*/

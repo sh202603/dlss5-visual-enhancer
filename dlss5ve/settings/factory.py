@@ -34,16 +34,23 @@ def _build(cls: type, values: dict[str, Any], overrides: dict[str, Any]) -> Any:
 
 
 def _neural_values(settings: UISettings) -> dict[str, Any]:
+    """The Neural Rendering controls shared by the Image and Video modes."""
     return {
         "ai_gpu_uuid": settings.ai_gpu_uuid,
-        "nr_preset": settings.nr_preset,
         "nr_style": settings.nr_style,
         "nr_intensity": settings.nr_intensity,
+        "nr_passes": settings.nr_passes,
         "local_tone_strength": settings.local_tone_strength,
         "local_structure_strength": settings.local_structure_strength,
         "skin_structure_strength": settings.skin_structure_strength,
+        "nr_color_strength": settings.nr_color_strength,
+        "tone_preservation": settings.tone_preservation,
+        "face_skin_protection": settings.face_skin_protection,
+        "grain_preservation": settings.grain_preservation,
+        "mask_feather": settings.mask_feather,
+        "nr_mask": settings.nr_mask,
         "automatic_mask": settings.automatic_mask,
-        "dlss_model_preset": settings.dlss_model_preset,
+        "nr_gpu_mode": settings.nr_gpu_mode,
         "upscaling_factor": settings.upscaling_factor,
     }
 
@@ -71,6 +78,8 @@ def video_options(settings: UISettings, **overrides: Any) -> ConversionOptions:
     values.update(
         {
             "video_gpu_uuid": settings.video_gpu_uuid,
+            # Temporal stabilization exists only for video (and Live).
+            "shimmer_suppression": settings.shimmer_suppression,
             "codec": settings.codec,
             "container": settings.container,
             "quality": settings.quality,
