@@ -13,6 +13,10 @@ Conventions:
   returns; since v8 the processing layer writes no manifest files, only the
   session log (``logs/app-<stamp>.log``), whose path the payload carries as
   ``log_path``.
+- since v9 the processing layer decides two things the caller used to choose:
+  the output container (from the codec) and, for video, whether frames stay on
+  CUDA or pass through system memory (NVENC codecs stay on CUDA). There are no
+  flags for either; ``--nr-gpu`` remains only on ``image``.
 
 Exit codes: 0 all inputs succeeded, 1 some or all inputs failed, 2 usage error
 or missing input, 3 runtime or GPU unavailable, 130 interrupted by the user.
@@ -28,13 +32,13 @@ from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any, Sequence
 
-from ..core.ffmpeg import CODEC_CHOICES, ENCODING_QUALITIES
+from ..core.ffmpeg import CODEC_CHOICES, ENCODING_QUALITIES, container_for_codec
 from ..core.jobs import cancel_active_job
 from ..core.naming import RENAME_MODES
 from ..core.paths import CONFIG_PATH, ROOT
 from ..core.runtime import NR_STYLES, UPSCALING_MODES
 from ..frame_interpolation.models import ENGINE_CHOICES, FPS_CHOICES
-from ..settings.models import CONTAINER_CHOICES, IMAGE_FORMAT_CHOICES, UISettings
+from ..settings.models import IMAGE_FORMAT_CHOICES, UISettings
 from ..settings.presets import import_settings_preset
 from ..settings.storage import SETTINGS_STATE, load_settings
 from ..upscale.video.models import HDR_PRECISIONS, SCALE_FACTORS
@@ -91,7 +95,7 @@ def _add_common(parser: argparse.ArgumentParser, settings: UISettings) -> None:
     )
     group.add_argument(
         "--video-gpu", metavar="UUID", default=settings.video_gpu_uuid,
-        help="Video Processing (NVENC) GPU UUID, or auto (default: %(default)s). Neural Rendering with --nr-gpu encodes on the AI GPU and ignores this.",
+        help="Video Processing (NVENC) GPU UUID, or auto (default: %(default)s). Neural Rendering video with an NVENC codec encodes on the AI GPU and ignores this.",
     )
     group.add_argument("--json", action="store_true", help="Write the batch result as JSON to stdout.")
     group.add_argument(
@@ -115,7 +119,13 @@ def _add_neural(parser: argparse.ArgumentParser, settings: UISettings, *, video:
         "--nr-scale", type=float, choices=NR_SCALE_CHOICES, metavar="FACTOR", default=settings.upscaling_factor,
         help=f"Resolution entering Neural Rendering as a fraction of the source: {scales}; below 1 is a Lanczos downscale, the output keeps that size (default: %(default)s)",
     )
-    group.add_argument("--nr-gpu", action=argparse.BooleanOptionalAction, default=settings.nr_gpu_mode, help="Processing Engine Path: keep frames in VRAM (CUDA/D3D12 interop); --no-nr-gpu stages through system memory.")
+    if not video:
+        # Video derives its path from the codec (NVENC stays on CUDA, CPU codecs
+        # stage through system memory), so the switch would have no effect there.
+        group.add_argument(
+            "--nr-gpu", action=argparse.BooleanOptionalAction, default=settings.nr_gpu_mode,
+            help="Processing Engine Path for images: keep frames in VRAM (CUDA/D3D12 interop); --no-nr-gpu stages through system memory.",
+        )
 
     composition = parser.add_argument_group("composition")
     composition.add_argument("--color-strength", type=float, metavar="0..1", default=settings.nr_color_strength, help="NR Color Strength; 0 keeps the source colour (default: %(default)s)")
@@ -128,11 +138,13 @@ def _add_neural(parser: argparse.ArgumentParser, settings: UISettings, *, video:
         composition.add_argument("--shimmer-suppression", type=float, metavar="0..1", default=settings.shimmer_suppression, help="Temporal stabilization of fine detail between frames (default: %(default)s)")
 
 
-def _add_encoding(parser: argparse.ArgumentParser, codec: str, container: str, quality: str, hdr: bool | None) -> None:
+def _add_encoding(parser: argparse.ArgumentParser, codec: str, quality: str, hdr: bool | None) -> None:
     """Codec flags; ``hdr`` is the HDR Mode default, or None when the command defines its own --hdr."""
     group = parser.add_argument_group("encoding")
-    group.add_argument("--codec", choices=CODEC_CHOICES, default=codec, help="(default: %(default)s)")
-    group.add_argument("--container", choices=CONTAINER_CHOICES, default=container, help="(default: %(default)s)")
+    group.add_argument(
+        "--codec", choices=CODEC_CHOICES, default=codec,
+        help="(default: %(default)s); the container follows the codec: H.264 to MP4, H.265 and AV1 to MKV, ProRes Proxy to MOV.",
+    )
     group.add_argument("--encoding-quality", choices=ENCODING_QUALITIES, default=quality, help="(default: %(default)s)")
     if hdr is not None:
         group.add_argument("--hdr", action=argparse.BooleanOptionalAction, default=hdr, help="10-bit output that keeps HDR metadata; H.265, AV1, and ProRes only.")
@@ -215,7 +227,7 @@ def build_parser(settings: UISettings) -> argparse.ArgumentParser:
     video.add_argument("inputs", nargs="+", metavar="PATH", help=inputs_help)
     _add_common(video, settings)
     _add_neural(video, settings, video=True)
-    _add_encoding(video, settings.codec, settings.container, settings.quality, settings.hdr_mode)
+    _add_encoding(video, settings.codec, settings.quality, settings.hdr_mode)
     _add_naming(video, settings.video_rename_mode, settings.video_custom_suffix)
     output = video.add_argument_group("output")
     output.add_argument("--zip", action="store_true", help="Also write a ZIP of the successful outputs next to them (two or more inputs).")
@@ -229,7 +241,7 @@ def build_parser(settings: UISettings) -> argparse.ArgumentParser:
     frame.add_argument("--fps", choices=FPS_CHOICES, default=settings.frame_interpolation_target_fps, help="(default: %(default)s)")
     frame.add_argument("--engine", choices=ENGINE_CHOICES, default=settings.frame_interpolation_engine, help="(default: %(default)s)")
     _add_encoding(
-        interpolate, settings.frame_interpolation_codec, settings.frame_interpolation_container,
+        interpolate, settings.frame_interpolation_codec,
         settings.frame_interpolation_quality, settings.frame_interpolation_hdr_mode,
     )
     _add_naming(interpolate, settings.frame_interpolation_rename_mode, settings.frame_interpolation_custom_suffix)
@@ -258,7 +270,7 @@ def build_parser(settings: UISettings) -> argparse.ArgumentParser:
     hdr.add_argument("--hdr-middle-gray", type=int, metavar="10..100", default=settings.upscale_hdr_middle_gray, help="(default: %(default)s)")
     hdr.add_argument("--hdr-peak-luminance", type=int, metavar="400..2000", default=settings.upscale_hdr_peak_luminance, help="Display peak in nits (default: %(default)s)")
     hdr.add_argument("--hdr-precision", choices=HDR_PRECISIONS, default=settings.upscale_hdr_precision, help="Frame format handed to the encoder (default: %(default)s)")
-    _add_encoding(upscale_video, settings.upscale_codec, settings.upscale_container, settings.upscale_quality, None)
+    _add_encoding(upscale_video, settings.upscale_codec, settings.upscale_quality, None)
     _add_naming(upscale_video, settings.upscale_rename_mode, settings.upscale_custom_suffix)
     upscale_video.add_argument("--preview-seconds", type=float, metavar="SEC", help="Process only the first SEC seconds.")
 
@@ -336,9 +348,11 @@ def _neural_overrides(args: argparse.Namespace) -> dict[str, Any]:
         "mask_feather": args.mask_feather,
         "nr_mask": nr_mask,
         "automatic_mask": bool(args.automatic_mask),
-        "nr_gpu_mode": bool(args.nr_gpu),
         "upscaling_factor": args.nr_scale,
     }
+    if hasattr(args, "nr_gpu"):
+        # Images only; video's path is decided by its codec in the processor.
+        overrides["nr_gpu_mode"] = bool(args.nr_gpu)
     if hasattr(args, "shimmer_suppression"):
         overrides["shimmer_suppression"] = args.shimmer_suppression
     return overrides
@@ -449,7 +463,6 @@ def run_video(args: argparse.Namespace, settings: UISettings, reporter: Progress
         **_neural_overrides(args),
         video_gpu_uuid=args.video_gpu,
         codec=args.codec,
-        container=args.container,
         quality=args.encoding_quality,
         hdr_mode=bool(args.hdr),
         rename_mode=args.rename,
@@ -484,7 +497,6 @@ def run_interpolate(args: argparse.Namespace, settings: UISettings, reporter: Pr
         target_fps=args.fps,
         engine=args.engine,
         codec=args.codec,
-        container=args.container,
         quality=args.encoding_quality,
         hdr_mode=bool(args.hdr),
         rename_mode=args.rename,
@@ -558,7 +570,6 @@ def run_upscale_video(args: argparse.Namespace, settings: UISettings, reporter: 
         hdr_peak_luminance=args.hdr_peak_luminance,
         hdr_precision=args.hdr_precision,
         codec=args.codec,
-        container=args.container,
         quality=args.encoding_quality,
         rename_mode=args.rename,
         custom_suffix=args.suffix,
@@ -627,7 +638,7 @@ def collect_info(ai_gpu_uuid: str) -> dict[str, Any]:
         "nr_style": list(NR_STYLES),
         "nr_passes": [1, 2, 3, 4],
         "codec": list(CODEC_CHOICES),
-        "container": list(CONTAINER_CHOICES),
+        "container_by_codec": {codec: container_for_codec(codec) for codec in CODEC_CHOICES},
         "encoding_quality": list(ENCODING_QUALITIES),
         "image_format": list(IMAGE_FORMAT_CHOICES),
         "fps": list(FPS_CHOICES),
@@ -675,7 +686,10 @@ def _print_info(report: dict[str, Any]) -> None:
             f"Frame generation: {state} | native {capabilities.get('native_multiplier')}x "
             f"| cascade {'yes' if capabilities.get('cascade_available') else 'no'} "
             f"| HAGS {'on' if capabilities.get('hags_enabled') else 'off'} "
-            f"| runtime {capabilities.get('runtime_version')}\n"
+            f"| NVOF {'yes' if capabilities.get('nvof_available') else 'no'} "
+            f"| runtime {capabilities.get('runtime_version')} "
+            f"| bridge {capabilities.get('bridge_version')} (ABI {capabilities.get('bridge_abi_version')}) "
+            f"| CUDA interop {'yes' if capabilities.get('cuda_interop') else 'no'}\n"
         )
         if capabilities.get("detail"):
             out.write(f"  {capabilities['detail']}\n")
@@ -692,12 +706,15 @@ def _print_info(report: dict[str, Any]) -> None:
             )
         out.write(
             f"RTX Video: VSR {state(rtx_video.get('vsr') or {})} | HDR {state(rtx_video.get('hdr') or {})} "
-            f"| SDK {rtx_video.get('sdk_version')} | worker {rtx_video.get('worker_version')}\n"
+            f"| SDK {rtx_video.get('sdk_version')} | bridge {rtx_video.get('bridge_version')}\n"
         )
     else:
         out.write(f"RTX Video: {rtx_video}\n")
     out.write("\nChoices:\n")
     for key, values in report["choices"].items():
+        if isinstance(values, dict):
+            out.write(f"  {key}: {', '.join(f'{name}={value}' for name, value in values.items())}\n")
+            continue
         out.write(f"  {key}: {', '.join(f'{v:g}' if isinstance(v, float) else str(v) for v in values)}\n")
 
 

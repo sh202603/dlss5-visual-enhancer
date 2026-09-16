@@ -12,13 +12,6 @@ from ..core.runtime import (
 )
 from ..settings.models import DEFAULT_SETTINGS, UISettings
 
-# The DLSSG worker exits once the frame count declared at setup has been
-# delivered (verified 2026-09-03: frame N+1 breaks the pipe). Declaring the
-# 32-bit maximum keeps that session open indefinitely; closing early is a
-# clean exit 0. Neural Rendering does not need this: since v8 it runs in
-# process and a session simply closes when the caller is done.
-UNBOUNDED_FRAMES = 2**32 - 1
-
 
 def ensure_rgba(frame: np.ndarray) -> np.ndarray:
     """Accept HxWx3 or HxWx4 uint8 and return a contiguous HxWx4 array."""

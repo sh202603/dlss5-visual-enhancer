@@ -3,14 +3,14 @@
 Neural Rendering, then RTX Video Super Resolution plus RTX Video HDR, as one script.
 
 .DESCRIPTION
-The two enhancers run in different workers, so the CLI has no single command for
-them. This script chains the two commands:
+The two enhancers run through different NGX bridges, so the CLI has no single
+command for them. This script chains the two commands:
 
   1. dlss5ve-cli video      Neural Rendering at the source size, SDR, into a stage folder
   2. dlss5ve-cli upscale-video   VSR to the target size and SDR-to-HDR10 conversion
 
 Neural Rendering runs first because the Upscale pipeline accepts SDR sources only
-and the NR worker processes 8-bit RGBA. Each stage is driven through --json, so a
+and Neural Rendering processes 8-bit RGBA. Each stage is driven through --json, so a
 file that fails in stage 1 is skipped in stage 2 instead of aborting the batch.
 
 .PARAMETER InputPath
@@ -25,6 +25,7 @@ VSR scale factor for stage 2 (1 keeps the size and only de-noises), default 2.
 
 .PARAMETER Codec
 Codec for both stages; must support HDR (H.265, AV1, ProRes Proxy, plain or NVENC).
+The container follows the codec (H.265 and AV1 give MKV, ProRes gives MOV).
 
 .PARAMETER NrArgs
 Extra flags for the video command, e.g. @('--nr-style', 'Cinematic', '--nr-intensity', '1.2').
@@ -36,7 +37,7 @@ Extra flags for upscale-video, e.g. @('--vsr-quality', '3', '--hdr-peak-luminanc
 .\examples\nr_vsr_hdr.ps1 D:\clips\scene.mp4 -OutputDir D:\hdr -Scale 2
 
 .EXAMPLE
-.\examples\nr_vsr_hdr.ps1 D:\clips -OutputDir D:\hdr -Codec AV1 -Container MKV -NrArgs @('--nr-style','Natural')
+.\examples\nr_vsr_hdr.ps1 D:\clips -OutputDir D:\hdr -Codec AV1 -NrArgs @('--nr-style','Natural')
 #>
 [CmdletBinding()]
 param(
@@ -44,7 +45,6 @@ param(
     [Parameter(Mandatory)][string]$OutputDir,
     [double]$Scale = 2,
     [string]$Codec = 'H.265 (NVIDIA NVENC)',
-    [ValidateSet('MP4', 'MKV', 'MOV')][string]$Container = 'MP4',
     [string]$Suffix = '_NR_VSR_HDR',
     [string[]]$NrArgs = @(),
     [string[]]$UpscaleArgs = @(),
@@ -81,7 +81,7 @@ function Invoke-Stage {
 $stage1 = Invoke-Stage 'Neural Rendering' (@(
     'video') + $InputPath + @(
     '--nr-scale', '1', '--no-hdr',
-    '--codec', $Codec, '--container', 'MP4',
+    '--codec', $Codec,
     '--rename', 'Copy',
     '--output-dir', $stageDir, '--json') + $NrArgs)
 if ($stage1.ExitCode -eq 130) { throw 'Neural Rendering was cancelled.' }
@@ -95,7 +95,7 @@ if ($rendered.Count -eq 0) { throw "Neural Rendering produced no output (exit co
 $stage2 = Invoke-Stage 'RTX Video Super Resolution + HDR' (@(
     'upscale-video') + $rendered + @(
     '--scale', $Scale.ToString([cultureinfo]::InvariantCulture), '--hdr',
-    '--codec', $Codec, '--container', $Container,
+    '--codec', $Codec,
     '--rename', 'Custom', '--suffix', $Suffix,
     '--output-dir', $OutputDir, '--json') + $UpscaleArgs)
 foreach ($failure in $stage2.Payload.failures) {

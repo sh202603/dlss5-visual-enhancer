@@ -7,6 +7,10 @@ one exception: ``hdr_mode`` is accepted for video and frame interpolation and
 is coerced against the effective codec before it lands in the Options
 (``preserve_hdr`` for video, ``hdr_mode`` for frame interpolation).
 
+``container`` is not taken from the settings either: since v9 the processing
+layer derives it from the effective codec, so the Options are built the same
+way to keep ``validate_codec_container`` from rejecting a stale saved pair.
+
 The Upscale builders wrap the ``options_from_settings`` functions that the
 upscale package ships; only the override check is added here.
 """
@@ -15,6 +19,7 @@ from __future__ import annotations
 from dataclasses import fields, replace
 from typing import Any
 
+from ..core.ffmpeg import container_for_codec
 from ..frame_interpolation.models import FrameInterpolationOptions
 from ..neural_rendering.video.models import ConversionOptions
 from .models import UISettings, coerce_hdr_mode
@@ -81,13 +86,13 @@ def video_options(settings: UISettings, **overrides: Any) -> ConversionOptions:
             # Temporal stabilization exists only for video (and Live).
             "shimmer_suppression": settings.shimmer_suppression,
             "codec": settings.codec,
-            "container": settings.container,
             "quality": settings.quality,
             "rename_mode": settings.video_rename_mode,
             "custom_suffix": settings.video_custom_suffix,
         }
     )
     codec = overrides.get("codec", values["codec"])
+    values["container"] = container_for_codec(codec)
     values["preserve_hdr"] = coerce_hdr_mode(codec, hdr_mode)
     return _build(ConversionOptions, values, overrides)
 
@@ -102,12 +107,12 @@ def frame_interpolation_options(
         "target_fps": settings.frame_interpolation_target_fps,
         "engine": settings.frame_interpolation_engine,
         "codec": settings.frame_interpolation_codec,
-        "container": settings.frame_interpolation_container,
         "quality": settings.frame_interpolation_quality,
         "rename_mode": settings.frame_interpolation_rename_mode,
         "custom_suffix": settings.frame_interpolation_custom_suffix,
     }
     codec = overrides.get("codec", values["codec"])
+    values["container"] = container_for_codec(codec)
     values["hdr_mode"] = coerce_hdr_mode(codec, hdr_mode)
     return _build(FrameInterpolationOptions, values, overrides)
 
