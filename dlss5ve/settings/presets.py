@@ -9,7 +9,7 @@ from dataclasses import asdict, fields, replace
 from pathlib import Path
 from typing import Any
 
-from ..core.paths import GRADIO_TEMP
+from ..core.paths import APP_TEMP
 from .models import (
     DEFAULT_SETTINGS, MAX_PRESET_BYTES, PRESET_FORMAT, PRESET_SCHEMA_VERSION, UISettings, _validate,
 )
@@ -66,8 +66,8 @@ def export_settings_preset(name: str, settings: UISettings) -> Path:
     """Write a validated preset to an isolated temporary download directory."""
     document = preset_document(name, settings)
     filename = preset_filename(document["name"])
-    GRADIO_TEMP.mkdir(parents=True, exist_ok=True)
-    directory = Path(tempfile.mkdtemp(prefix="dlss5-settings-preset-", dir=GRADIO_TEMP))
+    APP_TEMP.mkdir(parents=True, exist_ok=True)
+    directory = Path(tempfile.mkdtemp(prefix="dlss5-settings-preset-", dir=APP_TEMP))
     path = directory / filename
     path.write_text(
         json.dumps(document, indent=2, ensure_ascii=False) + "\n",
@@ -120,7 +120,7 @@ def import_settings_preset(
     if not isinstance(document, dict):
         raise ValueError("Preset JSON must contain an object at its top level.")
     if document.get("format") != PRESET_FORMAT:
-        raise ValueError("This JSON file is not a DLSS 5 Visual Enhancer settings preset.")
+        raise ValueError("This JSON file is not a Visual Enhancer settings preset.")
     version = document.get("schema_version")
     if isinstance(version, bool) or not isinstance(version, int):
         raise ValueError("Preset schema_version must be an integer.")
@@ -143,9 +143,9 @@ def import_settings_preset(
     }
     if version == 1:
         # v1's DLSS model-preset field was never applied by feature 18. Ignore
-        # it and default the newly introduced shared GPU staging switch to ON.
+        # it. (The retired GPU staging switch from old presets is filtered by
+        # known_names above; the runtime path is codec-driven now.)
         changes.pop("dlss_model_preset", None)
-        changes["nr_gpu_mode"] = DEFAULT_SETTINGS.nr_gpu_mode
     if version < 3:
         changes["nr_color_strength"] = DEFAULT_SETTINGS.nr_color_strength
         changes["tone_preservation"] = DEFAULT_SETTINGS.tone_preservation
@@ -157,8 +157,6 @@ def import_settings_preset(
         changes["nr_passes"] = DEFAULT_SETTINGS.nr_passes
     if version < 6:
         changes["shimmer_suppression"] = DEFAULT_SETTINGS.shimmer_suppression
-    if version < 7:
-        changes["frame_interpolation_gpu_mode"] = DEFAULT_SETTINGS.frame_interpolation_gpu_mode
     # NR Preset was removed entirely (non-functional). Old preset files still
     # carry it; ignore so imports from previous builds keep working.
     # (Unknown keys are already filtered above; this covers any edge case where
@@ -173,3 +171,31 @@ def import_settings_preset(
         changes["upscale_vsr_quality"] = DEFAULT_SETTINGS.upscale_vsr_quality
     merged = replace(current, **changes)
     return name, _validate(merged)
+
+
+def export_settings_preset_to(
+    name: str,
+    settings: UISettings,
+    destination: str | os.PathLike[str],
+) -> Path:
+    """Atomically write a validated preset to a user-selected destination."""
+    document = preset_document(name, settings)
+    target = Path(destination).expanduser()
+    if target.suffix.casefold() != ".json":
+        target = target.with_suffix(".json")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    payload = json.dumps(document, indent=2, ensure_ascii=False) + "\n"
+    fd, temp_name = tempfile.mkstemp(
+        prefix=target.stem + ".", suffix=".tmp", dir=str(target.parent)
+    )
+    temp_path = Path(temp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, target)
+    except Exception:
+        temp_path.unlink(missing_ok=True)
+        raise
+    return target.resolve()

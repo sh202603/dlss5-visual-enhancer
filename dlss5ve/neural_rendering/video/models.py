@@ -31,7 +31,6 @@ class ConversionOptions:
     preview_seconds: float | None = None
     preview_frames: int | None = None
     automatic_mask: bool = False
-    nr_gpu_mode: bool = True
     rename_mode: str = "Auto"
     custom_suffix: str = "_Neural_Rendering"
     # True = truncated preview uses the forced H.264 SDR path (current behavior).

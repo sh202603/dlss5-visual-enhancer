@@ -62,7 +62,10 @@ def detect_gpus() -> tuple[dict[str, Any], ...]:
         "--format=csv,noheader,nounits",
     ]
     try:
-        result = subprocess.run(command, capture_output=True, text=True, timeout=10)
+        result = subprocess.run(
+            command, capture_output=True, text=True, timeout=10,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise RuntimeError(
             "NVIDIA driver tools are unavailable; an RTX GPU and current driver are required."

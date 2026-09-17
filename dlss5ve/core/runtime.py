@@ -46,9 +46,14 @@ NR_STYLES = {
 }
 
 # Feature 18 is evaluated at the final neural dimensions. Scaling below 1x is
-# an explicit Lanczos downscale before Neural Rendering.
+# an explicit Lanczos downscale before Neural Rendering; scaling above 1x is
+# an explicit Lanczos upscale before Neural Rendering.
 UPSCALING_MODES = {
     1.0: {"label": "Source (Original)", "name": "Source", "perf_quality": 0},
+    2.0: {"label": "200%", "name": "Lanczos 200%", "perf_quality": 0},
+    1.75: {"label": "175%", "name": "Lanczos 175%", "perf_quality": 0},
+    1.5: {"label": "150%", "name": "Lanczos 150%", "perf_quality": 0},
+    1.25: {"label": "125%", "name": "Lanczos 125%", "perf_quality": 0},
     0.75: {"label": "75%", "name": "Lanczos 75%", "perf_quality": 0},
     0.5: {"label": "50%", "name": "Lanczos 50%", "perf_quality": 0},
     0.25: {"label": "25%", "name": "Lanczos 25%", "perf_quality": 0},
@@ -62,13 +67,13 @@ def resolve_upscaling_mode(raw_factor: float) -> tuple[float, dict[str, str | in
     try:
         factor = float(raw_factor)
     except (TypeError, ValueError) as exc:
-        raise ValueError("Scale must be one of: Source, 75%, 50%, 25%.") from exc
+        raise ValueError("Scale must be one of: Source, 200%, 175%, 150%, 125%, 75%, 50%, 25%.") from exc
     if not math.isfinite(factor):
-        raise ValueError("Scale must be one of: Source, 75%, 50%, 25%.")
+        raise ValueError("Scale must be one of: Source, 200%, 175%, 150%, 125%, 75%, 50%, 25%.")
     for supported, mode in UPSCALING_MODES.items():
         if math.isclose(factor, supported, rel_tol=0.0, abs_tol=1e-9):
             return supported, mode
-    raise ValueError("Scale must be one of: Source, 75%, 50%, 25%.")
+    raise ValueError("Scale must be one of: Source, 200%, 175%, 150%, 125%, 75%, 50%, 25%.")
 
 
 def _nearest_even(value: float) -> int:
@@ -94,7 +99,7 @@ def resolve_output_size(width: int, height: int, factor: float) -> tuple[int, in
     return output_width, output_height
 
 
-def resolve_native_settings(options: Any) -> dict[str, int | float | bool]:
+def resolve_native_settings(options: Any, *, gpu_mode: bool | None = None) -> dict[str, int | float | bool]:
     try:
         style = NR_STYLES[options.nr_style]
     except KeyError as exc:
@@ -132,7 +137,13 @@ def resolve_native_settings(options: Any) -> dict[str, int | float | bool]:
         raise ValueError("Mask Feather must be an integer from 0 to 128.")
     if not 0 <= int(mask_feather) <= 128:
         raise ValueError("Mask Feather must be between 0 and 128 pixels.")
-    gpu_mode = getattr(options, "nr_gpu_mode", True)
+    codec_name = str(getattr(options, "codec", ""))
+    if gpu_mode is None:
+        # Automatic path selection: an NVENC codec takes the CUDA transport,
+        # a CPU codec takes the host-memory path. Options without a codec
+        # (images, Live) default to GPU-resident; host pipelines pass False
+        # explicitly.
+        gpu_mode = True if not hasattr(options, "codec") else "NVENC" in codec_name.upper()
     if not isinstance(gpu_mode, bool):
         raise ValueError("Neural Rendering GPU mode must be a boolean value.")
     nr_passes = getattr(options, "nr_passes", 1)
@@ -141,7 +152,6 @@ def resolve_native_settings(options: Any) -> dict[str, int | float | bool]:
     if not 1 <= nr_passes <= 4:
         raise ValueError("NR Passes must be between 1 and 4.")
 
-    codec_name = str(getattr(options, "codec", ""))
     prefer_nvof = bool(codec_name and "NVENC" not in codec_name.upper())
     return {
         "profile": 0,
@@ -1019,6 +1029,7 @@ def _encoder_inventory() -> dict[str, bool]:
         text=True,
         encoding="utf-8",
         errors="replace",
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
     )
     if result.returncode:
         raise RuntimeError(result.stderr.strip() or "FFmpeg encoder inventory failed.")

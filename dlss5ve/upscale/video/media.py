@@ -131,7 +131,7 @@ def start_decoder(source, meta, controller):
                "-map", "0:v:0", "-an", "-sn", "-dn", "-vf", vf, "-c:v", "rawvideo", "-pix_fmt",
                "gbrp10le" if meta["depth"] > 8 else "rgba", "-fps_mode", "passthrough", "-enc_time_base", "demux",
                "-f", "nut", "pipe:1"]
-    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, creationflags=subprocess.CREATE_NO_WINDOW)
+    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     controller.register(process)
     logs = BoundedLogBuffer(max_tail=60)
     thread = threading.Thread(target=drain_bounded_text, args=(process.stderr, logs), daemon=True)

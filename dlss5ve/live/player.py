@@ -29,8 +29,8 @@ def check_live_binaries(*, resolve_pages: bool, play: bool) -> None:
         )
     if play and not MPV.is_file():
         raise RuntimeError(
-            f"MPV is not installed ({MPV} missing); uncheck "
-            "'Open in MPV' or restore the portable player."
+            f"MPV is not installed ({MPV} missing); "
+            "restore the portable player to watch Live in-tab."
         )
 
 
@@ -41,8 +41,15 @@ def launch_mpv(
     *,
     buffer_seconds: float = 6.0,
     state_path: Path | None = None,
+    wid: int = 0,
+    ipc_server: str = "",
 ) -> subprocess.Popen:
-    """Open the vendored MPV on a Live playlist. Raises on missing binary."""
+    """Play a Live playlist on the vendored MPV. Raises on missing binary.
+
+    When ``wid`` is a valid parent-window handle the player attaches to it
+    (in-tab embedding) instead of opening its own window. ``ipc_server``
+    enables the JSON IPC channel used by the in-tab transport controls.
+    """
     if not MPV.is_file():
         raise RuntimeError(
             f"MPV is not installed ({MPV} missing); the Live stream "
@@ -69,8 +76,24 @@ def launch_mpv(
         f"--title=DLSS 5 Live — {title}",
         "--terminal=no",
         *extra_args,
-        playlist_url,
     ]
+    if wid:
+        # In-tab embedding: MPV creates its own child window covering the
+        # given parent and letterboxes the video itself. Input goes to the
+        # QML transport (pause/mute via IPC); the OSD would only fight it.
+        command += [
+            f"--wid={int(wid)}",
+            "--force-window=yes",
+            "--no-border",
+            "--keepaspect=yes",
+            "--input-vo-keyboard=no",
+            "--no-osc",
+            "--no-osd-bar",
+            "--cursor-autohide=no",
+        ]
+    if ipc_server:
+        command.append(f"--input-ipc-server={ipc_server}")
+    command.append(playlist_url)
     creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     try:
         process = subprocess.Popen(

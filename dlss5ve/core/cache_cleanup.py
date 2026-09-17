@@ -1,13 +1,11 @@
 from __future__ import annotations
 
-"""Automatic cleanup of stale app-local Gradio caches and job leftovers.
+"""Automatic cleanup of stale app-local temp caches and job leftovers.
 
-Official Gradio cleanup (``gr.Blocks(delete_cache=...)``) handles tracked
-session files while the server runs and on graceful shutdown. Crash-orphaned
-files are covered here by an age-gated startup sweep over only this install's
-portable locations:
+Crash-orphaned files are covered here by an age-gated startup sweep over only
+this install's portable locations:
 
-1. ``<app>/temp/gradio`` (Gradio uploads/cache plus UI-owned temp artifacts).
+1. ``<app>/temp/app`` (native Qt preview/preset temp artifacts).
 2. Orphaned ``<app>/jobs/*`` per-render dirs left behind by killed runs.
 
 No system/user temp directory is inspected or migrated. This build is isolated
@@ -21,18 +19,18 @@ import shutil
 import time
 from pathlib import Path
 
-from .paths import GRADIO_TEMP, JOBS
+from .paths import APP_TEMP, JOBS
 
-# Agreed retention: sweep hourly while running (via Blocks delete_cache),
-# treat anything older than 24h as stale (startup sweep + periodic sweep).
+# Agreed retention: treat anything older than 24h as stale
+# (startup sweep + periodic sweep).
 CACHE_SWEEP_INTERVAL_SECONDS = 3600
 CACHE_MAX_AGE_SECONDS = 24 * 3600
 
 
-def resolve_gradio_temp_dir() -> Path | None:
-    """Return this installation's fixed app-local Gradio temp directory."""
+def resolve_app_temp_dir() -> Path | None:
+    """Return this installation's fixed app-local temp directory."""
     try:
-        resolved = GRADIO_TEMP.resolve()
+        resolved = APP_TEMP.resolve()
     except OSError:
         return None
     return resolved if resolved.is_dir() else None
@@ -110,10 +108,10 @@ def cleanup_old_caches(
     removed_total = 0
     freed_total = 0
 
-    gradio_dir = resolve_gradio_temp_dir()
-    if gradio_dir is not None:
+    app_dir = resolve_app_temp_dir()
+    if app_dir is not None:
         try:
-            removed, freed = sweep_dir_by_age(gradio_dir, max_age_seconds)
+            removed, freed = sweep_dir_by_age(app_dir, max_age_seconds)
             removed_total += removed
             freed_total += freed
         except Exception:

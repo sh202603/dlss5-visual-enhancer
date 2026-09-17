@@ -5,7 +5,11 @@ import re
 
 from .jobs import Cancelled
 
-APPLICATION = "DLSS 5 Visual Enhancer"
+APPLICATION = "Visual Enhancer"
+LEGACY_APPLICATION = "DLSS 5 Visual Enhancer"
+# Accept both headers when reading so outputs written before the rename
+# still merge cleanly; new notes are always written with APPLICATION.
+_APP_HEADER = r"(?:Visual Enhancer|DLSS 5 Visual Enhancer):"
 PREFIX = "DLSS 5 Neural Rendering Settings - "
 IMAGE_NOTE_FORMATS = frozenset({"PNG", "JPEG", "WebP", "AVIF", "TIFF"})
 VIDEO_NOTE_FORMATS = frozenset({"MP4", "MKV"})
@@ -17,7 +21,7 @@ _LABELS = (
     "GPU Memory Path", "Scale",
 )
 _NUMBER = r"-?\d+(?:\.\d+)?(?:e[+-]?\d+)?"
-_SCALE_VALUE = r"(?:Source|75%|50%|25%)"
+_SCALE_VALUE = r"(?:Source|200%|175%|150%|125%|75%|50%|25%)"
 _VALUES = (
     r"(?:Default|Natural|Cinematic)",
     _NUMBER, r"[1-4]", _NUMBER, _NUMBER,
@@ -76,27 +80,27 @@ _LEGACY_LABELS = (
     "GPU Memory Path", "Output Scale",
 )
 _OWN_NOTE = re.compile(
-    r"(?m)^" + re.escape(APPLICATION + ":") + r"\r?\n" + re.escape(PREFIX)
+    r"(?m)^" + _APP_HEADER + r"\r?\n" + re.escape(PREFIX)
     + ", ".join(re.escape(label + " - ") + value for label, value in zip(_LABELS, _VALUES))
     + r"(?=\r?$)"
 )
 _V4_NOTE = re.compile(
-    r"(?m)^" + re.escape(APPLICATION + ":") + r"\r?\n" + re.escape(PREFIX)
+    r"(?m)^" + _APP_HEADER + r"\r?\n" + re.escape(PREFIX)
     + ", ".join(re.escape(label + " - ") + value for label, value in zip(_V4_LABELS, _V4_VALUES))
     + r"(?=\r?$)"
 )
 _V3_NOTE = re.compile(
-    r"(?m)^" + re.escape(APPLICATION + ":") + r"\r?\n" + re.escape(PREFIX)
+    r"(?m)^" + _APP_HEADER + r"\r?\n" + re.escape(PREFIX)
     + ", ".join(re.escape(label + " - ") + value for label, value in zip(_V3_LABELS, _V3_VALUES))
     + r"(?=\r?$)"
 )
 _V2_NOTE = re.compile(
-    r"(?m)^" + re.escape(APPLICATION + ":") + r"\r?\n" + re.escape(PREFIX)
+    r"(?m)^" + _APP_HEADER + r"\r?\n" + re.escape(PREFIX)
     + ", ".join(re.escape(label + " - ") + value for label, value in zip(_V2_LABELS, _V2_VALUES))
     + r"(?=\r?$)"
 )
 _LEGACY_NOTE = re.compile(
-    r"(?m)^" + re.escape(APPLICATION + ":") + r"\r?\n" + re.escape(PREFIX)
+    r"(?m)^" + _APP_HEADER + r"\r?\n" + re.escape(PREFIX)
     + ", ".join(re.escape(label + " - ") + value for label, value in zip(_LEGACY_LABELS, _LEGACY_VALUES))
     + r"(?=\r?$)"
 )

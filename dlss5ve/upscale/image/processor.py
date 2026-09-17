@@ -69,7 +69,7 @@ def preview_upscale_image(input_path, options=None, progress=None, *, controller
 
         update(.12, "Checking RTX Video capabilities")
         caps = probe_capabilities(options.ai_gpu_uuid, controller=controller)
-        update(.24, f"RTX VSR: {width}×{height} → {ow}×{oh}")
+        update(.24, "Processing with RTX VSR")
         with RTXVideoSession(
             width, height, ow, oh, options.native_options(), 1, caps, controller,
             image_srgb=True,
@@ -140,7 +140,7 @@ def _process(source, options, progress, output_dir, controller, generate_preview
             source, IMAGE_EXTENSIONS[options.output_format], options.rename_mode, options.custom_suffix,
             f"{source.stem}_RTXIMAGE_{stamp}")
         destination_file = OutputFile(output)
-        update(.15, f"RTX VSR: {width}×{height} → {ow}×{oh}")
+        update(.15, "Processing with RTX VSR")
         key = (width, height, ow, oh, int(options.vsr_quality), str(caps.gpu.get("uuid", "")))
         if session_cache is None:
             session_context = RTXVideoSession(

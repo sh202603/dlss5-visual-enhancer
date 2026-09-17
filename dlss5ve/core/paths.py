@@ -19,13 +19,13 @@ def _resolve_root() -> Path:
 
 ROOT = _resolve_root()
 TEMP = ROOT / "temp"
-GRADIO_TEMP = TEMP / "gradio"
+APP_TEMP = TEMP / "app"
 RUNTIME = ROOT / "bin" / "runtime"
 DLSSG_DIR = RUNTIME / "dlssg"
 # In-process D3D12/NGX feature-18 runtime. The bridge and caller shim are
 # self-contained and require no Python tensor framework or external add-on.
 DLSSNR_DIR = RUNTIME / "dlssnr"
-DLSSNR_BRIDGE = DLSSNR_DIR / "neuroframe_engine.dll"
+DLSSNR_BRIDGE = DLSSNR_DIR / "neuroframe_engine_neural_rendering.dll"
 DLSSNR_CALLER_SHIM = DLSSNR_DIR / "neuroframe_caller.dll"
 FFMPEG = ROOT / "bin" / "ffmpeg" / "bin" / "ffmpeg.exe"
 FFPROBE = ROOT / "bin" / "ffmpeg" / "bin" / "ffprobe.exe"

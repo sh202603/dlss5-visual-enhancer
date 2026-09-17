@@ -3,7 +3,6 @@ from __future__ import annotations
 import atexit
 import ctypes
 from ctypes import wintypes
-import logging
 import os
 import shutil
 import sys
@@ -163,7 +162,7 @@ class TerminalUI:
         sys.__stdout__.flush()
 
     def render_loading(self) -> None:
-        """Draw centered LOADING screen with same DLSS 5 Visual Enhancer style, no footer."""
+        """Draw centered LOADING screen with same Visual Enhancer style, no footer."""
         for stream in (sys.__stdout__, sys.stdout):
             if hasattr(stream, "reconfigure"):
                 try:
@@ -338,17 +337,6 @@ class TerminalUI:
 
         # Suppress warnings
         warnings.filterwarnings("ignore")
-
-        # Configure file logging for libraries
-        file_handler = logging.FileHandler(str(session), encoding="utf-8")
-        file_handler.setLevel(logging.INFO)
-        formatter = logging.Formatter("[%(asctime)s] %(levelname)s:%(name)s: %(message)s")
-        file_handler.setFormatter(formatter)
-
-        for logger_name in ("uvicorn", "uvicorn.error", "uvicorn.access", "gradio", "fastapi"):
-            lg = logging.getLogger(logger_name)
-            lg.handlers = [file_handler]
-            lg.setLevel(logging.WARNING)
 
     def restore_cursor(self) -> None:
         """Show terminal cursor and leave alternate buffer on exit."""

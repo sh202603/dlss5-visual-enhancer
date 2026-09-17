@@ -148,7 +148,7 @@ def mask_report(selection: object | None, feather: int) -> dict[str, Any]:
 
 
 def report_options(options: object) -> dict[str, Any]:
-    """Return dataclass options without leaking a Gradio temporary path."""
+    """Return dataclass options without leaking an app temporary path."""
     values = asdict(options)
     selection = values.pop("nr_mask", None)
     values["custom_nr_mask"] = mask_report(selection, int(values.get("mask_feather", 0)))

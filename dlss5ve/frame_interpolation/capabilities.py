@@ -37,7 +37,8 @@ def _authenticode_status(path: Path) -> str:
              "Import-Module \"$env:WINDIR\\System32\\WindowsPowerShell\\v1.0\\Modules\\"
              "Microsoft.PowerShell.Security\\Microsoft.PowerShell.Security.psd1\"; "
              f"[string](Get-AuthenticodeSignature -LiteralPath '{escaped}').Status"],
-            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=15)
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=15,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     except (OSError, subprocess.TimeoutExpired):
         return "Unavailable"
     return process.stdout.strip() if process.returncode == 0 else "Unavailable"

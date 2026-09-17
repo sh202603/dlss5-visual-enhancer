@@ -14,13 +14,13 @@ import rawpy
 import resvg_py
 from PIL import Image, ImageCms, ImageOps
 
-from ...core.paths import GRADIO_TEMP
+from ...core.paths import APP_TEMP
 from .models import RAW_EXTENSIONS
 
 pillow_heif.register_heif_opener()
 Image.MAX_IMAGE_PIXELS = 100_000_000
 
-# Formats modern Chromium-based Gradio clients can display without a display
+# Formats the native Qt image provider can display without a
 # conversion. Animated raster inputs are still converted below so the preview
 # matches the processing pipeline's first-frame/page semantics.
 _BROWSER_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".avif", ".bmp"}
@@ -174,7 +174,7 @@ def decode_image_preview(
     """Decode a UI preview without constructing the full render-time NumPy payload.
 
     ``max_size=None`` preserves the decoded source dimensions. This is used only
-    by the opt-in full-size Gradio preview path.
+    by the opt-in full-size native preview path.
     """
     source = Path(path).resolve()
     suffix = source.suffix.lower()
@@ -243,12 +243,12 @@ def _direct_browser_image(source: Path) -> bool:
 
 
 def full_size_image_preview_path(path: str | os.PathLike[str]) -> str:
-    """Return a browser-displayable full-resolution path for an image.
+    """Return a displayable full-resolution path for an image.
 
-    Browser-native, single-frame formats are served directly so no pixels are
+    Native single-frame formats are served directly so no pixels are
     copied or re-encoded. RAW/HEIF/TIFF/animated/other Pillow-readable sources
     are converted once to a lossless full-resolution PNG in the app-local
-    Gradio temp directory.
+    temp directory.
     """
     source = Path(path).resolve()
     if not source.is_file():
@@ -259,14 +259,14 @@ def full_size_image_preview_path(path: str | os.PathLike[str]) -> str:
     stat = source.stat()
     identity = f"{source}|{stat.st_dev}|{stat.st_ino}|{stat.st_size}|{stat.st_mtime_ns}"
     digest = hashlib.sha256(identity.encode("utf-8", "surrogatepass")).hexdigest()[:24]
-    GRADIO_TEMP.mkdir(parents=True, exist_ok=True)
-    destination = GRADIO_TEMP / f"dlss5-fullsize-source-{digest}.png"
+    APP_TEMP.mkdir(parents=True, exist_ok=True)
+    destination = APP_TEMP / f"dlss5-fullsize-source-{digest}.png"
     if destination.is_file():
         return str(destination.resolve())
 
     image = decode_image_preview(source, None)
     handle, raw_temp = tempfile.mkstemp(
-        prefix="dlss5-fullsize-source-write-", suffix=".png", dir=GRADIO_TEMP
+        prefix="dlss5-fullsize-source-write-", suffix=".png", dir=APP_TEMP
     )
     os.close(handle)
     temporary = Path(raw_temp)

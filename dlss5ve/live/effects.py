@@ -31,7 +31,6 @@ class EffectSettings:
     mask_feather: int
     nr_mask: object | None
     automatic_mask: bool
-    nr_gpu_mode: bool
 
     @classmethod
     def from_options(cls, options) -> EffectSettings:

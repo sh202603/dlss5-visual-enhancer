@@ -40,6 +40,7 @@ def _encoder_probe(
             command,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         ).returncode
         == 0
     )

@@ -14,7 +14,7 @@ from PIL import Image
 
 from .models import ImageConversionOptions
 from ...core.jobs import Cancelled
-from ...core.paths import GRADIO_TEMP
+from ...core.paths import APP_TEMP
 from ...core.render_metadata import (
     IMAGE_NOTE_FORMATS, MetadataNoteError, check_cancelled, embedding_warning,
     merge_render_note, record_embedding,
@@ -71,9 +71,9 @@ def take_image_preview(output_path: str | os.PathLike[str]) -> Image.Image | Non
 
 
 def _spill_preview(key: str, image: Image.Image) -> None:
-    GRADIO_TEMP.mkdir(parents=True, exist_ok=True)
+    APP_TEMP.mkdir(parents=True, exist_ok=True)
     handle, raw_path = tempfile.mkstemp(
-        prefix="dlss5-preview-", suffix=".png", dir=GRADIO_TEMP
+        prefix="dlss5-preview-", suffix=".png", dir=APP_TEMP
     )
     os.close(handle)
     path = Path(raw_path)
@@ -119,15 +119,14 @@ def make_image_preview(
 def save_full_size_image_preview(
     rgba: np.ndarray, output_format: str, has_transparency: bool | None = None,
 ) -> str:
-    """Write processed preview pixels as a full-resolution browser-safe PNG.
+    """Write processed preview pixels as a full-resolution PNG for the native viewer.
 
-    This avoids handing a full-size PIL object to Gradio (which would create an
-    additional cache encode). JPEG preview semantics still composite transparent
+    JPEG preview semantics still composite transparent
     pixels over white, matching the production JPEG path.
     """
-    GRADIO_TEMP.mkdir(parents=True, exist_ok=True)
+    APP_TEMP.mkdir(parents=True, exist_ok=True)
     handle, raw_path = tempfile.mkstemp(
-        prefix="dlss5-fullsize-processed-", suffix=".png", dir=GRADIO_TEMP
+        prefix="dlss5-fullsize-processed-", suffix=".png", dir=APP_TEMP
     )
     os.close(handle)
     path = Path(raw_path)

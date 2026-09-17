@@ -283,7 +283,7 @@ def convert_video_cuda_nvenc(
             progress(max(0.0, min(1.0, value)), message)
 
     try:
-        update(0.01, f"Preparing CUDA decode and encode on {ai_gpu.get('name', 'NVIDIA GPU')}")
+        update(0.01, "Preparing video processing")
         job = tempfile.TemporaryDirectory(prefix="rtx-video-cuda-", dir=JOBS)
         try:
             job_dir = Path(job.name)
@@ -487,8 +487,7 @@ def convert_video_cuda_nvenc(
                 if now - last_update > 0.2:
                     update(
                         min(0.87, 0.05 + 0.82 * delivered / max(1, estimated)),
-                        f"RTX Video CUDA: {width}×{height} → {output_width}×{output_height}; "
-                        f"{delivered} frames; {delivered / max(0.01, now-started):.1f} fps",
+                        "Upscaling video",
                     )
                     last_update = now
             if not delivered:

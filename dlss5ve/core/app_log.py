@@ -19,6 +19,7 @@ from .paths import LOGS
 _lock = threading.Lock()
 _handle: io.TextIOWrapper | None = None
 _session_path: Path | None = None
+_listeners: set = set()
 
 MAX_MSG = 300
 MAX_TAIL = 500
@@ -96,6 +97,18 @@ def session_path() -> str:
     return str(init_session())
 
 
+
+def add_listener(callback) -> None:
+    """Subscribe to structured log events: ``callback(level, tag, message)``."""
+    with _lock:
+        _listeners.add(callback)
+
+
+def remove_listener(callback) -> None:
+    with _lock:
+        _listeners.discard(callback)
+
+
 def _write(level: str, tag: str, msg: str) -> None:
     global _handle
     line = f"[{time.strftime('%H:%M:%S')}] {level} {tag}: {msg}\n"
@@ -117,8 +130,14 @@ def _write(level: str, tag: str, msg: str) -> None:
         with _lock:
             handle.write(line)
             handle.flush()
+            listeners = tuple(_listeners)
     except (OSError, ValueError):
-        pass
+        listeners = ()
+    for callback in listeners:
+        try:
+            callback(level, tag, msg)
+        except Exception:
+            pass
 
 
 def info(tag: str, msg: object) -> None:

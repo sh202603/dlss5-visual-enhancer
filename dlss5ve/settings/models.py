@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from types import SimpleNamespace
 
 from ..core.ffmpeg import CODEC_CHOICES as FFMPEG_CODEC_CHOICES, ENCODING_QUALITIES, HDR_ALLOWED_CODECS, hdr_mode_supported
 from ..core.naming import validate_rename
 from ..core.runtime import resolve_native_settings, resolve_upscaling_mode
-from ..frame_interpolation.models import ENGINE_CHOICES, FPS_CHOICES
+from ..frame_interpolation.models import ENGINE_CHOICES, FPS_CHOICES, PREVIEW_LENGTH_CHOICES
 from .migration import _migrate_codec
 from ..upscale.video.models import options_from_settings
 from ..upscale.image.models import options_from_settings as image_upscale_options
@@ -57,9 +58,27 @@ class UISettings:
     # remains reset-based and does not consume this value.
     shimmer_suppression: float = 0.70
     mask_feather: int = 0
-    # Validated Gradio upload identity; intentionally omitted from config/presets.
+    # Validated native file-picker identity; intentionally omitted from config/presets.
     nr_mask: object | None = None
     upscaling_factor: float = 1.0
+    # Independent Live-tab mirrors of the NR controls above. The Live tab
+    # reads/writes only these, so tuning or resetting Live never touches
+    # the Neural Rendering tab (and vice versa). nr_mask stays shared:
+    # only the Neural tab manages the custom mask.
+    live_nr_style: str = "Default"
+    live_nr_intensity: float = 1.0
+    live_nr_passes: int = 1
+    live_local_tone_strength: float = 1.0
+    live_local_structure_strength: float = 1.0
+    live_skin_structure_strength: float = -1.0
+    live_nr_color_strength: float = 1.0
+    live_tone_preservation: float = 0.0
+    live_face_skin_protection: float = 0.0
+    live_grain_preservation: float = 0.0
+    live_shimmer_suppression: float = 0.70
+    live_mask_feather: int = 0
+    live_automatic_mask: bool = False
+    live_upscaling_factor: float = 1.0
     # Factory default only. Existing saved codec values are loaded unchanged.
     codec: str = "H.264 (NVIDIA NVENC)"
     container: str = "MP4"
@@ -72,7 +91,6 @@ class UISettings:
     image_custom_suffix: str = "_Neural_Rendering"
     video_rename_mode: str = "Auto"
     video_custom_suffix: str = "_Neural_Rendering"
-    nr_gpu_mode: bool = True
     frame_interpolation_target_fps: str = "60"
     frame_interpolation_engine: str = "Auto"
     # Factory default only. Existing saved selections are loaded unchanged.
@@ -80,11 +98,11 @@ class UISettings:
     frame_interpolation_container: str = "MP4"
     frame_interpolation_quality: str = "Auto (Default)"
     frame_interpolation_hdr_mode: bool = False
-    frame_interpolation_gpu_mode: bool = True
     frame_interpolation_rename_mode: str = "Auto"
     frame_interpolation_custom_suffix: str = "_Frame_Interpolation"
+    frame_interpolation_preview_length: str = "3"
     preview_encoding: str = "Auto"
-    full_size_image_previews: bool = False
+    full_size_image_previews: bool = True
     upscale_mode: str = "Image"
     upscale_image_vsr_quality: int = 4
     upscale_image_size_mode: str = "Scale factor"
@@ -118,7 +136,7 @@ class UISettings:
 
     def component_values(
         self,
-    ) -> tuple[str, float, int, float, float, float, float, float, float, float, float, int, float, bool, bool, str, str, str]:
+    ) -> tuple[str, float, int, float, float, float, float, float, float, float, float, int, float, bool, str, str, str]:
         return (
             self.nr_style,
             self.nr_intensity,
@@ -134,11 +152,34 @@ class UISettings:
             self.mask_feather,
             self.upscaling_factor,
             self.automatic_mask,
-            self.nr_gpu_mode,
             self.codec,
             self.container,
             self.quality,
         )
+
+
+def live_effect_options(settings: UISettings) -> SimpleNamespace:
+    """Namespace exposing the Live tab's independent NR values under the
+    shared nr_* names consumed by the live pipeline (EffectSettings).
+
+    The custom mask stays shared: only the Neural tab manages it.
+    """
+    return SimpleNamespace(
+        nr_style=settings.live_nr_style,
+        nr_intensity=settings.live_nr_intensity,
+        nr_passes=settings.live_nr_passes,
+        local_tone_strength=settings.live_local_tone_strength,
+        local_structure_strength=settings.live_local_structure_strength,
+        skin_structure_strength=settings.live_skin_structure_strength,
+        nr_color_strength=settings.live_nr_color_strength,
+        tone_preservation=settings.live_tone_preservation,
+        face_skin_protection=settings.live_face_skin_protection,
+        grain_preservation=settings.live_grain_preservation,
+        shimmer_suppression=settings.live_shimmer_suppression,
+        mask_feather=settings.live_mask_feather,
+        nr_mask=settings.nr_mask,
+        automatic_mask=settings.live_automatic_mask,
+    )
 
 
 DEFAULT_SETTINGS = UISettings()
@@ -158,21 +199,28 @@ def _validate(settings: UISettings) -> UISettings:
         raise ValueError("NR Passes must be an integer from 1 to 4.")
     if not 1 <= settings.nr_passes <= 4:
         raise ValueError("NR Passes must be between 1 and 4.")
+    if isinstance(settings.live_nr_passes, bool) or not isinstance(settings.live_nr_passes, int):
+        raise ValueError("Live NR Passes must be an integer from 1 to 4.")
+    if not 1 <= settings.live_nr_passes <= 4:
+        raise ValueError("Live NR Passes must be between 1 and 4.")
     if isinstance(settings.mask_feather, bool) or not isinstance(settings.mask_feather, int):
         raise ValueError("Mask Feather must be an integer from 0 to 128.")
     if not 0 <= settings.mask_feather <= 128:
         raise ValueError("Mask Feather must be between 0 and 128 pixels.")
+    if isinstance(settings.live_mask_feather, bool) or not isinstance(settings.live_mask_feather, int):
+        raise ValueError("Live Mask Feather must be an integer from 0 to 128.")
+    if not 0 <= settings.live_mask_feather <= 128:
+        raise ValueError("Live Mask Feather must be between 0 and 128 pixels.")
     resolve_upscaling_mode(settings.upscaling_factor)
+    resolve_upscaling_mode(settings.live_upscaling_factor)
     if not isinstance(settings.automatic_mask, bool):
         raise ValueError("Automatic Mask must be a boolean value.")
-    if not isinstance(settings.nr_gpu_mode, bool):
-        raise ValueError("Neural Rendering GPU mode must be a boolean value.")
+    if not isinstance(settings.live_automatic_mask, bool):
+        raise ValueError("Live Automatic Mask must be a boolean value.")
     if not isinstance(settings.hdr_mode, bool):
         raise ValueError("HDR Mode must be a boolean value.")
     if not isinstance(settings.frame_interpolation_hdr_mode, bool):
         raise ValueError("Frame Interpolation HDR Mode must be a boolean value.")
-    if not isinstance(settings.frame_interpolation_gpu_mode, bool):
-        raise ValueError("Frame Interpolation GPU mode must be a boolean value.")
     if not isinstance(settings.full_size_image_previews, bool):
         raise ValueError("Full size quality preview must be a boolean value.")
     # Migrate old codec names before validation
@@ -216,6 +264,10 @@ def _validate(settings: UISettings) -> UISettings:
         "Frame Interpolation quality": (
             settings.frame_interpolation_quality,
             QUALITY_CHOICES,
+        ),
+        "Frame Interpolation preview length": (
+            settings.frame_interpolation_preview_length,
+            PREVIEW_LENGTH_CHOICES,
         ),
         "Preview encoding": (
             settings.preview_encoding,

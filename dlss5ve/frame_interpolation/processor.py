@@ -324,9 +324,7 @@ def interpolate_video(
                 raise Cancelled("Frame interpolation stopped by user.")
             if progress:
                 value = max(0.0, min(1.0, float(value)))
-                elapsed = time.perf_counter() - started
-                if 0.01 < value < 0.99 and elapsed > .5:
-                    message += f" - Time Remaining: {elapsed * (1-value) / max(value,1e-6):.1f}s"
+                # Status bar shows only the main status; no ETA suffix.
                 progress(value, message)
 
         output_file: OutputFile | None = None
@@ -373,7 +371,7 @@ def interpolate_video(
                 capabilities.native_multiplier, cfr=cfr)
             output_count = output_frame_count(duration, options.target_rate)
             timings["probe_seconds"] = time.perf_counter() - probe_start
-            update(.01, f"{plan.path}: {source_rate} → {options.target_rate} FPS")
+            update(.01, "Preparing frame interpolation")
 
             selected_codec = "H.264 (NVIDIA NVENC)" if compat_preview else options.codec
             video_gpu = ffmpeg.resolve_video_gpu(
@@ -585,8 +583,7 @@ def interpolate_video(
                     now = time.perf_counter()
                     if now - last_update > .2:
                         update(.04 + .82 * decoded / max(1, source_frames),
-                               f"DLSSG GPU pipeline {decoded}/{source_frames}; "
-                               f"{writer.next_index/max(.01,now-pipeline_start):.1f} output fps")
+                               "Interpolating frames")
                         last_update = now
                 if decoded != source_frames:
                     raise RuntimeError(f"Decoded {decoded} source frames; expected {source_frames}.")

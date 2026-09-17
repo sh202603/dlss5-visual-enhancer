@@ -1,17 +1,14 @@
 from __future__ import annotations
 
-import traceback
+from dataclasses import replace
 from pathlib import Path
-
-import gradio as gr
 
 from ..core.ffmpeg import probe_video
 from ..core.ffmpeg.preview import (
     is_browser_playable, make_browser_preview, normalize_preview_encoding,
     resolve_preview_codec, wants_compat_preview,
 )
-from ..settings.factory import frame_interpolation_options
-from ..settings.storage import current_preview_encoding, current_settings, processing_gpu_settings
+from ..settings.storage import processing_gpu_settings
 from .capabilities import probe_frame_interpolation_capabilities
 from .models import FrameInterpolationOptions
 from .processor import interpolate_video
@@ -30,6 +27,7 @@ def first_video_path(paths: list[str] | str | None) -> str | None:
     normalized = normalize_video_paths(paths)
     return normalized[0] if normalized else None
 
+
 def frame_interpolation_capability_text() -> str:
     ai_gpu_uuid, _video_gpu_uuid = processing_gpu_settings()
     capabilities = probe_frame_interpolation_capabilities(ai_gpu_uuid)
@@ -42,8 +40,8 @@ def frame_interpolation_capability_text() -> str:
     state = "Ready" if capabilities.available else "Unavailable"
     detail = f"\n{capabilities.detail}" if capabilities.detail else ""
     return (
-        f"{state} — GPU: {capabilities.gpu} | Driver: {capabilities.driver} | "
-        f"HAGS: {hags}\nNative maximum: {native} | Cascade: {cascade} | "
+        f"{state} — GPU: {capabilities.gpu} | Driver: {capabilities.driver} | HAGS: {hags}\n"
+        f"Native maximum: {native} | Cascade: {cascade} | "
         f"NVOF: {'SLOW/available' if capabilities.nvof_available else 'unavailable'}\n"
         f"Bridge: {capabilities.bridge_version} (ABI {capabilities.bridge_abi_version}) | "
         f"CUDA interop: {'ready' if capabilities.cuda_interop else 'unavailable'} | "
@@ -64,11 +62,8 @@ def describe_frame_interpolation_plan(
         ai_gpu_uuid, _video_gpu_uuid = processing_gpu_settings()
         capabilities = probe_frame_interpolation_capabilities(ai_gpu_uuid)
         plan = choose_interpolation_plan(
-            metadata["rate"],
-            FrameInterpolationOptions(target_fps=target_fps).target_rate,
-            engine,
-            capabilities.native_multiplier,
-            cfr=bool(metadata.get("cfr", True)),
+            metadata["rate"], FrameInterpolationOptions(target_fps=target_fps).target_rate,
+            engine, capabilities.native_multiplier, cfr=bool(metadata.get("cfr", True)),
         )
         if plan.cascade_stages:
             precision = (
@@ -88,80 +83,85 @@ def describe_frame_interpolation_plan(
         return f"Preflight: {exc}"
 
 
-def update_frame_interpolation_preview_mode(
-    paths: list[str] | str | None,
-    target_fps: str,
-    engine: str,
-):
-    normalized = normalize_video_paths(paths)
-    available = bool(normalized)
-    single = len(normalized) == 1
-    label = "Input video preview" if len(normalized) <= 1 else f"Input video preview (first of {len(normalized)})"
-    return (
-        gr.update(value=normalized[0] if available else None, visible=True if available else "hidden", label=label),
-        gr.update(value=None, visible=True),
-        gr.update(visible=single),
-    )
-
-def preview_frame_interpolation(
-    input_paths: list[str] | str | None,
-    target_fps: str,
-    engine: str,
-    codec: str,
-    container: str,
-    quality: str,
-    progress=gr.Progress(track_tqdm=False),
-):
-    selected = first_video_path(input_paths)
-    if not selected:
-        raise gr.Error("Choose one video first.")
+def preview_frame_interpolation_native(
+    input_path: str,
+    options: FrameInterpolationOptions,
+    *,
+    preview_encoding: str = "Auto",
+    progress=None,
+    output_dir=None,
+    controller=None,
+    start_seconds: float | None = None,
+    frame_index: int | None = None,
+    preview_seconds: float | None = None,
+) -> tuple[str | None, str]:
+    if not input_path or not Path(input_path).is_file():
+        raise ValueError("Choose one valid video first.")
     try:
-        preview_mode = normalize_preview_encoding(current_preview_encoding())
-    except Exception:
-        preview_mode = "Auto"
+        length_seconds = max(0.0, float(preview_seconds if preview_seconds is not None else PREVIEW_SECONDS))
+    except (TypeError, ValueError):
+        length_seconds = PREVIEW_SECONDS
+    if not (length_seconds > 0):
+        length_seconds = PREVIEW_SECONDS
+    try:
+        start = max(0.0, float(start_seconds or 0.0))
+    except (TypeError, ValueError):
+        start = 0.0
+    try:
+        frame_no = max(1, int(frame_index or 1)) if frame_index else 1
+    except (TypeError, ValueError):
+        frame_no = 1
+    effective_path = str(input_path)
+    temp_clip: str | None = None
+    if start > 0.05:
+        from ..core.ffmpeg.preview import extract_preview_subclip
+        temp_clip = extract_preview_subclip(
+            str(input_path), dest_dir=output_dir, start_seconds=start,
+            length_seconds=length_seconds, controller=controller,
+        )
+        effective_path = temp_clip
+    preview_encoding_mode = normalize_preview_encoding(preview_encoding)
     effective_codec, effective_container = resolve_preview_codec(
-        codec, container, preview_mode
+        options.codec, options.container, preview_encoding_mode
     )
-    compat_preview = wants_compat_preview(codec, container, preview_mode)
-    # The preview never carried the HDR choice; keep it off as before.
-    options = frame_interpolation_options(
-        current_settings(),
-        target_fps=target_fps,
-        engine=engine,
+    compat_preview = wants_compat_preview(options.codec, options.container, preview_encoding_mode)
+    effective = replace(
+        options,
         codec=effective_codec,
         container=effective_container,
-        quality=quality,
-        hdr_mode=False,
-        rename_mode="Auto",
-        custom_suffix="_DLSSFG",
-        preview_seconds=PREVIEW_SECONDS,
+        hdr_mode=(options.hdr_mode and not compat_preview),
+        preview_seconds=length_seconds,
         preview_compat=compat_preview,
     )
-    try:
-        result = interpolate_video(
-            selected,
-            options,
-            lambda value, message: progress(value, desc=message),
-        )
-    except Exception as exc:
-        traceback.print_exc()
-        return None, f"Failed: {exc}"
+    result = interpolate_video(
+        effective_path,
+        effective,
+        progress,
+        output_dir=output_dir,
+        controller=controller,
+    )
+    if temp_clip:
+        try:
+            Path(temp_clip).unlink(missing_ok=True)
+        except OSError:
+            pass
     output_preview = result.output_path
     derived_note = ""
-    if preview_mode == "Auto" and not compat_preview:
+    if preview_encoding_mode == "Auto" and not compat_preview:
         try:
             playable = is_browser_playable(result.output_path)
         except Exception:
             playable = False
         if not playable:
             try:
-                output_preview = make_browser_preview(result.output_path)
-                derived_note = " (browser preview transcoded to H.264)"
+                output_preview = make_browser_preview(
+                    result.output_path, dest_dir=output_dir, controller=controller
+                )
+                derived_note = " (compatibility preview transcoded to H.264)"
             except Exception:
                 output_preview = result.output_path
     return output_preview, (
-        f"Preview complete: {result.output_frames} frames, {result.selected_path}, "
+        f"Preview complete f{frame_no} @ {start:.2f}s: {result.output_frames} frames, {result.selected_path}, "
         f"{result.cascade_stages} cascade stage(s), {result.generated_frames} DLSSG-selected "
-        f"frames in {result.elapsed_seconds:.1f}s. Report: {result.report_path}"
-        f"{derived_note}"
+        f"frames in {result.elapsed_seconds:.1f}s. Report: {result.report_path}{derived_note}"
     )

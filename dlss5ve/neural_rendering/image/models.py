@@ -33,7 +33,6 @@ class ImageConversionOptions:
     preserve_metadata: bool = True
     warmup_frames: int = 0
     automatic_mask: bool = False
-    nr_gpu_mode: bool = True
     rename_mode: str = "Auto"
     custom_suffix: str = "_Neural_Rendering"
 

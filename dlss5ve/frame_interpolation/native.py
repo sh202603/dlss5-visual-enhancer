@@ -17,7 +17,7 @@ from ..core.ngx_runtime import NGX_RUNTIME_LOCK
 from ..core.paths import RUNTIME
 
 RUNTIME_DIR = RUNTIME / "dlssg"
-BRIDGE = RUNTIME_DIR / "neuroframe_engine.dll"
+BRIDGE = RUNTIME_DIR / "neuroframe_engine_frame_interpolation.dll"
 BRIDGE_ABI_VERSION = 1
 MEMORY_HOST, MEMORY_CUDA = 1, 2
 FORMAT_RGBA8, FORMAT_NV12, FORMAT_P010 = 1, 4, 5
@@ -149,7 +149,9 @@ class _BridgeManager:
         try:
             library = ctypes.WinDLL(str(BRIDGE))
         except OSError as exc:
-            raise DLSSGBridgeError(f"Could not load neuroframe_engine.dll: {exc}") from exc
+            raise DLSSGBridgeError(
+                f"Could not load neuroframe_engine_frame_interpolation.dll: {exc}"
+            ) from exc
         library.fi_abi_version.restype = ctypes.c_uint32
         library.fi_version.restype = ctypes.c_char_p
         library.fi_init.argtypes = [ctypes.c_int, ctypes.c_wchar_p, ctypes.c_void_p, ctypes.c_int]

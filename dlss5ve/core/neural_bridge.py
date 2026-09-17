@@ -34,6 +34,22 @@ FORMAT_NV12 = 2
 FORMAT_P010 = 3
 
 
+def _bridge_failure_requires_restart(detail: str) -> bool:
+    """Return whether retrying through either memory path is unsafe/useless."""
+    lowered = detail.lower()
+    return any(
+        marker in lowered
+        for marker in (
+            "corrupt",
+            "access violation",
+            "device recovery failed",
+            "device recovery aborted",
+            "device removal",
+            "reinitialization failed",
+        )
+    )
+
+
 class FrameDescriptorV1(ctypes.Structure):
     _fields_ = [
         ("struct_size", ctypes.c_uint32),
@@ -1237,7 +1253,7 @@ class NeuralBridgeManager:
                 elapsed = time.perf_counter() - started
                 if not ok:
                     detail = _text(error.value) or "unknown CUDA frame-ABI failure"
-                    if "corrupt" in detail.lower() or "access violation" in detail.lower():
+                    if _bridge_failure_requires_restart(detail):
                         self._poisoned_reason = detail
                         raise NeuralBridgePoisonedError(
                             f"{detail}. Restart the application before rendering again."
@@ -1551,7 +1567,7 @@ class NeuralBridgeManager:
             elapsed = time.perf_counter() - started
             if not ok:
                 detail = _text(error.value) or "unknown feature-18 failure"
-                if "corrupt" in detail.lower() or "access violation" in detail.lower():
+                if _bridge_failure_requires_restart(detail):
                     self._poisoned_reason = detail
                     raise NeuralBridgePoisonedError(
                         f"{detail}. Restart the application before rendering again."
@@ -1596,7 +1612,7 @@ class NeuralBridgeManager:
             evaluate_seconds = time.perf_counter() - evaluate_started
             if not ok:
                 detail = _text(error.value) or "unknown CUDA interoperability failure"
-                if "corrupt" in detail.lower() or "access violation" in detail.lower():
+                if _bridge_failure_requires_restart(detail):
                     self._poisoned_reason = detail
                     raise NeuralBridgePoisonedError(
                         f"{detail}. Restart the application before rendering again."

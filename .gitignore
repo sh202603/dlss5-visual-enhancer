@@ -1,10 +1,12 @@
-# Runtime state created on demand by the app and the CLI.
-logs/
-outputs/
-jobs/
-config/
-live/
-temp/
+# Runtime state created on demand by the app and the CLI. Anchored to the
+# repository root: the unanchored forms also matched package directories
+# (dlss5ve/live/ is the Live package, not the Live scratch directory).
+/logs/
+/outputs/
+/jobs/
+/config/
+/live/
+/temp/
 
 # Vendored embedded interpreter and its site-packages (release package only).
 bin/python-*/

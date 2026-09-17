@@ -1,0 +1,142 @@
+import QtQuick
+import QtQuick.Dialogs
+import ".."
+import "../controls"
+
+AppCard {
+    id: root
+
+    property var appBridge: null
+    title: "Composition & Masking"
+
+    Column {
+        width: parent.width
+        spacing: 12
+
+        // Detail-Only Preset Button
+        Row {
+            width: parent.width
+            spacing: 8
+
+            AppButton {
+                text: "Apply Detail-Only Preset"
+                width: parent.width
+                buttonHeight: 28
+                onClicked: {
+                    if (appBridge) appBridge.applyDetailOnly()
+                }
+            }
+        }
+
+        // Sliders
+        AppSlider {
+            width: parent.width
+            label: "NR Color Strength"
+            from: 0.0
+            to: 1.0
+            stepSize: 0.05
+            defaultValue: 1.0
+            value: appBridge ? appBridge.nrColorStrength : 1.0
+            onValueModified: (v) => { if (appBridge) appBridge.nrColorStrength = v }
+        }
+
+        AppSlider {
+            width: parent.width
+            label: "Tone Preservation"
+            from: 0.0
+            to: 1.0
+            stepSize: 0.05
+            defaultValue: 0.0
+            value: appBridge ? appBridge.tonePreservation : 0.0
+            onValueModified: (v) => { if (appBridge) appBridge.tonePreservation = v }
+        }
+
+        AppSlider {
+            width: parent.width
+            label: "Face / Skin Protection"
+            from: 0.0
+            to: 1.0
+            stepSize: 0.05
+            defaultValue: 0.0
+            value: appBridge ? appBridge.faceSkinProtection : 0.0
+            onValueModified: (v) => { if (appBridge) appBridge.faceSkinProtection = v }
+        }
+
+        AppSlider {
+            width: parent.width
+            label: "Grain Preservation"
+            from: 0.0
+            to: 1.0
+            stepSize: 0.05
+            defaultValue: 0.0
+            value: appBridge ? appBridge.grainPreservation : 0.0
+            onValueModified: (v) => { if (appBridge) appBridge.grainPreservation = v }
+        }
+
+        AppSlider {
+            width: parent.width
+            label: "Mask Feather"
+            unit: "px"
+            from: 0
+            to: 128
+            stepSize: 1
+            precision: 0
+            defaultValue: 0
+            value: appBridge ? appBridge.maskFeather : 0
+            onValueModified: (v) => { if (appBridge) appBridge.maskFeather = Math.round(v) }
+        }
+
+        // Custom NR Mask Box
+        Rectangle {
+            width: parent.width
+            height: 64
+            radius: Theme.radiusMedium
+            color: Theme.bgInput
+            border.color: Theme.borderSubtle
+            border.width: 1
+
+            Column {
+                anchors.centerIn: parent
+                spacing: 4
+
+                Row {
+                    anchors.horizontalCenter: parent.horizontalCenter
+                    spacing: 8
+
+                    AppButton {
+                        text: "Load Custom Mask..."
+                        buttonHeight: 24
+                        onClicked: maskDialog.open()
+                    }
+
+                    AppButton {
+                        text: "Clear Mask"
+                        buttonHeight: 24
+                        onClicked: {
+                            if (appBridge) appBridge.clearCustomMask()
+                        }
+                    }
+                }
+
+                Text {
+                    anchors.horizontalCenter: parent.horizontalCenter
+                    text: appBridge ? appBridge.customMaskStatus : "No mask loaded"
+                    font.family: Theme.monoFontFamily
+                    font.pixelSize: Theme.fontSizeSmall
+                    color: Theme.textMuted
+                }
+            }
+        }
+    }
+
+    FileDialog {
+        id: maskDialog
+        title: "Select Custom NR Mask"
+        nameFilters: ["Image Files (*.png *.jpg *.jpeg *.webp *.tiff *.bmp)", "All Files (*.*)"]
+        onAccepted: {
+            if (appBridge && selectedFile) {
+                appBridge.selectCustomMask(selectedFile.toString())
+            }
+        }
+    }
+}

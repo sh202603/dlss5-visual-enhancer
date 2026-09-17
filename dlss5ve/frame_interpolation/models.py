@@ -24,6 +24,10 @@ FPS_RATES: dict[str, Fraction] = {
 }
 FPS_CHOICES = tuple(FPS_RATES)
 ENGINE_CHOICES = ("Auto", "Native DLSSG", "Cascade")
+# Preview clip lengths (seconds) offered in the FI action bar. Stored as
+# strings like the FPS choice; converted to float at render time.
+PREVIEW_LENGTH_CHOICES = ("3", "5", "10", "20", "30")
+PREVIEW_LENGTH_DEFAULT = "3"
 
 
 def resolve_target_rate(value: str | int | float | Fraction) -> Fraction:

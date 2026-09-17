@@ -15,7 +15,6 @@ from typing import Callable
 
 import av
 import numpy as np
-from av.codec.hwaccel import HWAccel
 
 from ...core import app_log, ffmpeg
 from ...core.gpu_selection import resolve_runtime_ai_gpu
@@ -84,10 +83,10 @@ def convert_video(
     # Compat previews use the forced H.264 SDR 8-bit path; user-encoded previews
     # (Preview Encoding Auto-playable / Disabled) preserve the HDR choice.
     compat_preview = is_preview and bool(getattr(options, "preview_compat", True))
-    # Processing-engine selection is codec-driven. Keep the legacy option in
-    # the data model for preset/API compatibility, but never let an old saved
-    # value override the automatic NVENC/CPU routing decision.
-    options.nr_gpu_mode = automatic_gpu_mode(options.codec)
+    # Processing-engine selection is codec-driven: NVENC encoders take the
+    # CUDA transport, CPU codecs take the host-memory path. There is no
+    # user-facing mode switch.
+    cuda_path = automatic_gpu_mode(options.codec)
     hdr_requested = bool(options.preserve_hdr)
     if compat_preview:
         hdr_requested = False
@@ -104,7 +103,7 @@ def convert_video(
 
     with job_context as controller:
         assert controller is not None
-        if options.nr_gpu_mode:
+        if cuda_path:
             from .cuda_pipeline import convert_video_cuda_nvenc
 
             return convert_video_cuda_nvenc(
@@ -126,13 +125,8 @@ def convert_video(
             try:
                 v = float(value)
                 v = 0.0 if v < 0 else (1.0 if v > 1 else v)
-                elapsed = time.perf_counter() - started
-                if 0.01 < v < 0.99 and elapsed > 0.5:
-                    eta = elapsed * (1 - v) / max(v, 1e-6)
-                    desc = f"{desc} - Time Remaining: {eta:.1f}s"
-                else:
-                    v = float(value) if isinstance(value, (int, float)) else v
-                # Use positional `desc` so it works for both gr.Progress(desc=) and report_item(message)
+                # Status bar shows only the main status; no ETA suffix.
+                # Native Qt progress callback: progress(value, message).
                 progress(v, desc)
             except Exception:
                 try:
@@ -237,7 +231,8 @@ def convert_video(
             )
             output_file = OutputFile(output)
             temp_video = job_dir / (f"processed-video{extension}" if preview_frames is not None else "processed-video.mkv")
-            native = resolve_native_settings(options)
+            # Host-memory path (CPU codec): stage explicitly, never CUDA.
+            native = resolve_native_settings(options, gpu_mode=False)
             metadata_diagnostics: dict = {}
             render_note = prepare_render_note(options, metadata_diagnostics)
             video_duration = float(metadata.get("video_stream_duration") or 0.0)
@@ -260,7 +255,7 @@ def convert_video(
                 if preview_seconds is not None
                 else (video_duration if video_duration > 0.0 else None)
             )
-            _report_progress(0.01, f"Starting feature 18 on {gpu['display_name']}")
+            _report_progress(0.01, "Starting feature 18")
 
             encoder_setup: list[tuple] = []
             encoding_stage_started = time.perf_counter()
@@ -269,11 +264,9 @@ def convert_video(
                 nonlocal video_gpu
                 encoder_started = time.perf_counter()
                 try:
-                    # GPU ON co-locates NVENC with feature 18 on the AI GPU.
-                    # GPU OFF retains the separate Video Processing selection.
-                    encoder_gpu_uuid = (
-                        str(gpu["uuid"]) if options.nr_gpu_mode else options.video_gpu_uuid
-                    )
+                    # The host-memory path retains the separate Video
+                    # Processing GPU selection for the CPU encoder stage.
+                    encoder_gpu_uuid = options.video_gpu_uuid
                     video_gpu = ffmpeg.resolve_video_gpu(
                         prepared_runtime.gpus,
                         encoder_gpu_uuid,
@@ -316,19 +309,8 @@ def convert_video(
             encoder_setup_thread.start()
             preopened_decoder = None
             # Final-residual stabilization needs the original RGBA frame after
-            # composition.  Keep decode on the host for this non-NVENC path;
+            # composition. Decode stays on the host for this non-NVENC path;
             # feature 18 and optical flow still execute on the selected GPU.
-            if options.nr_gpu_mode and float(options.shimmer_suppression) <= 0.0:
-                # FFmpeg's CUDA hwdevice must be created before NGX retains the
-                # CUDA primary context on affected Windows driver versions.
-                decode_device = HWAccel(
-                    "cuda",
-                    device=str(int(gpu.get("cuda_ordinal", gpu.get("index", 0)))),
-                    allow_software_fallback=True,
-                    options={"primary_ctx": "1"},
-                    is_hw_owned=True,
-                )
-                preopened_decoder = av.open(str(source), hwaccel=decode_device)
             session_started = time.perf_counter()
             session = DLSSFrameSession(
                 input_width=input_width,
@@ -365,8 +347,7 @@ def convert_video(
             maximum_height = session.maximum_height
             _report_progress(
                 0.03,
-                f"DLSS {mode['name']}: {render_width}×{render_height} → "
-                f"{output_width}×{output_height}",
+                "Preparing video rendering",
             )
 
             (
@@ -644,7 +625,7 @@ def convert_video(
                 if now - last_progress_update >= 0.1:
                     _report_progress(
                         0.04 + 0.84 * min(1.0, delivered / estimated_frames),
-                        f"DLSS 5 frame {delivered} (estimated {estimated_frames})",
+                        "Rendering video frames",
                     )
                     last_progress_update = now
 

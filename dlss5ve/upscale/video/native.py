@@ -28,7 +28,7 @@ from .models import UpscaleCapabilities, UpscaleOptions
 
 
 RUNTIME_DIR = RUNTIME / "rtx_video"
-BRIDGE = RUNTIME_DIR / "neuroframe_engine.dll"
+BRIDGE = RUNTIME_DIR / "neuroframe_engine_upscaling.dll"
 WORKER = (ROOT / "native (dev)" / "Upscale" / "RTX Video" / "rtx_video" /
           "build" / "legacy" / "rtx-video-worker.exe")
 BRIDGE_ABI_VERSION = 1
@@ -334,7 +334,7 @@ def probe_legacy_capabilities(luid: str) -> dict[str, Any]:
     process = subprocess.Popen(
         [str(WORKER), "--probe", "--gpu-luid", luid], cwd=WORKER.parent,
         stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        creationflags=subprocess.CREATE_NO_WINDOW,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
     )
     controller.register(process)
     try:

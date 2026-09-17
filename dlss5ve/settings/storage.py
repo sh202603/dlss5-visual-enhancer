@@ -11,7 +11,7 @@ from ..core.ffmpeg import HDR_ALLOWED_CODECS
 from ..core.paths import CONFIG_PATH
 from ..core.naming import RENAME_MODES, validate_rename
 from ..core.runtime import NR_STYLES, resolve_upscaling_mode
-from ..frame_interpolation.models import ENGINE_CHOICES, FPS_CHOICES
+from ..frame_interpolation.models import ENGINE_CHOICES, FPS_CHOICES, PREVIEW_LENGTH_CHOICES
 from .migration import _migrate_codec
 from .models import (
     CODEC_CHOICES, CONFIG_SECTION, CONTAINER_CHOICES, DEFAULT_SETTINGS, IMAGE_FORMAT_CHOICES,
@@ -180,7 +180,6 @@ def load_settings(path: str | os.PathLike[str]) -> UISettings:
             "mask_feather", 0, 128, DEFAULT_SETTINGS.mask_feather
         )),
         automatic_mask=boolean("automatic_mask", DEFAULT_SETTINGS.automatic_mask),
-        nr_gpu_mode=boolean("nr_gpu_mode", DEFAULT_SETTINGS.nr_gpu_mode),
         upscaling_factor=upscaling_factor(),
         codec=codec_choice("codec", DEFAULT_SETTINGS.codec),
         container=choice("container", CONTAINER_CHOICES, DEFAULT_SETTINGS.container),
@@ -215,8 +214,11 @@ def load_settings(path: str | os.PathLike[str]) -> UISettings:
             DEFAULT_SETTINGS.frame_interpolation_quality,
         ),
         frame_interpolation_hdr_mode=fi_hdr_mode_value(),
-        frame_interpolation_gpu_mode=boolean(
-            "frame_interpolation_gpu_mode", DEFAULT_SETTINGS.frame_interpolation_gpu_mode),
+        frame_interpolation_preview_length=choice(
+            "frame_interpolation_preview_length",
+            PREVIEW_LENGTH_CHOICES,
+            DEFAULT_SETTINGS.frame_interpolation_preview_length,
+        ),
         frame_interpolation_rename_mode=frame_interpolation_rename_mode,
         frame_interpolation_custom_suffix=frame_interpolation_custom_suffix,
         preview_encoding=choice(
@@ -232,6 +234,50 @@ def load_settings(path: str | os.PathLike[str]) -> UISettings:
             UPSCALE_MODE_CHOICES,
             DEFAULT_SETTINGS.upscale_mode,
         ),
+    )
+    # First-run migration: Live mirrors default to the loaded shared NR
+    # values so previous Live tunings survive the split. Factory defaults
+    # apply only to fresh configs and to per-tab Reset.
+    def live_upscaling_factor() -> float:
+        try:
+            return resolve_upscaling_mode(float(section.get(
+                "live_upscaling_factor", str(settings.upscaling_factor))))[0]
+        except (TypeError, ValueError):
+            return settings.upscaling_factor
+    settings = replace(
+        settings,
+        live_nr_style=choice("live_nr_style", tuple(NR_STYLES), settings.nr_style),
+        live_nr_intensity=number("live_nr_intensity", 0.0, 2.0, settings.nr_intensity),
+        live_nr_passes=integer("live_nr_passes", 1, 4, settings.nr_passes),
+        live_local_tone_strength=number(
+            "live_local_tone_strength", 0.0, 2.0, settings.local_tone_strength
+        ),
+        live_local_structure_strength=number(
+            "live_local_structure_strength", 0.0, 2.0, settings.local_structure_strength
+        ),
+        live_skin_structure_strength=number(
+            "live_skin_structure_strength", -1.0, 2.0, settings.skin_structure_strength
+        ),
+        live_nr_color_strength=number(
+            "live_nr_color_strength", 0.0, 1.0, settings.nr_color_strength
+        ),
+        live_tone_preservation=number(
+            "live_tone_preservation", 0.0, 1.0, settings.tone_preservation
+        ),
+        live_face_skin_protection=number(
+            "live_face_skin_protection", 0.0, 1.0, settings.face_skin_protection
+        ),
+        live_grain_preservation=number(
+            "live_grain_preservation", 0.0, 1.0, settings.grain_preservation
+        ),
+        live_shimmer_suppression=number(
+            "live_shimmer_suppression", 0.0, 1.0, settings.shimmer_suppression
+        ),
+        live_mask_feather=int(number(
+            "live_mask_feather", 0, 128, settings.mask_feather
+        )),
+        live_automatic_mask=boolean("live_automatic_mask", settings.automatic_mask),
+        live_upscaling_factor=live_upscaling_factor(),
     )
     # Auto-disable HDR Mode if codec does not support it (e.g. H.264)
     try:
@@ -293,8 +339,21 @@ def save_settings(path: str | os.PathLike[str], settings: UISettings) -> None:
         "shimmer_suppression": f"{settings.shimmer_suppression:.2f}",
         "mask_feather": str(settings.mask_feather),
         "automatic_mask": str(settings.automatic_mask).lower(),
-        "nr_gpu_mode": str(settings.nr_gpu_mode).lower(),
         "upscaling_factor": f"{settings.upscaling_factor:g}",
+        "live_nr_style": settings.live_nr_style,
+        "live_nr_intensity": f"{settings.live_nr_intensity:.2f}",
+        "live_nr_passes": str(settings.live_nr_passes),
+        "live_local_tone_strength": f"{settings.live_local_tone_strength:.2f}",
+        "live_local_structure_strength": f"{settings.live_local_structure_strength:.2f}",
+        "live_skin_structure_strength": f"{settings.live_skin_structure_strength:.2f}",
+        "live_nr_color_strength": f"{settings.live_nr_color_strength:.2f}",
+        "live_tone_preservation": f"{settings.live_tone_preservation:.2f}",
+        "live_face_skin_protection": f"{settings.live_face_skin_protection:.2f}",
+        "live_grain_preservation": f"{settings.live_grain_preservation:.2f}",
+        "live_shimmer_suppression": f"{settings.live_shimmer_suppression:.2f}",
+        "live_mask_feather": str(settings.live_mask_feather),
+        "live_automatic_mask": str(settings.live_automatic_mask).lower(),
+        "live_upscaling_factor": f"{settings.live_upscaling_factor:g}",
         "codec": settings.codec,
         "container": settings.container,
         "quality": settings.quality,
@@ -311,7 +370,7 @@ def save_settings(path: str | os.PathLike[str], settings: UISettings) -> None:
         "frame_interpolation_container": settings.frame_interpolation_container,
         "frame_interpolation_quality": settings.frame_interpolation_quality,
         "frame_interpolation_hdr_mode": str(settings.frame_interpolation_hdr_mode).lower(),
-        "frame_interpolation_gpu_mode": str(settings.frame_interpolation_gpu_mode).lower(),
+        "frame_interpolation_preview_length": settings.frame_interpolation_preview_length,
         "frame_interpolation_rename_mode": settings.frame_interpolation_rename_mode,
         "frame_interpolation_custom_suffix": settings.frame_interpolation_custom_suffix,
         "preview_encoding": settings.preview_encoding,

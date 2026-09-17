@@ -155,8 +155,11 @@ class LiveSession(threading.Thread):
         native = None
         try:
             with NativeDeadline(self.controller, EFFECT_REPLACEMENT_TIMEOUT) as deadline:
+                # The replacement session must match the running path: CUDA
+                # branch native_args carry cuda_video=True, host ones don't.
                 native = DLSSFrameSession(**native_args, controller=deadline,
-                                         native_settings=resolve_native_settings(settings),
+                                          native_settings=resolve_native_settings(
+                                              settings, gpu_mode=bool(native_args.get("cuda_video", False))),
                                          composition_mask=settings.nr_mask)
                 native.diagnostics.encode_backend = (
                     "nvenc" if self.info.encoder == "NVIDIA NVENC" else "cpu"
@@ -224,7 +227,7 @@ class LiveSession(threading.Thread):
         # startup, and include its cost in automatic cadence selection.
         return False, None
 
-    def _decoder_command(self, source: ResolvedSource, width: int, height: int, rate) -> list[str]:
+    def _decoder_command(self, source: ResolvedSource, width: int, height: int, rate, *, cuda: bool) -> list[str]:
         opts = self.options
         command = [str(FFMPEG), "-hide_banner", "-loglevel", "warning", "-nostdin", "-filter_threads", "2"]
         # HLS broadcasts can jump clocks at reconnects/ad boundaries. Let
@@ -239,7 +242,7 @@ class LiveSession(threading.Thread):
             command += [*input_args(source.audio_url, source.audio_headers, opts.network_timeout),
                         "-thread_queue_size", "32", "-i", source.audio_url]
             audio_input = "1"
-        if opts.nr_gpu_mode:
+        if cuda:
             # Demux compressed video without decoding pixels. Audio alone is
             # normalized to timestamped stereo PCM for PyAV's HLS mux.
             command += ["-map", "0:v:0", "-map", f"{audio_input}:a:0?", "-sn", "-dn",
@@ -403,7 +406,7 @@ class LiveSession(threading.Thread):
         )
         try:
             decoder = self._spawn(
-                "demux", self._decoder_command(resolved, in_w, in_h, self._rate.rate),
+                "demux", self._decoder_command(resolved, in_w, in_h, self._rate.rate, cuda=True),
                 stdout=subprocess.PIPE, stdin=subprocess.DEVNULL,
             )
             decode_device = HWAccel(
@@ -580,8 +583,6 @@ class LiveSession(threading.Thread):
                         old_settings = self.effects.applied
                         update_started = time.perf_counter()
                         try:
-                            if not request.settings.nr_gpu_mode:
-                                raise RuntimeError("Changing GPU mode during Live requires Stop and Start.")
                             output, output_pts, cost = evaluate(request.settings, True)
                             self.effects.complete(
                                 request, pts=pts,
@@ -710,7 +711,8 @@ class LiveSession(threading.Thread):
                 pass
             code = self._mpv.poll()
             self._set(mpv_running=code is None)
-            self._set(player_dropped_frames=int(self._player_state.get("dropped", 0)) +
+            self._set(player_started=bool(self._player_state.get("started", False)),
+                      player_dropped_frames=int(self._player_state.get("dropped", 0)) +
                       int(self._player_state.get("decoder_dropped", 0)),
                       rebuffer_events=int(self._player_state.get("stalls", 0)),
                       av_sync_ms=float(self._player_state.get("avsync", 0)) * 1000)
@@ -728,7 +730,9 @@ class LiveSession(threading.Thread):
             if self.options.open_mpv:
                 self._mpv = launch_mpv(self.info.playlist_url, self._title, self.options.mpv_args,
                     buffer_seconds=min(self.options.buffer_seconds, published),
-                    state_path=self._session_dir / "player.json")
+                    state_path=self._session_dir / "player.json",
+                    wid=int(getattr(self.options, "mpv_wid", 0) or 0),
+                    ipc_server=str(getattr(self.options, "mpv_ipc_server", "") or ""))
                 self._set(mpv_running=True)
         info = self.snapshot()
         position = (float(self._player_state.get("position", 0)) if self._mpv
@@ -793,16 +797,13 @@ class LiveSession(threading.Thread):
         prepared_runtime = prepare_runtime()
         ai_uuid, video_uuid = processing_gpu_settings()
         gpu = resolve_runtime_ai_gpu(prepared_runtime.gpus, prepared_runtime.runtime_bundle, ai_uuid)
-        encoder_uuid = ai_uuid if options.nr_gpu_mode else video_uuid
-        nvenc, ordinal = self._select_encoder(prepared_runtime.gpus, encoder_uuid, out_w, out_h)
+        # Automatic path selection: NVENC on the AI GPU takes the CUDA path,
+        # anything else falls back to the host-memory path with a CPU encoder.
+        nvenc, ordinal = self._select_encoder(prepared_runtime.gpus, ai_uuid, out_w, out_h)
         self._set(input_size=f"{in_w}x{in_h}", output_size=f"{out_w}x{out_h}",
                   encoder="NVIDIA NVENC" if nvenc else "CPU x264")
-        if options.nr_gpu_mode:
-            if not nvenc or ordinal is None:
-                raise RuntimeError(
-                    "GPU ON Live requires H.264 NVENC on the selected AI GPU. "
-                    "Switch GPU OFF to use the host-staging CPU encoder boundary."
-                )
+        cuda_path = bool(nvenc and ordinal is not None)
+        if cuda_path:
             self._produce_cuda(
                 resolved, metadata, in_w, in_h, out_w, out_h, factor, mode,
                 prepared_runtime, gpu, ordinal,
@@ -819,12 +820,12 @@ class LiveSession(threading.Thread):
             native_args = dict(input_width=in_w, input_height=in_h, output_width=out_w, output_height=out_h,
                 frame_count=None, warmup_frames=0, factor=factor, mode=mode,
                 gpu=gpu, runtime_bundle=prepared_runtime.runtime_bundle)
-            native = DLSSFrameSession(**native_args, native_settings=resolve_native_settings(options),
+            native = DLSSFrameSession(**native_args, native_settings=resolve_native_settings(options, gpu_mode=False),
                                       composition_mask=options.nr_mask,
                                       controller=self.controller)
             native.diagnostics.encode_backend = "nvenc" if nvenc else "cpu"
             self._last_progress = time.monotonic()
-            decoder = self._spawn("decoder", self._decoder_command(resolved, out_w, out_h, self._rate.rate),
+            decoder = self._spawn("decoder", self._decoder_command(resolved, out_w, out_h, self._rate.rate, cuda=False),
                                   stdout=subprocess.PIPE, stdin=subprocess.DEVNULL)
             processes.append(decoder)
             encoder = self._spawn("encoder", self._encoder_command(self._rate.rate, ordinal, nvenc),

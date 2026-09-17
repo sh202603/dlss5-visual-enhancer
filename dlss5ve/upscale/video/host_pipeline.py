@@ -331,7 +331,7 @@ def convert_video_inprocess_host(
 
     encode_queue: queue.Queue | None = None
     try:
-        update(0.01, f"Preparing in-process CUDA and {encoder.display_name}")
+        update(0.01, "Preparing video processing")
         JOBS.mkdir(exist_ok=True)
         job = tempfile.TemporaryDirectory(prefix="rtx-video-host-", dir=JOBS)
         try:
@@ -526,8 +526,7 @@ def convert_video_inprocess_host(
                 if now - last_update > 0.2:
                     update(
                         min(0.87, 0.05 + 0.82 * delivered / max(1, estimated)),
-                        f"RTX Video pinned pipeline: {width}×{height} → {output_width}×{output_height}; "
-                        f"{delivered} frames; {delivered / max(0.01, now-started):.1f} fps")
+                        "Upscaling video")
                     last_update = now
             if not delivered:
                 raise ValueError("The input contains no decodable video frames.")

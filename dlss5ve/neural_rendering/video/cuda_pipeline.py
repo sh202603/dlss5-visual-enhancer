@@ -189,7 +189,7 @@ def convert_video_cuda_nvenc(
             options={"primary_ctx": "1"},
             is_hw_owned=True,
         )
-        _progress(progress, 0.01, f"Starting feature 18 on {gpu['display_name']}")
+        _progress(progress, 0.01, "Starting feature 18")
         with av.open(str(source), hwaccel=decode_device) as decoded:
             input_stream = decoded.streams.video[0]
             input_stream.thread_type = "AUTO"
@@ -356,7 +356,7 @@ def convert_video_cuda_nvenc(
                     _progress(
                         progress,
                         0.04 + 0.84 * min(1.0, delivered / estimated_frames),
-                        f"Neural Rendering frame {delivered} (estimated {estimated_frames})",
+                        "Rendering video frames",
                     )
                 if not delivered:
                     raise RuntimeError("The input video contains no decodable frames.")
