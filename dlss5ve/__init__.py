@@ -1,4 +1,4 @@
-"""Portable DLSS 5 Visual Enhancer for images and video.
+"""Portable Visual Enhancer for images and video.
 
 The feature packages are imported lazily so that ``import dlss5ve`` works in
 environments without the optional image decoders (``image`` extra): video,

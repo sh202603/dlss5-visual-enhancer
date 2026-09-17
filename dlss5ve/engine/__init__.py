@@ -2,10 +2,10 @@
 
 The processing packages work on files. These classes work on numpy frames so
 that another program (lada-ex, a custom pipeline) can stream frames through
-the native runtimes without touching files, Gradio, or torch:
+the native runtimes without touching files, the desktop UI, or torch:
 
 - ``NeuralRenderStream``: DLSS Neural Rendering (feature 18), one RGBA frame
-  in, one RGBA frame out at the chosen Scale (1, 0.75, 0.5, 0.25).
+  in, one RGBA frame out at the chosen Scale (0.25 to 2).
 - ``FrameGenStream``: DLSS Frame Generation, one RGBA frame in, the generated
   frames between it and the previous frame out.
 

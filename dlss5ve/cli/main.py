@@ -13,10 +13,10 @@ Conventions:
   returns; since v8 the processing layer writes no manifest files, only the
   session log (``logs/app-<stamp>.log``), whose path the payload carries as
   ``log_path``.
-- since v9 the processing layer decides two things the caller used to choose:
-  the output container (from the codec) and, for video, whether frames stay on
-  CUDA or pass through system memory (NVENC codecs stay on CUDA). There are no
-  flags for either; ``--nr-gpu`` remains only on ``image``.
+- since v9 the container follows the codec and, since v10, the memory path is
+  decided by the processing layer for every command (NVENC codecs stay on
+  CUDA, CPU codecs stage through system memory, images stay GPU-resident).
+  There are no flags for either.
 
 Exit codes: 0 all inputs succeeded, 1 some or all inputs failed, 2 usage error
 or missing input, 3 runtime or GPU unavailable, 130 interrupted by the user.
@@ -51,7 +51,9 @@ EXIT_USAGE = 2
 EXIT_RUNTIME = 3
 EXIT_CANCELLED = 130
 
-NR_SCALE_CHOICES = tuple(UPSCALING_MODES)
+# Ascending, unlike the UPSCALING_MODES mapping (which leads with Source), so
+# that --help, the argparse error message, and info --json all read in order.
+NR_SCALE_CHOICES = tuple(sorted(UPSCALING_MODES))
 
 
 class UsageError(ValueError):
@@ -117,15 +119,8 @@ def _add_neural(parser: argparse.ArgumentParser, settings: UISettings, *, video:
     scales = ", ".join(f"{factor:g}" for factor in NR_SCALE_CHOICES)
     group.add_argument(
         "--nr-scale", type=float, choices=NR_SCALE_CHOICES, metavar="FACTOR", default=settings.upscaling_factor,
-        help=f"Resolution entering Neural Rendering as a fraction of the source: {scales}; below 1 is a Lanczos downscale, the output keeps that size (default: %(default)s)",
+        help=f"Resolution entering Neural Rendering relative to the source: {scales}; below 1 is a Lanczos downscale, above 1 a Lanczos upscale, and the output keeps that size (default: %(default)s)",
     )
-    if not video:
-        # Video derives its path from the codec (NVENC stays on CUDA, CPU codecs
-        # stage through system memory), so the switch would have no effect there.
-        group.add_argument(
-            "--nr-gpu", action=argparse.BooleanOptionalAction, default=settings.nr_gpu_mode,
-            help="Processing Engine Path for images: keep frames in VRAM (CUDA/D3D12 interop); --no-nr-gpu stages through system memory.",
-        )
 
     composition = parser.add_argument_group("composition")
     composition.add_argument("--color-strength", type=float, metavar="0..1", default=settings.nr_color_strength, help="NR Color Strength; 0 keeps the source colour (default: %(default)s)")
@@ -193,7 +188,7 @@ def _sizing_overrides(args: argparse.Namespace) -> dict[str, Any]:
     return overrides
 
 
-_BANNER = f"dlss5ve-cli {__version__} (DLSS 5 Visual Enhancer {APP_VERSION})"
+_BANNER = f"dlss5ve-cli {__version__} (Visual Enhancer {APP_VERSION})"
 
 
 def _command(commands: Any, name: str, help_text: str) -> argparse.ArgumentParser:
@@ -209,7 +204,7 @@ def build_parser(settings: UISettings) -> argparse.ArgumentParser:
         description=f"{_BANNER}: Neural Rendering for images and videos, DLSS Frame Generation, and RTX Video Super Resolution / HDR.",
         epilog="Defaults come from config.ini (or --preset). Exit codes: 0 ok, 1 some inputs failed, 2 usage, 3 runtime/GPU unavailable, 130 interrupted.",
     )
-    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__} (DLSS 5 Visual Enhancer {APP_VERSION})")
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__} (Visual Enhancer {APP_VERSION})")
     commands = parser.add_subparsers(dest="command", metavar="COMMAND", required=True)
     inputs_help = "Files, or folders whose supported files are processed in name order (subfolders excluded)."
 
@@ -350,9 +345,6 @@ def _neural_overrides(args: argparse.Namespace) -> dict[str, Any]:
         "automatic_mask": bool(args.automatic_mask),
         "upscaling_factor": args.nr_scale,
     }
-    if hasattr(args, "nr_gpu"):
-        # Images only; video's path is decided by its codec in the processor.
-        overrides["nr_gpu_mode"] = bool(args.nr_gpu)
     if hasattr(args, "shimmer_suppression"):
         overrides["shimmer_suppression"] = args.shimmer_suppression
     return overrides
@@ -653,7 +645,7 @@ def collect_info(ai_gpu_uuid: str) -> dict[str, Any]:
 
 def _print_info(report: dict[str, Any]) -> None:
     out = sys.stdout
-    out.write(f"dlss5ve-cli {report['version']} | DLSS 5 Visual Enhancer {report['app_version']}\n")
+    out.write(f"dlss5ve-cli {report['version']} | Visual Enhancer {report['app_version']}\n")
     out.write(f"Root: {report['root']}\nConfig: {report['config']}\nRuntime files: {report['runtime_files']}\n\n")
     gpus = report["gpus"]
     if isinstance(gpus, str):

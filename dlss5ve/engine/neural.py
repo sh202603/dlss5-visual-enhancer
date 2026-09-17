@@ -36,10 +36,11 @@ class NeuralRenderStream:
     independent clip. There is no scene-cut detection here: the caller
     decides where clips start.
 
-    ``factor`` is the Scale control of the WebUI (1, 0.75, 0.5, 0.25): the
-    resolution entering Neural Rendering as a fraction of the input, and the
-    size of the frames returned. Neural Rendering does not enlarge frames
-    since v8.
+    ``factor`` is the Scale control (0.25 to 2 in the steps of
+    ``UPSCALING_MODES``): frames are fitted to the input size times ``factor``
+    with Lanczos before Neural Rendering, and the rendered frame keeps that
+    size. Feature 18 itself never resizes. The 7680x4320 boundary of
+    ``resolve_output_size`` applies to the scaled size.
 
     The feature-18 runtime lives in this process (``core.neural_bridge``):
     the first stream initialises NGX on the selected GPU and every later
@@ -49,14 +50,18 @@ class NeuralRenderStream:
     restarted. With ``gpu_mode`` the bridge retains the GPU's CUDA primary
     context and leaves no context current on the calling thread afterwards.
 
-    ``gpu_mode`` follows ``settings.nr_gpu_mode`` when None. The bridge
-    accepts the CUDA path only when it creates the device's primary context
-    itself (it needs FFmpeg's blocking-sync flags); when another library
-    (torch) created the context first, the CUDA path is refused. With
-    ``gpu_mode=None`` the stream then falls back to host staging and records
-    why in ``gpu_fallback_reason``; an explicit ``gpu_mode=True`` raises
-    instead. Open the first stream before the first torch CUDA call to keep
-    the CUDA path.
+    ``gpu_mode=None`` takes the CUDA path when the bridge reports CUDA interop
+    for the GPU and falls back to host staging otherwise. Since v10 the
+    settings carry no memory-path field, so this keyword is the only way to
+    choose: the processing layer decides from the codec, and Options without a
+    codec (images, Live) stay GPU-resident. The bridge accepts the CUDA path
+    only when it creates the device's primary context itself (it needs
+    FFmpeg's blocking-sync flags); when another library (torch) created the
+    context first, the CUDA path is refused. With ``gpu_mode=None`` the stream
+    then falls back to host staging and records why in
+    ``gpu_fallback_reason``; an explicit ``gpu_mode=True`` raises instead.
+    Open the first stream before the first torch CUDA call to keep the CUDA
+    path.
 
     ``expected_frames`` keeps the counted mode available: the session then
     insists on exactly that many frames before ``close``.
@@ -74,23 +79,21 @@ class NeuralRenderStream:
         controller: JobController | None = None,
         expected_frames: int | None = None,
     ) -> None:
-        from dataclasses import replace
-
         settings = settings or DEFAULT_SETTINGS
         prepared = prepare_runtime()
         gpu = resolve_runtime_ai_gpu(prepared.gpus, prepared.runtime_bundle, gpu_uuid)
         self.gpu_fallback_reason: str | None = None
-        if gpu_mode is None and settings.nr_gpu_mode:
+        if gpu_mode is None:
+            # Ask the bridge before opening the session: an explicit True would
+            # raise here, and the caller asked for whichever path works.
             from ..core.neural_bridge import BRIDGE_MANAGER
 
             status = BRIDGE_MANAGER.initialize(gpu, require_cuda=False)
-            if not status.get("cuda_supported"):
+            gpu_mode = bool(status.get("cuda_supported"))
+            if not gpu_mode:
                 self.gpu_fallback_reason = str(status.get("cuda_status") or "CUDA interop unavailable")
-                gpu_mode = False
-        if gpu_mode is not None:
-            settings = replace(settings, nr_gpu_mode=bool(gpu_mode))
         self.factor, mode = resolve_upscaling_mode(factor)
-        native = resolve_native_settings(settings)
+        native = resolve_native_settings(settings, gpu_mode=bool(gpu_mode))
         output_width, output_height = resolve_output_size(int(width), int(height), self.factor)
         self.input_size = (int(width), int(height))
         self.output_size = (output_width, output_height)

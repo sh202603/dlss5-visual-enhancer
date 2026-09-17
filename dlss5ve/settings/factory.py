@@ -1,15 +1,20 @@
 """Build feature Options from UISettings.
 
-Every entry point (WebUI handlers, CLI, presets) derives its Options here so
-that a setting has one meaning everywhere. ``overrides`` are applied on top of
-the values taken from ``settings`` and must name real Options fields, with
-one exception: ``hdr_mode`` is accepted for video and frame interpolation and
-is coerced against the effective codec before it lands in the Options
-(``preserve_hdr`` for video, ``hdr_mode`` for frame interpolation).
+The CLI, the engine API, and presets derive their Options here so that a
+setting has one meaning everywhere; the desktop bridge builds its Options
+directly from ``UISettings`` with the same derivations (``container_for_codec``,
+``coerce_hdr_mode``). ``overrides`` are applied on top of the values taken from
+``settings`` and must name real Options fields, with one exception:
+``hdr_mode`` is accepted for video and frame interpolation and is coerced
+against the effective codec before it lands in the Options (``preserve_hdr``
+for video, ``hdr_mode`` for frame interpolation).
 
 ``container`` is not taken from the settings either: since v9 the processing
 layer derives it from the effective codec, so the Options are built the same
 way to keep ``validate_codec_container`` from rejecting a stale saved pair.
+The memory path is not an Options field since v10: ``resolve_native_settings``
+decides it from the codec (NVENC stays on CUDA, CPU codecs stage through
+system memory, Options without a codec stay GPU-resident).
 
 The Upscale builders wrap the ``options_from_settings`` functions that the
 upscale package ships; only the override check is added here.
@@ -55,7 +60,6 @@ def _neural_values(settings: UISettings) -> dict[str, Any]:
         "mask_feather": settings.mask_feather,
         "nr_mask": settings.nr_mask,
         "automatic_mask": settings.automatic_mask,
-        "nr_gpu_mode": settings.nr_gpu_mode,
         "upscaling_factor": settings.upscaling_factor,
     }
 
