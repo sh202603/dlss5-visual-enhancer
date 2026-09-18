@@ -89,7 +89,7 @@ def _add_common(parser: argparse.ArgumentParser, settings: UISettings) -> None:
     )
     group.add_argument(
         "--preset", metavar="FILE",
-        help="Settings preset JSON exported from the Settings tab; replaces config.ini values before flags apply.",
+        help="Settings preset JSON exported from Settings; replaces config.ini values before flags apply.",
     )
     group.add_argument(
         "--ai-gpu", metavar="UUID", default=settings.ai_gpu_uuid,
@@ -165,7 +165,7 @@ def _add_upscale_sizing(parser: argparse.ArgumentParser, settings: UISettings, p
     factors = ", ".join(f"{factor:g}" for _label, factor in SCALE_FACTORS)
     group = parser.add_argument_group("sizing")
     group.add_argument("--vsr-quality", type=int, metavar="1..4", default=saved("vsr_quality"), help="RTX Video Super Resolution quality (default: %(default)s)")
-    group.add_argument("--scale", type=float, metavar="FACTOR", default=None, help=f"Output size as a multiple of the source, at least 1; the WebUI offers {factors} (default: {saved_size})")
+    group.add_argument("--scale", type=float, metavar="FACTOR", default=None, help=f"Output size as a multiple of the source, at least 1; the app offers {factors} (default: {saved_size})")
     group.add_argument("--width", type=int, metavar="PX", default=None, help="Output width in pixels instead of --scale; the height follows the source aspect ratio unless --no-aspect-lock.")
     group.add_argument("--height", type=int, metavar="PX", default=None, help="Output height in pixels; used with --width and --no-aspect-lock.")
     group.add_argument("--aspect-lock", action=argparse.BooleanOptionalAction, default=saved("aspect_lock"), help="Derive the height from --width and the source aspect ratio.")
@@ -439,7 +439,7 @@ def run_image(args: argparse.Namespace, settings: UISettings, reporter: Progress
     reporter.register(inputs)
     result = convert_images(
         inputs, options, reporter, output_dir=args.output_dir, on_item_update=reporter.item_update,
-        # Thumbnails for the browser gallery are a WebUI concern.
+        # Preview thumbnails are a concern of the app's media viewer only.
         generate_previews=False, create_zip=bool(args.zip),
     )
     return _payload("image", result, options, output_directory, zip_path=result.zip_path)
