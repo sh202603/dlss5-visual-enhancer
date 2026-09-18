@@ -228,6 +228,42 @@ Saved GPU selections follow the selected GPU identity. If that GPU is no longer 
 
 The same processing layer is available as a `dlss5ve-cli` command for scripts and other programs. The portable package runs it with the embedded interpreter; a development checkout can also install it with uv.
 
+### Setup
+
+This branch tracks the Python sources only. `bin/` holds the embedded Python, FFmpeg, mpv, yt-dlp, and the NVIDIA runtime DLLs, and none of it is committed, so a clone on its own cannot run. Take those binaries from the upstream release of the same version and lay this branch over them:
+
+```powershell
+# 1. Extract the upstream release ZIP; it supplies bin/ and the desktop app.
+New-Item -ItemType Directory D:\visual-enhancer-cli | Out-Null
+tar -xf .\Visual.Enhancer.v10.0.zip -C D:\visual-enhancer-cli
+
+# 2. Overlay this branch's tracked files (dlss5ve/, dlss5ve-cli.bat, examples/).
+git clone --branch cli --depth 1 https://github.com/sh202603/dlss5-visual-enhancer.git C:\src\ve-cli
+git -C C:\src\ve-cli archive -o "$env:TEMP\ve-cli.tar" cli
+tar -xf "$env:TEMP\ve-cli.tar" -C D:\visual-enhancer-cli
+
+# 3. Remove the upstream package directory; this branch renamed it to dlss5ve/.
+Remove-Item -Recurse -Force D:\visual-enhancer-cli\src
+
+# 4. Check the result: GPU, encoders, and the three NGX bridges.
+D:\visual-enhancer-cli\dlss5ve-cli.bat info
+```
+
+Two things trip this up. `tar` has to be the Windows one (`C:\Windows\System32\tar.exe`, which reads ZIPs); if a Git for Windows directory comes first on `PATH`, that name resolves to GNU tar, which cannot read a ZIP and reads `H:\...` as a host name. And `git archive` must not be piped straight into `tar` in PowerShell, because the pipeline would convert the archive to text; write the tar file first, as above.
+
+The release and the branch have to be the same upstream version, which `dlss5ve-cli --version` prints as `<package version> (Visual Enhancer <release>)`. The desktop app keeps working in that folder, so the same install serves both.
+
+For development, clone the branch and let uv build the environment instead. The package still needs the vendored binaries, so either extract a release's `bin/` into the clone or point `DLSS5VE_HOME` at an extracted release folder.
+
+```powershell
+uv sync                           # core: video and frame interpolation
+uv sync --extra image             # adds RAW, HEIF, and SVG decoding for images
+uv sync --extra desktop           # adds PySide6 for app.py (implies image)
+uv run dlss5ve-cli info
+```
+
+### Usage
+
 ```powershell
 .\dlss5ve-cli.bat info                                           # GPUs, encoders, frame generation, RTX Video
 .\dlss5ve-cli.bat image photo.png --nr-passes 2 --format PNG
@@ -236,13 +272,6 @@ The same processing layer is available as a `dlss5ve-cli` command for scripts an
 .\dlss5ve-cli.bat interpolate D:\clips --fps 60                  # a folder processes its supported files in name order
 .\dlss5ve-cli.bat upscale-video clip.mp4 --scale 2 --hdr         # RTX Video Super Resolution plus RTX Video HDR
 .\dlss5ve-cli.bat upscale-image photo.jpg --width 3840 --format PNG
-```
-
-```powershell
-uv sync                           # core: video and frame interpolation
-uv sync --extra image             # adds RAW, HEIF, and SVG decoding for images
-uv sync --extra desktop           # adds PySide6 for app.py (implies image)
-uv run dlss5ve-cli info
 ```
 
 - Defaults come from `config/config.ini`, the same file the app writes. `--preset FILE` applies a preset exported from Settings instead; flags override individual values on top.
