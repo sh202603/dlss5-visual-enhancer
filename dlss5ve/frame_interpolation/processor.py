@@ -385,6 +385,24 @@ def interpolate_video(
             # output keeps decode/interpolation/encode on CUDA, while a CPU
             # codec uses the in-process host-staging ABI.
             want_cuda = automatic_cuda_path(selected_codec, metadata["rotation"])
+            # One DLSSG session carries a single depth for its input and its
+            # output, and HDR Mode picks it. On the CUDA route the bridge gets
+            # the NVDEC surface untouched, which is P010 for every 10-bit source
+            # and NV12 for every 8-bit one, so a depth that disagrees with HDR
+            # Mode reaches the session as a format it was not created for and
+            # each evaluation fails with "Invalid frame dimensions, format,
+            # strides, or session state". The host route converts in both
+            # directions (to RGBA8 for SDR, to P010 for HDR), so send the
+            # mismatched combinations through it. Only decode and bridge input
+            # move to system memory; the NVENC encoder is still used.
+            ten_bit_source = int(metadata.get("depth") or 8) > 8
+            if want_cuda and ten_bit_source != effective_hdr:
+                app_log.info(
+                    "frame-interp",
+                    f"host staging: {10 if ten_bit_source else 8}-bit source with HDR Mode "
+                    f"{'on' if effective_hdr else 'off'}",
+                )
+                want_cuda = False
             decode_device = HWAccel(
                 "cuda", device=str(ai_ordinal), allow_software_fallback=True,
                 options={"primary_ctx": "1"}, is_hw_owned=True) if want_cuda else None

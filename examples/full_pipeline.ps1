@@ -23,6 +23,19 @@ across three encodes; -EncodingQuality defaults to Max for that reason.
 Intermediates are written at the upscaled size and, after stage 2, at the higher
 frame rate, so the stage folders can be several times the size of the source.
 
+A note on bit depth. One DLSS Frame Generation session carries a single depth
+for its input and its output, and HDR Mode picks it, so a 10-bit source with
+HDR off (or an 8-bit source with -Hdr) cannot stay on the GPU-resident path:
+the processing layer stages those frames through system memory to convert
+them. The render is correct either way, only slower, and this script says so
+before the stage runs rather than leaving it to be discovered afterwards.
+
+A note on frame rates. Frame Interpolation checks its own output against the
+exact target rational, and Matroska's millisecond timestamps cannot carry
+59.94 or 119.88 closely enough to pass, so this script refuses those two rates
+with an MKV codec (H.265 and AV1) before rendering anything. H.264 (MP4) and
+ProRes Proxy (MOV) take them, and every rate works in MKV up to 29.97.
+
 Each stage is driven through --json, so a file that fails in one stage is
 dropped from the next instead of aborting the batch. Stages can be skipped;
 whichever stage runs last writes to -OutputDir with the -Suffix name, and the
@@ -100,7 +113,8 @@ param(
     [string[]]$InterpolateArgs = @(),
     [string[]]$NrArgs = @(),
     [switch]$KeepIntermediate,
-    [string]$Cli = (Join-Path $PSScriptRoot '..\dlss5ve-cli.bat')
+    [string]$Cli = (Join-Path $PSScriptRoot '..\dlss5ve-cli.bat'),
+    [string]$Ffprobe = (Join-Path $PSScriptRoot '..\bin\ffmpeg\bin\ffprobe.exe')
 )
 
 $ErrorActionPreference = 'Stop'
@@ -118,6 +132,21 @@ if ($Scale -lt 1) {
 }
 if ($SkipUpscale -and $SkipInterpolate -and $SkipEnhance) {
     throw 'All three stages are skipped; nothing to do.'
+}
+# Frame Interpolation verifies its own output against the exact target rational.
+# Matroska keeps millisecond timestamps, which cannot carry 59.94 or 119.88
+# closely enough for that check, so those two rates always fail in an MKV
+# however long the render took. Refuse the combination up front.
+$container = switch -Regex ($Codec) {
+    '^H\.264' { 'MP4'; break }
+    '^ProRes' { 'MOV'; break }
+    default   { 'MKV' }
+}
+if (-not $SkipInterpolate -and $container -eq 'MKV' -and $Fps -in @('59.94', '119.88')) {
+    throw ("-Fps $Fps cannot be verified in an MKV output: Matroska stores millisecond " +
+           "timestamps and Frame Interpolation checks its result against the exact rate. " +
+           "Use -Codec 'H.264 (NVIDIA NVENC)' (MP4) or -Codec 'ProRes Proxy' (MOV), " +
+           "or an integer rate such as -Fps 60.")
 }
 if (-not (Test-Path $Cli)) { throw "dlss5ve-cli.bat not found: $Cli" }
 $Cli = (Resolve-Path $Cli).Path
@@ -162,8 +191,9 @@ function Format-Command {
 }
 
 function Invoke-Stage {
+    # The caller prints the "== name" header, so that any advisory note for the
+    # stage appears under it and above the command line.
     param([string]$Name, [string[]]$Arguments)
-    Write-Host "== $Name" -ForegroundColor Cyan
     Write-Host "   dlss5ve-cli $(Format-Command $Arguments)"
     # stdout carries only the --json payload; progress and the summary stay on stderr.
     $json = & $Cli @Arguments | Out-String
@@ -172,6 +202,37 @@ function Invoke-Stage {
         throw "$Name produced no result (exit code $code); see the messages above."
     }
     return [pscustomobject]@{ ExitCode = $code; Payload = ($json | ConvertFrom-Json) }
+}
+
+function Get-VideoBitDepth {
+    # 0 when the depth cannot be read; the caller then says nothing.
+    param([string]$Path)
+    if (-not (Test-Path $Ffprobe) -or -not (Test-Path -PathType Leaf $Path)) { return 0 }
+    try {
+        $pixelFormat = & $Ffprobe -v error -select_streams v:0 -show_entries stream=pix_fmt `
+            -of csv=p=0 -- $Path 2>$null | Select-Object -First 1
+    } catch {
+        return 0
+    }
+    if (-not $pixelFormat) { return 0 }
+    if ($pixelFormat -match '(\d{2})(le|be)$') { return [int]$Matches[1] }
+    return 8
+}
+
+function Write-DepthNote {
+    # One DLSSG session carries a single depth for input and output, and HDR Mode
+    # picks it. When the source disagrees, the processing layer stages the frames
+    # through system memory to convert them, which is correct but slower than the
+    # GPU-resident path. Saying so before the stage beats wondering afterwards.
+    param([string[]]$Files)
+    $mismatched = @($Files | Where-Object {
+        $depth = Get-VideoBitDepth $_
+        $depth -gt 0 -and (($depth -gt 8) -ne [bool]$Hdr)
+    })
+    if ($mismatched.Count -eq 0) { return }
+    $state = if ($Hdr) { '8-bit while -Hdr asks for 10-bit output' } else { '10-bit while HDR is off' }
+    Write-Host "   note: $($mismatched.Count) file(s) are $state, so this stage stages through" -ForegroundColor Yellow
+    Write-Host "         system memory instead of staying on the GPU. The result is the same." -ForegroundColor Yellow
 }
 
 function Format-Result {
@@ -214,6 +275,10 @@ try {
             '--codec', $Codec,
             '--encoding-quality', $EncodingQuality,
             '--output-dir', $destination, '--json') + $naming
+        Write-Host "== $($stage.Name)" -ForegroundColor Cyan
+        # Only Frame Generation cares about the source depth; the other two
+        # stages convert whatever they are given without changing transport.
+        if ($stage.Command -eq 'interpolate') { Write-DepthNote $current }
         $run = Invoke-Stage $stage.Name $arguments
         $lastPayload = $run.Payload
 
