@@ -3,7 +3,7 @@ name = "dlss5ve"
 dynamic = ["version"]
 description = "Visual Enhancer: NVIDIA DLSS 5 Neural Rendering, Frame Generation, and RTX Video for images and videos"
 readme = "README.md"
-# The v10 release bundles Python 3.14 and this checkout pins 3.14 for its own
+# The v11 release bundles Python 3.14 and this checkout pins 3.14 for its own
 # environment (.python-version). The floor stays at 3.12 so that consuming
 # projects on an older interpreter (lada-ex runs 3.13) can still resolve the
 # editable dependency; every runtime dependency ships wheels for both.
@@ -27,6 +27,7 @@ image = [
 ]
 desktop = [
     # v10 replaced the Gradio WebUI with a PySide6 + Qt Quick desktop app.
+    # v11 bundles 6.11.2.
     # Only app.py needs this; the CLI and the engine API never import it.
     "pyside6>=6.11",
     "dlss5ve[image]",
@@ -45,7 +46,11 @@ packages = { find = { where = ["."], include = ["dlss5ve", "dlss5ve.*"] } }
 [tool.setuptools.package-data]
 # The desktop app loads its QML from next to dlss5ve/desktop/app.py, so the
 # QML tree has to survive a wheel build (an editable install needs nothing).
-"dlss5ve.desktop" = ["qml/*.qml", "qml/*/*.qml", "qml/qmldir", "qml/*/qmldir"]
+# v11 added the icon set the QML reads through the "icons" image provider.
+"dlss5ve.desktop" = [
+    "qml/*.qml", "qml/*/*.qml", "qml/qmldir", "qml/*/qmldir",
+    "qml/assets/icons/png/*/*.png",
+]
 
 [tool.setuptools.dynamic]
 version = { attr = "dlss5ve.version.__version__" }

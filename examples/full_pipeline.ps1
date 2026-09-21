@@ -33,8 +33,9 @@ before the stage runs rather than leaving it to be discovered afterwards.
 A note on frame rates. Frame Interpolation checks its own output against the
 exact target rational, and Matroska's millisecond timestamps cannot carry
 59.94 or 119.88 closely enough to pass, so this script refuses those two rates
-with an MKV codec (H.265 and AV1) before rendering anything. H.264 (MP4) and
-ProRes Proxy (MOV) take them, and every rate works in MKV up to 29.97.
+with an MKV codec (H.265, AV1, and FFV1) before rendering anything. H.264 (MP4)
+and both ProRes profiles (MOV) take them, and every rate works in MKV up to
+29.97.
 
 Each stage is driven through --json, so a file that fails in one stage is
 dropped from the next instead of aborting the batch. Stages can be skipped;
@@ -60,7 +61,8 @@ Target frame rate for stage 2. Default 60.
 
 .PARAMETER Codec
 Codec for every stage. The container follows the codec (H.264 gives MP4,
-H.265 and AV1 give MKV, ProRes Proxy gives MOV).
+H.265, AV1 and FFV1 give MKV, ProRes Proxy and ProRes HQ give MOV). ProRes HQ
+and FFV1 Lossless RGB 10-bit ignore -EncodingQuality.
 
 .PARAMETER EncodingQuality
 Encoding quality for every stage. Max by default because the material is
@@ -68,7 +70,7 @@ encoded three times.
 
 .PARAMETER Hdr
 Convert SDR to HDR10 with RTX Video HDR in stage 1 and keep 10-bit through
-stages 2 and 3. Requires an HDR-capable codec (H.265, AV1, or ProRes Proxy).
+stages 2 and 3. Requires a 10-bit codec (H.265, AV1, ProRes Proxy, ProRes HQ, or FFV1).
 
 .PARAMETER UpscaleArgs
 Extra flags for upscale-video, e.g. @('--vsr-quality', '3').
@@ -100,7 +102,8 @@ param(
                  '120', '144', '165', '180', '240', '360', '480')]
     [string]$Fps = '60',
     [ValidateSet('H.264', 'H.264 (NVIDIA NVENC)', 'H.265', 'H.265 (NVIDIA NVENC)',
-                 'AV1', 'AV1 (NVIDIA NVENC)', 'ProRes Proxy')]
+                 'AV1', 'AV1 (NVIDIA NVENC)', 'ProRes Proxy', 'ProRes HQ',
+                 'FFV1 Lossless RGB 10-bit')]
     [string]$Codec = 'H.265 (NVIDIA NVENC)',
     [ValidateSet('Auto (Default)', 'Max', 'Best', 'Good')]
     [string]$EncodingQuality = 'Max',
@@ -123,7 +126,8 @@ $ErrorActionPreference = 'Stop'
 $PSNativeCommandUseErrorActionPreference = $false
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 
-$HDR_CODECS = @('H.265', 'H.265 (NVIDIA NVENC)', 'AV1', 'AV1 (NVIDIA NVENC)', 'ProRes Proxy')
+$HDR_CODECS = @('H.265', 'H.265 (NVIDIA NVENC)', 'AV1', 'AV1 (NVIDIA NVENC)', 'ProRes Proxy',
+                'ProRes HQ', 'FFV1 Lossless RGB 10-bit')
 if ($Hdr -and $Codec -notin $HDR_CODECS) {
     throw "HDR needs one of: $($HDR_CODECS -join ', '). -Codec is '$Codec'."
 }

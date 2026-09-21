@@ -125,7 +125,13 @@ def upscale_video_options(settings: UISettings, **overrides: Any):
     from ..upscale.video.models import UpscaleOptions, options_from_settings
 
     _check_overrides(UpscaleOptions, overrides)
-    return replace(options_from_settings(settings), **overrides)
+    options = replace(options_from_settings(settings), **overrides)
+    # options_from_settings derives the container from the saved codec, so a
+    # codec override would otherwise keep the saved container. The processor
+    # derives it again at entry, but validate_codec_container runs before that
+    # and rejects a stale pair (v11 added that check for the fixed-quality
+    # codecs, where ProRes HQ in MKV is refused outright).
+    return replace(options, container=container_for_codec(options.codec))
 
 
 def upscale_image_options(settings: UISettings, **overrides: Any):

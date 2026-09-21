@@ -17,6 +17,9 @@ Conventions:
   decided by the processing layer for every command (NVENC codecs stay on
   CUDA, CPU codecs stage through system memory, images stay GPU-resident).
   There are no flags for either.
+- ``--output-dir`` and ``--same-as-input`` are the two output destinations;
+  with the latter the batch publishes each file next to its source and the
+  payload reports ``"same as input"`` instead of a single directory.
 
 Exit codes: 0 all inputs succeeded, 1 some or all inputs failed, 2 usage error
 or missing input, 3 runtime or GPU unavailable, 130 interrupted by the user.
@@ -32,7 +35,7 @@ from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any, Sequence
 
-from ..core.ffmpeg import CODEC_CHOICES, ENCODING_QUALITIES, container_for_codec
+from ..core.ffmpeg import CODEC_CHOICES, ENCODING_QUALITIES, FIXED_QUALITY_CODECS, container_for_codec
 from ..core.jobs import cancel_active_job
 from ..core.naming import RENAME_MODES
 from ..core.paths import CONFIG_PATH, ROOT
@@ -83,9 +86,14 @@ def _load_settings(argv: Sequence[str]) -> UISettings:
 
 def _add_common(parser: argparse.ArgumentParser, settings: UISettings) -> None:
     group = parser.add_argument_group("common")
-    group.add_argument(
+    destination = group.add_mutually_exclusive_group()
+    destination.add_argument(
         "--output-dir", metavar="DIR", default=None,
         help="Directory for rendered files (default: outputs/ next to the runtime).",
+    )
+    destination.add_argument(
+        "--same-as-input", action="store_true",
+        help="Publish each rendered file next to its source instead of one output directory; a batch ZIP still goes to outputs/.",
     )
     group.add_argument(
         "--preset", metavar="FILE",
@@ -138,11 +146,15 @@ def _add_encoding(parser: argparse.ArgumentParser, codec: str, quality: str, hdr
     group = parser.add_argument_group("encoding")
     group.add_argument(
         "--codec", choices=CODEC_CHOICES, default=codec,
-        help="(default: %(default)s); the container follows the codec: H.264 to MP4, H.265 and AV1 to MKV, ProRes Proxy to MOV.",
+        help="(default: %(default)s); the container follows the codec: H.264 to MP4, H.265, AV1 and FFV1 to MKV, ProRes Proxy and ProRes HQ to MOV.",
     )
-    group.add_argument("--encoding-quality", choices=ENCODING_QUALITIES, default=quality, help="(default: %(default)s)")
+    fixed = ", ".join(sorted(FIXED_QUALITY_CODECS))
+    group.add_argument(
+        "--encoding-quality", choices=ENCODING_QUALITIES, default=quality,
+        help=f"(default: %(default)s); ignored by the fixed-quality codecs: {fixed}.",
+    )
     if hdr is not None:
-        group.add_argument("--hdr", action=argparse.BooleanOptionalAction, default=hdr, help="10-bit output that keeps HDR metadata; H.265, AV1, and ProRes only.")
+        group.add_argument("--hdr", action=argparse.BooleanOptionalAction, default=hdr, help="10-bit output that keeps HDR metadata; 10-bit codecs only (H.265, AV1, ProRes Proxy, ProRes HQ, FFV1).")
 
 
 def _add_naming(parser: argparse.ArgumentParser, mode: str, suffix: str) -> None:
@@ -259,7 +271,7 @@ def build_parser(settings: UISettings) -> argparse.ArgumentParser:
     _add_upscale_sizing(upscale_video, settings, "upscale_")
     upscale_video.add_argument("--vsr", action=argparse.BooleanOptionalAction, default=settings.upscale_vsr_enabled, help="RTX Video Super Resolution; --no-vsr keeps the source size and applies only RTX Video HDR.")
     hdr = upscale_video.add_argument_group("RTX Video HDR")
-    hdr.add_argument("--hdr", action=argparse.BooleanOptionalAction, default=settings.upscale_hdr_enabled, help="Convert SDR to HDR10 with RTX Video HDR; H.265, AV1, and ProRes only.")
+    hdr.add_argument("--hdr", action=argparse.BooleanOptionalAction, default=settings.upscale_hdr_enabled, help="Convert SDR to HDR10 with RTX Video HDR; 10-bit codecs only (H.265, AV1, ProRes Proxy, ProRes HQ, FFV1).")
     hdr.add_argument("--hdr-contrast", type=int, metavar="0..200", default=settings.upscale_hdr_contrast, help="(default: %(default)s)")
     hdr.add_argument("--hdr-saturation", type=int, metavar="0..200", default=settings.upscale_hdr_saturation, help="(default: %(default)s)")
     hdr.add_argument("--hdr-middle-gray", type=int, metavar="10..100", default=settings.upscale_hdr_middle_gray, help="(default: %(default)s)")
@@ -386,6 +398,23 @@ def _check_output_dir(value: str | None) -> str:
         raise UsageError(f"--output-dir: {exc}") from exc
 
 
+def _output_target(args: argparse.Namespace, *, archive: bool = False) -> tuple[bool, str]:
+    """Resolve the destination into (same_as_input, the reported directory).
+
+    ``--same-as-input`` publishes every item next to its own source, so no
+    single directory describes the batch and the payload carries a marker
+    instead. A batch ZIP still needs one directory, which stays --output-dir
+    (outputs/ by default) and is validated here even in that mode; ``zip_path``
+    then names the archive.
+    """
+    same = bool(getattr(args, "same_as_input", False))
+    if not same:
+        return False, _check_output_dir(args.output_dir)
+    if archive:
+        _check_output_dir(args.output_dir)
+    return True, "same as input"
+
+
 def _payload(command: str, result: Any, options: Any, output_directory: str, **extra: Any) -> dict[str, Any]:
     """The batch result as one JSON document.
 
@@ -435,12 +464,12 @@ def run_image(args: argparse.Namespace, settings: UISettings, reporter: Progress
     )
     resolve_native_settings(options)
     resolve_upscaling_mode(options.upscaling_factor)
-    output_directory = _check_output_dir(args.output_dir)
+    same_as_input, output_directory = _output_target(args, archive=bool(args.zip))
     reporter.register(inputs)
     result = convert_images(
         inputs, options, reporter, output_dir=args.output_dir, on_item_update=reporter.item_update,
         # Preview thumbnails are a concern of the app's media viewer only.
-        generate_previews=False, create_zip=bool(args.zip),
+        generate_previews=False, create_zip=bool(args.zip), same_as_input=same_as_input,
     )
     return _payload("image", result, options, output_directory, zip_path=result.zip_path)
 
@@ -465,11 +494,11 @@ def run_video(args: argparse.Namespace, settings: UISettings, reporter: Progress
         preview_compat=False,
     )
     _check_video_like(options, neural=True)
-    output_directory = _check_output_dir(args.output_dir)
+    same_as_input, output_directory = _output_target(args, archive=bool(args.zip))
     reporter.register(inputs)
     result = convert_videos(
         inputs, options, reporter, output_dir=args.output_dir, on_item_update=reporter.item_update,
-        create_archive=bool(args.zip),
+        create_archive=bool(args.zip), same_as_input=same_as_input,
     )
     return _payload(
         "video", result, options, output_directory,
@@ -498,9 +527,12 @@ def run_interpolate(args: argparse.Namespace, settings: UISettings, reporter: Pr
     )
     _check_video_like(options, neural=False)
     options.target_rate  # raises ValueError for an unsupported FPS choice
-    output_directory = _check_output_dir(args.output_dir)
+    same_as_input, output_directory = _output_target(args)
     reporter.register(inputs)
-    result = interpolate_videos(inputs, options, reporter, output_dir=args.output_dir, on_item_update=reporter.item_update)
+    result = interpolate_videos(
+        inputs, options, reporter, output_dir=args.output_dir, on_item_update=reporter.item_update,
+        same_as_input=same_as_input,
+    )
     return _payload("interpolate", result, options, output_directory)
 
 
@@ -526,11 +558,11 @@ def run_upscale_image(args: argparse.Namespace, settings: UISettings, reporter: 
         custom_suffix=args.suffix,
     )
     options.validate()
-    output_directory = _check_output_dir(args.output_dir)
+    same_as_input, output_directory = _output_target(args, archive=bool(args.zip))
     reporter.register(inputs)
     result = upscale_images(
         inputs, options, reporter, output_dir=args.output_dir, on_item_update=reporter.item_update,
-        generate_previews=False,
+        generate_previews=False, same_as_input=same_as_input,
     )
     zip_path = None
     if args.zip and result.successes and not result.cancelled:
@@ -568,9 +600,12 @@ def run_upscale_video(args: argparse.Namespace, settings: UISettings, reporter: 
         preview_seconds=args.preview_seconds,
     )
     options.validate()
-    output_directory = _check_output_dir(args.output_dir)
+    same_as_input, output_directory = _output_target(args)
     reporter.register(inputs)
-    result = upscale_videos(inputs, options, reporter, output_dir=args.output_dir, on_item_update=reporter.item_update)
+    result = upscale_videos(
+        inputs, options, reporter, output_dir=args.output_dir, on_item_update=reporter.item_update,
+        same_as_input=same_as_input,
+    )
     return _payload("upscale-video", result, options, output_directory)
 
 
@@ -605,11 +640,12 @@ def collect_info(ai_gpu_uuid: str) -> dict[str, Any]:
         report["encoders"] = str(exc)
     try:
         # Loading the bridge DLL reads its version and checks the frame ABI;
-        # NGX itself is initialized only by a render session.
+        # NGX itself is initialized only by a render session (preload binds no
+        # adapter, unlike the frame-generation and RTX Video probes below).
         from ..core.neural_bridge import BRIDGE_ABI_VERSION, BRIDGE_MANAGER
         from ..core.paths import DLSSNR_BRIDGE
 
-        BRIDGE_MANAGER._load()
+        BRIDGE_MANAGER.preload()
         report["neural_bridge"] = {
             "path": str(DLSSNR_BRIDGE), "version": BRIDGE_MANAGER.version, "abi_version": BRIDGE_ABI_VERSION,
         }
@@ -632,6 +668,7 @@ def collect_info(ai_gpu_uuid: str) -> dict[str, Any]:
         "codec": list(CODEC_CHOICES),
         "container_by_codec": {codec: container_for_codec(codec) for codec in CODEC_CHOICES},
         "encoding_quality": list(ENCODING_QUALITIES),
+        "fixed_quality_codec": sorted(FIXED_QUALITY_CODECS),
         "image_format": list(IMAGE_FORMAT_CHOICES),
         "fps": list(FPS_CHOICES),
         "engine": list(ENGINE_CHOICES),

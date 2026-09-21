@@ -24,7 +24,8 @@ subfolder there and removed afterwards unless -KeepIntermediate is set.
 VSR scale factor for stage 2 (1 keeps the size and only de-noises), default 2.
 
 .PARAMETER Codec
-Codec for both stages; must support HDR (H.265, AV1, ProRes Proxy, plain or NVENC).
+Codec for both stages; must be 10-bit (H.265, AV1, ProRes Proxy, ProRes HQ, or FFV1
+Lossless RGB 10-bit; plain or NVENC where offered).
 The container follows the codec (H.265 and AV1 give MKV, ProRes gives MOV).
 
 .PARAMETER NrArgs

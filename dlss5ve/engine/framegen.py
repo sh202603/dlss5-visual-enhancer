@@ -37,17 +37,20 @@ class FrameGenStream:
     estimates motion itself with NVIDIA Optical Flow. Two consequences for
     callers:
 
-    - Generated frames leave the bridge as NV12, so this class converts them
-      back to RGBA. That round trip makes the generated frames' chroma 4:2:0;
-      the source frames the caller keeps are untouched. The colour matrix and
-      range used on the way in and out must agree, or the result shifts: the
-      pair here is BT.709 full range.
+    - Generated frames are taken as NV12 and converted back to RGBA here. That
+      round trip makes the generated frames' chroma 4:2:0; the source frames
+      the caller keeps are untouched. The colour matrix and range used on the
+      way in and out must agree, or the result shifts: the pair here is BT.709
+      full range.
     - The frames are taken as CUDA surfaces and brought to host memory by
-      swscale, because the bridge's own host download is far slower: measured
-      at 1080p, ``fi_surface_copy_to_host`` alone costs 105 ms per frame while
-      reformatting the CUDA surface costs 2.8 ms, for bit-identical output
-      (16 ms versus 127 ms per push). A bridge without CUDA interop falls back
-      to the host download.
+      swscale, because the bridge's own host download is far slower. The v11
+      bridge can also return the generated frame as an RGBA surface
+      (``output_rgb=True``), which would avoid the 4:2:0 chroma entirely, but
+      its RGB download costs too much: measured at 1080p with one generated
+      frame per push, this NV12 path takes 26.9 ms per push, the RGB download
+      101.2 ms, and converting the RGB surface back to NV12 on the GPU before
+      swscale 43.7 ms (same 4:2:0 result as this path). A bridge without CUDA
+      interop falls back to the host download.
     - NGX state is process-lifetime and bound to the GPU that initialised it,
       so every stream in a process shares one adapter, and a watchdog timeout
       or native exception poisons the bridge until the process restarts.
