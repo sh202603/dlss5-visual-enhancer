@@ -71,10 +71,10 @@ Item {
                 visible: Math.abs(control.value - control.defaultValue) > 0.001
                 anchors.verticalCenter: parent.verticalCenter
 
-                Text {
+                AppIcon {
                     anchors.centerIn: parent
-                    text: "R"
-                    font.pixelSize: 10
+                    iconName: "reset"
+                    iconSize: 12
                     color: resetArea.containsMouse ? Theme.accent : Theme.textMuted
                 }
 

@@ -1019,13 +1019,13 @@ def start_live_session(options: LiveOptions) -> LiveSessionInfo:
     return session.snapshot()
 
 
-def stop_live_session() -> LiveSessionInfo:
+def stop_live_session(timeout: float | None = 3) -> LiveSessionInfo:
     with _LOCK:
         session = _CURRENT
     if session is None or not session.is_alive():
         return live_status()
     session.stop()
-    session.join(timeout=3)
+    session.join(timeout=timeout)
     return session.snapshot()
 
 

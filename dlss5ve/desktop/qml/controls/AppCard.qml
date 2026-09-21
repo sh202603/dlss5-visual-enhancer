@@ -47,14 +47,14 @@ Item {
                 }
             }
 
-            Text {
+            AppIcon {
                 id: chevron
                 visible: card.collapsible
                 anchors.right: parent.right
                 anchors.rightMargin: 12
                 anchors.verticalCenter: parent.verticalCenter
-                text: card.collapsed ? "v" : "^"
-                font.pixelSize: 10
+                iconName: card.collapsed ? "chevron_down" : "chevron_up"
+                iconSize: 12
                 color: headerMouse.containsMouse ? Theme.textPrimary : Theme.textMuted
             }
 

@@ -15,7 +15,8 @@ from ..frame_interpolation.models import ENGINE_CHOICES, FPS_CHOICES, PREVIEW_LE
 from .migration import _migrate_codec
 from .models import (
     CODEC_CHOICES, CONFIG_SECTION, CONTAINER_CHOICES, DEFAULT_SETTINGS, IMAGE_FORMAT_CHOICES,
-    PREVIEW_ENCODING_CHOICES, QUALITY_CHOICES, UPSCALE_MODE_CHOICES, UISettings, _validate,
+    PREVIEW_ENCODING_CHOICES, QUALITY_CHOICES, UPSCALE_MODE_CHOICES,
+    UPSCALE_PREVIEW_LENGTH_CHOICES, UISettings, _validate,
 )
 from ..upscale.video.models import SETTING_FIELDS, options_from_settings
 from ..upscale.image.models import SETTING_FIELDS as IMAGE_UPSCALE_FIELDS, options_from_settings as image_upscale_options
@@ -226,13 +227,15 @@ def load_settings(path: str | os.PathLike[str]) -> UISettings:
             PREVIEW_ENCODING_CHOICES,
             DEFAULT_SETTINGS.preview_encoding,
         ),
-        full_size_image_previews=boolean(
-            "full_size_image_previews", DEFAULT_SETTINGS.full_size_image_previews
-        ),
         upscale_mode=choice(
             "upscale_mode",
             UPSCALE_MODE_CHOICES,
             DEFAULT_SETTINGS.upscale_mode,
+        ),
+        upscale_preview_length=choice(
+            "upscale_preview_length",
+            UPSCALE_PREVIEW_LENGTH_CHOICES,
+            DEFAULT_SETTINGS.upscale_preview_length,
         ),
     )
     # First-run migration: Live mirrors default to the loaded shared NR
@@ -324,6 +327,7 @@ def save_settings(path: str | os.PathLike[str], settings: UISettings) -> None:
         **{"upscale_image_" + name: str(getattr(settings, "upscale_image_" + name)) for name in IMAGE_UPSCALE_FIELDS},
         **{"upscale_" + name: str(getattr(settings, "upscale_" + name)) for name in SETTING_FIELDS},
         "upscale_mode": settings.upscale_mode,
+        "upscale_preview_length": settings.upscale_preview_length,
         "ai_gpu_uuid": settings.ai_gpu_uuid,
         "video_gpu_uuid": settings.video_gpu_uuid,
         "nr_style": settings.nr_style,
@@ -374,7 +378,6 @@ def save_settings(path: str | os.PathLike[str], settings: UISettings) -> None:
         "frame_interpolation_rename_mode": settings.frame_interpolation_rename_mode,
         "frame_interpolation_custom_suffix": settings.frame_interpolation_custom_suffix,
         "preview_encoding": settings.preview_encoding,
-        "full_size_image_previews": str(settings.full_size_image_previews).lower(),
     }
 
     temporary = config_path.with_name(f".{config_path.name}.tmp")
@@ -414,9 +417,3 @@ def current_preview_encoding() -> str:
         settings = SETTINGS_STATE.current or load_settings(CONFIG_PATH)
     return normalize_preview_encoding(settings.preview_encoding)
 
-
-def full_size_image_previews_enabled() -> bool:
-    """Return the saved image-preview quality mode for one operation snapshot."""
-    with SETTINGS_STATE.lock:
-        settings = SETTINGS_STATE.current or load_settings(CONFIG_PATH)
-    return bool(settings.full_size_image_previews)

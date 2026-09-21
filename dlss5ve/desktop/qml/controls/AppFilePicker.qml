@@ -55,10 +55,10 @@ Item {
                     font.pixelSize: Theme.fontSizeLabel; color: Theme.textMuted
                 }
             }
-            Text {
+            AppIcon {
                 id: clearBtn; visible: pathInput.text !== "" && control.enabled
                 anchors.right: parent.right; anchors.rightMargin: 8; anchors.verticalCenter: parent.verticalCenter
-                text: "x"; font.pixelSize: 14; color: clearMouse.containsMouse ? Theme.textPrimary : Theme.textMuted
+                iconName: "close"; iconSize: 14; color: clearMouse.containsMouse ? Theme.textPrimary : Theme.textMuted
                 MouseArea {
                     id: clearMouse; anchors.fill: parent; anchors.margins: -5; hoverEnabled: true
                     cursorShape: Qt.PointingHandCursor
@@ -67,7 +67,7 @@ Item {
             }
         }
         AppButton {
-            id: browseBtn; text: "Browse"; width: 70; buttonHeight: Theme.controlHeight; enabled: control.enabled
+            id: browseBtn; text: "Browse"; iconName: "browse_folder"; width: 88; buttonHeight: Theme.controlHeight; enabled: control.enabled
             onClicked: control.selectFolder ? folderDialog.open() : fileDialog.open()
         }
     }

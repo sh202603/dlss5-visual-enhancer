@@ -16,18 +16,19 @@ from typing import Any, Callable
 import av
 import numpy as np
 from av.codec.hwaccel import HWAccel
+from av.video.reformatter import Colorspace
 
 from ..core import app_log, ffmpeg
 from ..core.disk_paths import OutputFile, prepare_output_dir
 from ..core.gpu_selection import resolve_runtime_ai_gpu
 from ..core.jobs import Cancelled, active_job
-from ..core.naming import output_filename, validate_rename
+from ..core.naming import output_filename, unique_output_path, validate_rename
 from ..core.paths import JOBS, OUTPUTS
 from ..core.runtime import prepare_runtime, rotate_frame
 from ..upscale.video.cuda_transfer import CudaTransferPool
 from .capabilities import probe_frame_interpolation_capabilities
 from .models import FrameInterpolationOptions, FrameInterpolationResult
-from .native import DirectDLSSGSession
+from .native import DLSSGCudaSurface, DirectDLSSGSession
 from .scheduler import choose_interpolation_plan, output_frame_count
 
 _BATCH_CONTEXT = threading.local()
@@ -42,7 +43,7 @@ _NVENC = {
 @dataclass(slots=True)
 class TimedFrame:
     bridge_frame: Any
-    encode_frame: av.VideoFrame
+    encode_frame: Any
     timestamp: Fraction
     segment: int
     provenance: str
@@ -109,19 +110,36 @@ def _encoder(options: FrameInterpolationOptions, codec: str, width: int, height:
         return _Encoder(name, name, "yuv420p10le" if hdr else "yuv420p", False, values, bitrate)
     if normalized == "ProRes Proxy":
         values = {"profile": "0"}
-        if quality.get("bits_per_mb") is not None:
-            values["bits_per_mb"] = str(int(quality["bits_per_mb"]))
+        bits_per_mb = quality.get("bits_per_mb")
+        if bits_per_mb is None and options.quality == "Auto (Default)":
+            bits_per_mb = 300
+        if bits_per_mb is not None:
+            values["bits_per_mb"] = str(int(bits_per_mb))
         return _Encoder("prores_ks", "prores_ks (Proxy)", "yuv422p10le", False, values, 0)
+    if normalized == "ProRes HQ":
+        return _Encoder("prores_ks", "prores_ks (HQ)", "yuv422p10le", False,
+                        {"profile": "3"}, 0)
+    if normalized == "FFV1 Lossless RGB 10-bit":
+        return _Encoder("ffv1", "ffv1 (Lossless RGB 10-bit)", "gbrp10le", False,
+                        {"level": "3", "slicecrc": "1"}, 0)
     raise ValueError(f"Unsupported in-process codec: {codec}.")
 
 
-def _matrix_code(metadata: dict[str, Any]) -> int:
+def _matrix_code(metadata: dict[str, Any], *, hdr: bool = False) -> int:
     value = str(metadata.get("color_space") or "").casefold()
     if value in {"bt2020nc", "bt2020c"}:
         return 2
-    if value in {"bt470bg", "smpte170m", "smpte240m", "fcc"}:
+    if value in {"bt470bg", "smpte170m"}:
         return 0
-    return 1
+    if value == "bt709":
+        return 1
+    if value == "fcc":
+        return 3
+    if value == "smpte240m":
+        return 4
+    # FFmpeg decodes untagged SDR YUV to RGB with its BT.601 default. Match
+    # that interpretation when the RGB pixels return to an encoded YUV frame.
+    return 2 if hdr else 0
 
 
 def _range_code(metadata: dict[str, Any]) -> int:
@@ -130,7 +148,7 @@ def _range_code(metadata: dict[str, Any]) -> int:
 
 def _primaries_code(metadata: dict[str, Any]) -> int:
     value = str(metadata.get("color_primaries") or "").casefold()
-    return 2 if value == "bt2020" else 0 if value in {"bt470bg", "bt470m"} else 1
+    return 2 if value == "bt2020" else 0 if value in {"bt470bg", "bt470m", "smpte170m"} else 1
 
 
 def _transfer_code(metadata: dict[str, Any]) -> int:
@@ -143,11 +161,15 @@ def _set_color_properties(context: Any, metadata: dict[str, Any], hdr: bool) -> 
     primaries = str(metadata.get("color_primaries") or "").casefold()
     transfer = str(metadata.get("color_transfer") or "").casefold()
     matrix = str(metadata.get("color_space") or "").casefold()
-    context.color_primaries = {"bt2020": 9, "smpte432": 12}.get(primaries, 1)
-    context.color_trc = {"smpte2084": 16, "arib-std-b67": 18, "iec61966-2-1": 13}.get(
-        transfer, 1)
-    context.colorspace = {"bt2020nc": 9, "bt2020c": 10, "smpte170m": 6,
-                          "bt470bg": 5}.get(matrix, 1)
+    context.color_primaries = {"bt709": 1, "bt470m": 4, "bt470bg": 5,
+                               "smpte170m": 6, "smpte240m": 7, "bt2020": 9,
+                               "smpte432": 12}.get(primaries, 2)
+    context.color_trc = {"bt709": 1, "bt470m": 4, "bt470bg": 5,
+                         "smpte170m": 6, "smpte240m": 7, "linear": 8, "iec61966-2-1": 13,
+                         "smpte2084": 16, "arib-std-b67": 18}.get(transfer, 2)
+    context.colorspace = {"bt709": 1, "fcc": 4, "bt470bg": 5,
+                          "smpte170m": 6, "smpte240m": 7, "bt2020nc": 9,
+                          "bt2020c": 10}.get(matrix, 9 if hdr else 6)
     context.color_range = 2 if _range_code(metadata) else 1
     if hdr and primaries in {"", "unknown"}:
         context.color_primaries, context.color_trc, context.colorspace = 9, 16, 9
@@ -195,10 +217,11 @@ def _validate_decoded_frame(frame: Any) -> Any:
 class DLSSGStage:
     def __init__(self, session: DirectDLSSGSession, generated_count: int, *,
                  detect_source_cuts: bool, cuda_output: bool, output_p010: bool,
-                 colors: dict[str, int]) -> None:
+                 colors: dict[str, int], preserve_source_rgb: bool = False) -> None:
         self.session, self.generated_count = session, int(generated_count)
         self.detect_source_cuts, self.cuda_output = detect_source_cuts, cuda_output
         self.output_p010, self.colors = output_p010, colors
+        self.preserve_source_rgb = preserve_source_rgb
         self.previous: TimedFrame | None = None
         self.scene_cuts = self.duplicates = 0
 
@@ -212,7 +235,10 @@ class DLSSGStage:
         generated, detail = self.session.process_frame(
             bridge_frame, force_reset=force_reset,
             detect_scene_cut=self.detect_source_cuts, output_cuda=self.cuda_output,
-            output_p010=self.output_p010, **self.colors)
+            output_p010=self.output_p010, output_rgb=True, **self.colors)
+        if self.preserve_source_rgb:
+            source_rgb = self.session.copy_current_input_rgb()
+            frame = replace(frame, bridge_frame=source_rgb, encode_frame=source_rgb)
         if previous is not None and detail["scene_cut"] and self.detect_source_cuts:
             frame = replace(frame, segment=previous.segment + 1)
             self.scene_cuts += 1
@@ -278,7 +304,7 @@ class NearestTimestampWriter:
 def _duration_fraction(metadata: dict, source_rate: Fraction, frames: int, *, cfr: bool) -> Fraction:
     if cfr and frames > 0:
         return Fraction(frames, 1) / source_rate
-    return Fraction(str(metadata["duration"]))
+    return Fraction(str(metadata.get("video_stream_duration") or metadata["duration"]))
 
 
 def _validate(options: FrameInterpolationOptions) -> None:
@@ -426,9 +452,9 @@ def interpolate_video(
             destination = prepare_output_dir(output_dir, default=OUTPUTS)
             stamp = time.strftime("%Y%m%d-%H%M%S") + f"-{time.time_ns()%1_000_000:06d}"
             extension = {"MP4": ".mp4", "MKV": ".mkv", "MOV": ".mov"}[options.container]
-            output = destination / output_filename(
+            output = unique_output_path(destination / output_filename(
                 source, extension, options.rename_mode, options.custom_suffix,
-                f"{source.stem}_{'DLSSFG_PREVIEW' if preview else 'DLSSFG'}_{stamp}")
+                f"{source.stem}_{'DLSSFG_PREVIEW' if preview else 'DLSSFG'}_{stamp}"))
             output_file = OutputFile(output)
             JOBS.mkdir(exist_ok=True)
             job = tempfile.TemporaryDirectory(prefix="dlssg-bridge-", dir=JOBS)
@@ -450,7 +476,15 @@ def interpolate_video(
                 output_stream.codec_context.time_base = output_tb
                 output_stream.codec_context.options = encoder.options
                 output_stream.codec_context.bit_rate = encoder.bitrate
+                if encoder.display == "prores_ks (Proxy)" and options.quality == "Auto (Default)":
+                    # Proxy's default quantizer remains visibly softer even with
+                    # the higher macroblock budget. Match its high-quality range.
+                    output_stream.codec_context.qscale = True
+                    output_stream.codec_context.global_quality = 3
                 _set_color_properties(output_stream.codec_context, metadata, effective_hdr)
+                if encoder.name == "ffv1":
+                    output_stream.codec_context.colorspace = 0  # RGB, no YUV matrix.
+                    output_stream.codec_context.color_range = 2  # Full range.
                 output_stream.codec_context.open()
 
                 generated_count = plan.generated_per_interval if plan.path == "Native DLSSG" else 1
@@ -461,16 +495,24 @@ def interpolate_video(
                         int(metadata["width"]), int(metadata["height"]), generated_count,
                         controller, ai_ordinal, hdr=effective_hdr))
                 timings["session_initialization_seconds"] = time.perf_counter() - initialization_start
-                colors = {"color_matrix": _matrix_code(metadata), "color_range": _range_code(metadata),
+                colors = {"color_matrix": _matrix_code(metadata, hdr=effective_hdr),
+                          "color_range": _range_code(metadata),
                           "color_primaries": _primaries_code(metadata),
                           "color_transfer": _transfer_code(metadata),
                           "rotation": int(metadata["rotation"])}
                 stages = [DLSSGStage(
                     session, generated_count, detect_source_cuts=index == 0,
-                    cuda_output=cuda_route, output_p010=output_p010, colors=colors)
+                    cuda_output=cuda_route, output_p010=output_p010, colors=colors,
+                    preserve_source_rgb=index == 0)
                     for index, session in enumerate(sessions)]
                 if cuda_route and encode_ordinal != ai_ordinal:
                     transfer_pool = CudaTransferPool(ai_ordinal, encode_ordinal, controller)
+
+                rgb_colorspace = {
+                    0: Colorspace.ITU601, 1: Colorspace.ITU709,
+                    2: Colorspace.BT2020, 3: Colorspace.FCC,
+                    4: Colorspace.SMPTE240M,
+                }[colors["color_matrix"]]
 
                 decode_queue: queue.Queue = queue.Queue(maxsize=4)
                 encode_queue: queue.Queue = queue.Queue(maxsize=4)
@@ -506,7 +548,15 @@ def interpolate_video(
                             frame, pts = item
                             encode_start = time.perf_counter()
                             if not cuda_route and frame.format.name != encoder.pixel_format:
-                                frame = frame.reformat(format=encoder.pixel_format)
+                                frame = frame.reformat(
+                                    format=encoder.pixel_format,
+                                    src_colorspace=rgb_colorspace,
+                                    dst_colorspace=rgb_colorspace)
+                            if encoder.name == "ffv1":
+                                frame.color_primaries = output_stream.codec_context.color_primaries
+                                frame.color_trc = output_stream.codec_context.color_trc
+                                frame.colorspace = 0
+                                frame.color_range = 2
                             frame.pts, frame.time_base, frame.duration = pts, output_tb, 1
                             for packet in output_stream.encode(frame):
                                 encoded_container.mux(packet)
@@ -534,6 +584,29 @@ def interpolate_video(
 
                 def emit(selected: TimedFrame, index: int) -> None:
                     frame = selected.encode_frame
+                    if isinstance(frame, DLSSGCudaSurface):
+                        convert_start = time.perf_counter()
+                        if encoder.name == "prores_ks" or not cuda_route:
+                            pixels = frame.to_host_rgb()
+                            if effective_hdr:
+                                # DLSSG returns normalized, transfer-encoded half float RGB.
+                                # Keep the 10-bit precision until the final 4:2:2 conversion.
+                                depth = 10
+                                maximum = (1 << depth) - 1
+                                rgb = np.rint(np.clip(pixels[..., :3].astype(np.float32),
+                                                      0.0, 1.0) * maximum).astype(np.uint16)
+                                gbr = np.ascontiguousarray(rgb[..., [1, 2, 0]])
+                                frame = av.VideoFrame.from_ndarray(gbr, format=f"gbrp{depth}le")
+                            else:
+                                frame = av.VideoFrame.from_ndarray(pixels, format="rgba")
+                        else:
+                            yuv = frame.to_yuv_surface(
+                                color_matrix=colors["color_matrix"],
+                                color_range=colors["color_range"], p010=output_p010)
+                            frame = yuv.to_av_frame()
+                        timings["final_color_conversion_seconds"] = (
+                            timings.get("final_color_conversion_seconds", 0.0) +
+                            time.perf_counter() - convert_start)
                     if transfer_pool is not None:
                         transfer_start = time.perf_counter()
                         frame, _detail = transfer_pool.transfer(frame)
@@ -641,10 +714,12 @@ def interpolate_video(
                     transfer_pool.close(); transfer_pool = None
                 update(.9, "Muxing original audio, subtitles, chapters, and metadata")
                 mux_start = time.perf_counter()
+                audio_diagnostics: dict = {}
                 ffmpeg.final_mux(
                     temp_video, source, output_file.temporary, options.container, controller,
                     preserve_supported_subtitles=True,
-                    source_time_origin=metadata.get("origin", 0))
+                    source_time_origin=metadata.get("origin", 0),
+                    audio_diagnostics=audio_diagnostics)
                 timings["mux_seconds"] = time.perf_counter() - mux_start
                 update(.96, "Verifying exact frame count, rational FPS, dimensions, and HDR")
                 verify_start = time.perf_counter()
@@ -660,6 +735,13 @@ def interpolate_video(
                     raise RuntimeError("Output dimensions changed during interpolation.")
                 if effective_hdr and (not verified.get("hdr") or int(verified.get("depth", 0)) < 10):
                     raise RuntimeError("Saved interpolation failed HDR/10-bit verification.")
+                expected = {
+                    "ProRes HQ": ("prores", "yuv422p10le", 10),
+                    "FFV1 Lossless RGB 10-bit": ("ffv1", "gbrp10le", 10),
+                }.get(ffmpeg._normalize_codec(selected_codec))
+                if expected and (verified.get("codec"), verified.get("pixel_format"),
+                                 int(verified.get("depth") or 0)) != expected:
+                    raise RuntimeError(f"Saved interpolation format does not match {selected_codec}.")
                 timings["verification_seconds"] = time.perf_counter() - verify_start
                 elapsed = time.perf_counter() - started
                 timings["total_seconds"] = elapsed
@@ -685,7 +767,8 @@ def interpolate_video(
                 else:
                     memory_path = "host_staging_inprocess_dlssg_encoder"
                 pool_pressure = {
-                    "capacity": 8,
+                    "capacity": max((int(item.get("surface_pool_capacity", 0))
+                                     for item in session_diagnostics), default=0),
                     "allocated": max((int(item.get("surface_pool_allocated", 0))
                                       for item in session_diagnostics), default=0),
                     "waits": sum(int(item.get("surface_pool_waits", 0))
@@ -705,6 +788,7 @@ def interpolate_video(
                                  "encode": video_gpu if _is_nvenc(selected_codec) else "CPU"},
                     "discontinuities": discontinuities, "duplicate_intervals": duplicate_intervals,
                     "unselected_source_frames": unselected_source_frames,
+                    "audio_streams": audio_diagnostics.get("streams", []),
                 }
                 output_file.publish()
                 app_log.info("frame-interp", f"done src={source.name} out={output.name} "

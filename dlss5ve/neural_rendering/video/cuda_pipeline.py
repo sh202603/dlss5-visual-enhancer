@@ -388,6 +388,7 @@ def convert_video_cuda_nvenc(
         gc.collect()
 
         mux_started = time.perf_counter()
+        audio_diagnostics: dict = {}
         if preview_frames is not None:
             shutil.copyfile(temp_video, output_file.temporary)
             metadata_diagnostics.update(status="skipped", reason="preview_fast_path")
@@ -401,6 +402,7 @@ def convert_video_cuda_nvenc(
                 controller,
                 render_note=render_note,
                 metadata_diagnostics=metadata_diagnostics,
+                audio_diagnostics=audio_diagnostics,
             )
         timings["final_mux_seconds"] = time.perf_counter() - mux_started
         _check_cancel(controller)
@@ -421,6 +423,7 @@ def convert_video_cuda_nvenc(
         decode_backend = "+".join(sorted(decode_backends)) or "unknown"
         status["decode_backend"] = decode_backend
         status["encode_backend"] = codec_name
+        status["audio_streams"] = audio_diagnostics.get("streams", [])
         resize_method = "none" if factor == 1.0 else "lanczos"
         elapsed = time.perf_counter() - started
         report_path = app_log.session_path()

@@ -7,6 +7,7 @@ from pathlib import Path
 
 from ..jobs import BoundedLogBuffer, JobController, drain_bounded_text, drain_text
 from ..paths import FFMPEG
+from .audio import AudioPlan, plan_audio_streams
 from .codecs import (
     CODEC_CHOICES, _NVENC_ENCODERS, _base_codec, _hdr_color_args,
     _is_hdr_allowed_codec, _is_nvenc_codec, _normalize_codec, _x265_hdr_params,
@@ -161,7 +162,7 @@ def _codec_command(
     if hdr_mode and not _is_hdr_allowed_codec(norm):
         raise ValueError(
             f"HDR Mode is not available for {codec!r}; choose H.265, H.265 (NVIDIA NVENC), "
-            "AV1, AV1 (NVIDIA NVENC) or ProRes Proxy."
+            "AV1, AV1 (NVIDIA NVENC), ProRes, or FFV1 Lossless RGB 10-bit."
         )
     # HDR mode needs 10-bit divisor
     quality = resolve_encoding_quality(quality_name, codec, width, height, fps, hdr_mode=hdr_mode)
@@ -180,6 +181,18 @@ def _codec_command(
             ],
             "prores_ks (Proxy)",
             quality,
+        )
+    if norm == "ProRes HQ":
+        return (
+            ["-c:v", "prores_ks", "-profile:v", "3", "-pix_fmt", "yuv422p10le",
+             *(_hdr_color_args(hdr_metadata) if hdr_mode and hdr_metadata else [])],
+            "prores_ks (HQ)", quality,
+        )
+    if norm == "FFV1 Lossless RGB 10-bit":
+        return (
+            ["-c:v", "ffv1", "-level", "3", "-slicecrc", "1", "-pix_fmt", "gbrp10le",
+             "-color_range", "pc"],
+            "ffv1 (Lossless RGB 10-bit)", quality,
         )
     if quality["mode"] == "constant-quality":
         nvenc_quality = ["-rc", "vbr", "-cq", "0", "-b:v", "0"]
@@ -329,13 +342,36 @@ def start_encoder(
     speed_profile: str = "default", source_audio: Path | None = None,
     direct_container: str | None = None, comment: str | None = None,
     audio_duration: float | None = None, include_source_metadata: bool = True,
+    audio_plan: AudioPlan | None = None,
 ):
     codec_args, selected, quality = _codec_command(
         codec, quality_name, width, height, fps, gpu_ordinal, require_nvenc, hdr_mode, hdr_metadata,
         speed_profile=speed_profile,
     )
+    normalized_codec = _normalize_codec(codec)
+    if normalized_codec in {"ProRes HQ", "FFV1 Lossless RGB 10-bit"}:
+        colors = hdr_metadata or {}
+        primaries = str(colors.get("color_primaries") or "bt709")
+        transfer = str(colors.get("color_transfer") or "bt709")
+        if primaries in {"unknown", "unspecified"}:
+            primaries = "bt2020" if colors.get("hdr") else "bt709"
+        if transfer in {"unknown", "unspecified"}:
+            transfer = "smpte2084" if colors.get("hdr") else "bt709"
+        if normalized_codec == "FFV1 Lossless RGB 10-bit":
+            tag_filter = ("format=gbrp10le,setparams="
+                          f"color_primaries={primaries}:color_trc={transfer}:"
+                          "colorspace=gbr:range=full")
+        else:
+            matrix = str(colors.get("color_space") or "bt709")
+            if matrix in {"unknown", "unspecified"}:
+                matrix = "bt2020nc" if colors.get("hdr") else "bt709"
+            tag_filter = ("format=yuv422p10le,setparams="
+                          f"color_primaries={primaries}:color_trc={transfer}:"
+                          f"colorspace={matrix}:range=limited")
+        video_filter = f"{video_filter},{tag_filter}" if video_filter else tag_filter
     direct_mux = source_audio is not None and direct_container in {"MP4", "MOV"}
     if direct_mux:
+        selected_audio = audio_plan or plan_audio_streams(source_audio, direct_container, controller)
         command = [
             str(FFMPEG),
             "-hide_banner",
@@ -357,10 +393,7 @@ def start_encoder(
             *( ["-map_metadata", "1", "-map_chapters", "1"] if include_source_metadata else ["-map_metadata", "-1", "-map_chapters", "-1"] ),
             *( ["-vf", video_filter] if video_filter else [] ),
             *codec_args,
-            "-c:a",
-            "aac",
-            "-b:a",
-            "192k",
+            *selected_audio.encoder_args(),
             "-fps_mode",
             "passthrough",
             *( ["-enc_time_base:v", "demux"] if preserve_timestamps else [] ),

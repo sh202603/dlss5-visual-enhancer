@@ -8,6 +8,7 @@ import time
 import platform
 import math
 import hashlib
+import importlib
 import shutil
 import tempfile
 import urllib.parse
@@ -20,15 +21,16 @@ from PySide6.QtCore import QObject, QThreadPool, QTimer, QUrl, Signal, Slot, Pro
 from PySide6.QtGui import QGuiApplication, QImage, QPixmap
 
 from ..core.paths import CONFIG_PATH, OUTPUTS, LOGS, FFMPEG, FFPROBE, MPV, APP_TEMP
-from ..core.disk_paths import supported_file as _is_supported_media_file
+from ..core.disk_paths import prepare_output_dir, supported_file as _is_supported_media_file
 from ..core.cache_cleanup import cleanup_old_caches
 from ..core import app_log
 from ..core.runtime import prepare_runtime, NR_STYLES, UPSCALING_MODES, resolve_upscaling_mode, resolve_output_size
-from ..core.ffmpeg import CODEC_CHOICES, ENCODING_QUALITIES, container_for_codec, hdr_mode_supported, probe_video
-from ..core.naming import RENAME_MODES
+from ..core.ffmpeg import CODEC_CHOICES, ENCODING_QUALITIES, FIXED_QUALITY_CODECS, container_for_codec, hdr_mode_supported, probe_video
+from ..core.naming import RENAME_MODES, validate_rename
 from ..core.nr_composition import inspect_nr_mask, mask_status
 from ..settings.models import (
-    CONTAINER_CHOICES, DEFAULT_SETTINGS, PREVIEW_ENCODING_CHOICES, UPSCALE_MODE_CHOICES, UISettings,
+    CONTAINER_CHOICES, DEFAULT_SETTINGS, PREVIEW_ENCODING_CHOICES, UPSCALE_MODE_CHOICES,
+    UPSCALE_PREVIEW_LENGTH_CHOICES, UISettings,
     automatic_mask_choice, coerce_hdr_mode, live_effect_options, parse_automatic_mask, _validate,
 )
 from ..settings.storage import SETTINGS_STATE, load_settings, save_settings
@@ -47,7 +49,7 @@ from .state import (
 from ..neural_rendering.image.batch import convert_images
 from ..neural_rendering.image.preview import render_image_preview
 from ..neural_rendering.image.models import ImageConversionOptions, RAW_EXTENSIONS, IMAGE_EXTENSIONS
-from ..neural_rendering.image.decoder import decode_image_preview, full_size_image_preview_path, initialize_image_runtime
+from ..neural_rendering.image.decoder import decode_image_preview, initialize_image_runtime
 
 from ..neural_rendering.video.batch import convert_videos
 from ..neural_rendering.video.preview import process_video_preview
@@ -146,7 +148,7 @@ class AppBridge(QObject):
         "frame_interpolation_hdr_mode", "preview_encoding",
     }
     # Cap stored ranges per context so repeated previews can't grow state.
-    FI_RANGE_LIMIT = 32
+    PREVIEW_RANGE_LIMIT = 32
 
     # Settings that materially change the visual result shown in the preview.
     # Changes to these fields are debounced and automatically re-render the
@@ -161,7 +163,7 @@ class AppBridge(QObject):
         "face_skin_protection", "grain_preservation",
         "shimmer_suppression", "mask_feather", "nr_mask",
         "upscaling_factor",
-        "preview_encoding", "full_size_image_previews",
+        "preview_encoding",
         "upscale_image_vsr_quality", "upscale_image_size_mode",
         "upscale_image_scale_factor", "upscale_image_width",
         "upscale_image_height", "upscale_image_aspect_lock",
@@ -176,6 +178,16 @@ class AppBridge(QObject):
         "frame_interpolation_codec", "frame_interpolation_quality",
         "frame_interpolation_hdr_mode",
         "codec", "quality", "hdr_mode",
+    }
+    UPSCALE_RANGE_FIELDS = {
+        "ai_gpu_uuid", "video_gpu_uuid", "preview_encoding",
+        "upscale_vsr_enabled", "upscale_vsr_quality",
+        "upscale_size_mode", "upscale_scale_factor",
+        "upscale_width", "upscale_height", "upscale_aspect_lock",
+        "upscale_hdr_enabled", "upscale_hdr_contrast",
+        "upscale_hdr_saturation", "upscale_hdr_middle_gray",
+        "upscale_hdr_peak_luminance", "upscale_hdr_precision",
+        "upscale_codec", "upscale_quality",
     }
 
     # UI State Signals
@@ -202,6 +214,7 @@ class AppBridge(QObject):
     layoutChanged = Signal()
     sourceSizeChanged = Signal()
     outputSizeChanged = Signal()
+    batchExportRequested = Signal(str)
 
     # Settings Signals
     settingsUpdated = Signal()
@@ -301,11 +314,11 @@ class AppBridge(QObject):
         self._sweep_timer.timeout.connect(self._sweep_temp_caches)
         self._sweep_timer.start()
 
-        # Runtime starts in a lightweight bootstrap state. ``initializeRuntime``
-        # populates this asynchronously after the QML window is already visible.
+        # The launch path prepares the runtime before loading the QML window.
         self._prepared = None
         self._runtime_state = "Initializing"
         self._runtime_error = ""
+        self._startup_warnings: list[str] = []
 
         # Persistent desktop layout is deliberately separate from render presets.
         # Renamed in v10: "DLSS 5 Visual Enhancer" -> "Visual Enhancer".
@@ -432,10 +445,18 @@ class AppBridge(QObject):
             return 3.0
         return length if (length and math.isfinite(length) and length > 0) else 3.0
 
-    def _add_fi_rendered_range(self, context_key: str, start_seconds: float, media_path: str,
-                               length_seconds: float = 3.0) -> None:
-        """Record one FI preview span for the green timeline overlay."""
-        if context_key != "fi-video":
+    def _upscale_preview_length_seconds(self) -> float:
+        """Return the selected manual Upscale preview clip length."""
+        selected = self._settings.upscale_preview_length
+        try:
+            return float(selected) if selected in PREVIEW_LENGTH_CHOICES else 3.0
+        except (TypeError, ValueError):
+            return 3.0
+
+    def _add_rendered_range(self, context_key: str, start_seconds: float, media_path: str,
+                            length_seconds: float) -> None:
+        """Record a rendered video preview span for the green timeline overlay."""
+        if context_key not in {"fi-video", "upscale-video"}:
             return
         ctx = self._contexts.get(context_key)
         if ctx is None:
@@ -470,19 +491,21 @@ class AppBridge(QObject):
         # Newest last; drop the oldest beyond the cap. Overlapping spans are
         # kept as separate entries so each keeps its own clip; they merge
         # visually by overdraw and playback prefers the newest match.
-        if len(ranges) > int(self.FI_RANGE_LIMIT):
-            ranges = ranges[-int(self.FI_RANGE_LIMIT):]
+        if len(ranges) > int(self.PREVIEW_RANGE_LIMIT):
+            ranges = ranges[-int(self.PREVIEW_RANGE_LIMIT):]
         ctx.rendered_ranges = ranges
         if context_key == self._context_key():
             self.previewRangesChanged.emit()
 
-    def _clear_fi_rendered_ranges(self, emit: bool = True) -> None:
-        """Drop FI pre-rendered spans (source/settings changed)."""
-        ctx = self._contexts.get("fi-video")
+    def _clear_rendered_ranges(self, context_key: str, emit: bool = True) -> None:
+        """Drop spans rendered with stale settings or replaced by a frame preview."""
+        ctx = self._contexts.get(context_key)
         if ctx is None:
             return
+        if not ctx.rendered_ranges:
+            return
         ctx.rendered_ranges = []
-        if emit and self._context_key() == "fi-video":
+        if emit and self._context_key() == context_key:
             self.previewRangesChanged.emit()
 
     # =========================================================================
@@ -540,6 +563,15 @@ class AppBridge(QObject):
             self._emit_context()
             self._schedule_auto_preview(180)
 
+    @Property(str, notify=settingsUpdated)
+    def upscalePreviewLength(self) -> str:
+        return self._settings.upscale_preview_length
+
+    @upscalePreviewLength.setter
+    def upscalePreviewLength(self, value: str) -> None:
+        if str(value) in UPSCALE_PREVIEW_LENGTH_CHOICES:
+            self._save_setting(upscale_preview_length=str(value))
+
     @Property(bool, notify=isProcessingChanged)
     def isProcessing(self) -> bool:
         return self._is_processing
@@ -589,12 +621,11 @@ class AppBridge(QObject):
 
     @Property(list, notify=previewRangesChanged)
     def previewRenderedRanges(self) -> list[dict]:
-        """FI pre-rendered timeline spans, newest last.
+        """Rendered timeline spans for FI and timed Upscale previews, newest last.
 
         Each entry is {"start": seconds, "end": seconds, "url": clip URL}.
-        Empty for every context except fi-video. The timeline paints them
-        green; playback shows the processed clip inside a span and the
-        original source outside of all spans.
+        Empty for frame and image previews. The timeline paints spans green;
+        playback shows the processed clip inside and the source outside.
         """
         try:
             ranges = getattr(self._context(), "rendered_ranges", None) or []
@@ -734,6 +765,10 @@ class AppBridge(QObject):
     def runtimeError(self) -> str:
         return self._runtime_error
 
+    @Property(str, notify=runtimeStateChanged)
+    def startupWarnings(self) -> str:
+        return "\n".join(self._startup_warnings)
+
     @Property(int, notify=sourceSizeChanged)
     def sourceWidth(self) -> int:
         return self._context().source_width
@@ -826,13 +861,13 @@ class AppBridge(QObject):
     def _auto_preview_fingerprint(self, context_key: str | None = None) -> tuple:
         """Snapshot what the current output preview was rendered from.
 
-        Returns ``(selected source, full settings snapshot)`` for the given
+        Returns ``(selected source, relevant settings snapshot)`` for the given
         context. Compared against ``PreviewState.last_auto_fingerprint`` to
         decide whether a scheduled auto-preview is redundant (e.g. returning
-        to a tab with unchanged settings). The full settings snapshot —
-        rather than per-tab subsets — keeps shared fields edited on another
-        tab (AI/video GPU, preview encoding) correctly marking this context
-        stale. Never raises; falls back to ``()`` (stale) on any error.
+        to a tab with unchanged settings). Shared fields edited on another
+        tab (AI/video GPU, preview encoding) still mark this context stale.
+        Upscale's manual clip duration is excluded because it does not alter
+        already rendered footage. Returns ``()`` on error.
         """
         try:
             key = context_key or self._context_key()
@@ -842,6 +877,7 @@ class AppBridge(QObject):
                 snapshot = tuple(
                     getattr(self._settings, field.name, None)
                     for field in _dataclass_fields(self._settings)
+                    if not (key == "upscale-video" and field.name == "upscale_preview_length")
                 )
             except Exception:
                 snapshot = ()
@@ -1048,6 +1084,7 @@ class AppBridge(QObject):
         ]
         if self._runtime_error:
             lines.append(f"Runtime error: {self._runtime_error}")
+        lines.extend(f"Startup warning: {warning}" for warning in self._startup_warnings)
         return "\n".join(lines)
 
     @Property(list, constant=True)
@@ -1071,6 +1108,10 @@ class AppBridge(QObject):
         return list(CODEC_CHOICES)
 
     @Property(list, constant=True)
+    def fixedQualityCodecs(self) -> list[str]:
+        return sorted(FIXED_QUALITY_CODECS)
+
+    @Property(list, constant=True)
     def encodingQualityChoices(self) -> list[str]:
         return list(ENCODING_QUALITIES)
 
@@ -1089,6 +1130,10 @@ class AppBridge(QObject):
     @Property(list, constant=True)
     def fiPreviewLengthChoices(self) -> list[dict[str, str]]:
         return [{"label": f"{v}s", "value": v} for v in PREVIEW_LENGTH_CHOICES]
+
+    @Property(list, constant=True)
+    def upscalePreviewLengthChoices(self) -> list[dict[str, str]]:
+        return [{"label": f"{value}s", "value": value} for value in PREVIEW_LENGTH_CHOICES]
 
     @Property(list, constant=True)
     def previewEncodingChoices(self) -> list[str]:
@@ -1155,38 +1200,21 @@ class AppBridge(QObject):
 
     @Slot()
     def initializeRuntime(self) -> None:
-        if self._runtime_state == "Ready" or getattr(self, "_runtime_worker", None) is not None:
+        """Prepare all input-independent backends before the first QML frame."""
+        if self._runtime_state != "Initializing":
             return
-        self._runtime_state = "Initializing"
-        self._runtime_error = ""
-        self.runtimeStateChanged.emit()
-        self._status_message = "Initializing NVIDIA runtime and media backends…"
-        self.statusMessageChanged.emit()
 
-        def task() -> Any:
+        try:
             sweep_stale_live_dirs()
+        except Exception as exc:
+            self._startup_warnings.append(f"Live cache cleanup: {exc}")
+
+        try:
             initialize_image_runtime()
-            return prepare_runtime()
-
-        worker = JobWorker(task, inject_callbacks=False)
-        self._runtime_worker = worker
-
-        def done(prepared: Any) -> None:
-            self._runtime_worker = None
-            self._prepared = prepared
-            self._runtime_state = "Ready"
-            self._runtime_error = ""
+            self._prepared = prepare_runtime()
             self._normalize_gpu_selections()
-            self.runtimeStateChanged.emit()
-            self.gpuChoicesChanged.emit()
-            self.operationStateChanged.emit()
-            self._status_message = "Ready."
-            self.statusMessageChanged.emit()
-            self._log(f"Runtime ready on {self.gpuName}.")
-            self._schedule_auto_preview(180)
-
-        def failed(message: str) -> None:
-            self._runtime_worker = None
+        except Exception as exc:
+            message = str(exc)
             self._runtime_state = "Failed"
             self._runtime_error = message
             self.runtimeStateChanged.emit()
@@ -1194,10 +1222,31 @@ class AppBridge(QObject):
             self._status_message = f"Runtime initialization failed: {message}"
             self.statusMessageChanged.emit()
             self._log(self._status_message)
+            app_log.error("startup", self._status_message)
+            return
 
-        worker.signals.finished.connect(done)
-        worker.signals.failed.connect(failed)
-        self._thread_pool.start(worker)
+        # Load optional native bridges without selecting an adapter. Their
+        # absence must not prevent the other rendering modes from opening.
+        for name, module_name in (
+            ("Frame Interpolation", "..frame_interpolation.native"),
+            ("RTX Video Upscale", "..upscale.video.native"),
+        ):
+            try:
+                importlib.import_module(module_name, __package__).preload_bridge()
+            except Exception as exc:
+                self._startup_warnings.append(f"{name}: {exc}")
+
+        self._runtime_state = "Ready"
+        self._runtime_error = ""
+        self._status_message = "Ready."
+        self.runtimeStateChanged.emit()
+        self.gpuChoicesChanged.emit()
+        self.operationStateChanged.emit()
+        self.statusMessageChanged.emit()
+        self._log(f"Runtime ready on {self.gpuName}.")
+        for warning in self._startup_warnings:
+            self._log(f"Startup warning: {warning}")
+            app_log.error("startup", warning)
 
     def _normalize_gpu_selections(self) -> None:
         if self._prepared is None:
@@ -1281,9 +1330,11 @@ class AppBridge(QObject):
         self.operationStateChanged.emit()
         self._save_timer.start()
         if any(field in self.FI_RANGE_FIELDS for field in changed):
-            # Rendered FI spans were built with older settings: drop them so
-            # the green overlay never claims stale footage as processed.
-            self._clear_fi_rendered_ranges()
+            # These spans were built with older settings: drop them so the
+            # green overlay never claims stale footage as processed.
+            self._clear_rendered_ranges("fi-video")
+        if any(field in self.UPSCALE_RANGE_FIELDS for field in changed):
+            self._clear_rendered_ranges("upscale-video")
         if any(field in self.AUTO_PREVIEW_FIELDS for field in changed):
             self._schedule_auto_preview()
         return True
@@ -1995,14 +2046,6 @@ class AppBridge(QObject):
     def previewEncoding(self, val: str) -> None:
         self._save_setting(preview_encoding=val)
 
-    @Property(bool, notify=settingsUpdated)
-    def fullSizeImagePreviews(self) -> bool:
-        return self._settings.full_size_image_previews
-
-    @fullSizeImagePreviews.setter
-    def fullSizeImagePreviews(self, val: bool) -> None:
-        self._save_setting(full_size_image_previews=bool(val))
-
     def _active_render_configuration_valid(self) -> bool:
         try:
             _validate(self._settings)
@@ -2079,6 +2122,8 @@ class AppBridge(QObject):
             return
         self._settings = DEFAULT_SETTINGS
         SETTINGS_STATE.current = self._settings
+        self._clear_rendered_ranges("fi-video")
+        self._clear_rendered_ranges("upscale-video")
         if self._upscale_mode != DEFAULT_SETTINGS.upscale_mode:
             self._upscale_mode = DEFAULT_SETTINGS.upscale_mode
             self.upscaleModeChanged.emit()
@@ -2468,6 +2513,7 @@ class AppBridge(QObject):
         except Exception:
             pass
 
+    @Slot(int)
     def selectQueueItem(self, row: int) -> None:
         if self._operation_state != IDLE:
             self._status_message = "Selection changes are disabled while an operation is active."
@@ -2619,6 +2665,13 @@ class AppBridge(QObject):
 
     @staticmethod
     def _image_dimensions(preview: Any) -> tuple[int, int]:
+        if isinstance(preview, (str, Path)):
+            try:
+                from PIL import Image as _PILImage
+                with _PILImage.open(preview) as image:
+                    return int(image.width), int(image.height)
+            except (OSError, ValueError, TypeError):
+                return 0, 0
         width = getattr(preview, "width", 0)
         height = getattr(preview, "height", 0)
         if callable(width):
@@ -2666,7 +2719,6 @@ class AppBridge(QObject):
                 pass
 
         operation_id = self._set_operation(LOADING_METADATA, "Loading media…")
-        full_size = self._settings.full_size_image_previews
         accepts_images = context_key in {"nr-image", "upscale-image"}
 
         def task(controller=None, progress=None) -> dict[str, Any]:
@@ -2675,8 +2727,7 @@ class AppBridge(QObject):
             if accepts_images and is_image:
                 if progress:
                     progress(0.15, "Decoding image preview…")
-                max_size = None if full_size else (1920, 1080)
-                preview = decode_image_preview(str(path), max_size)
+                preview = decode_image_preview(str(path))
                 width, height = self._image_dimensions(preview)
                 return {"kind": "image", "preview": preview, "width": width, "height": height}
             if progress:
@@ -2789,20 +2840,78 @@ class AppBridge(QObject):
     # =========================================================================
     @Slot()
     def startActiveBatch(self) -> None:
+        """Compatibility entry point for batch actions; show export choices first."""
+        self.requestActiveBatchExport()
+
+    @Slot(result=bool)
+    def requestActiveBatchExport(self) -> bool:
+        context_key = self._context_key()
+        if context_key not in {"nr-image", "nr-video", "upscale-image", "upscale-video", "fi-video"} or self._active_tab not in {"neural-rendering", "upscale", "frame-interpolation"}:
+            self._status_message = "Select a batch processing tab before exporting."
+        elif self._operation_state != IDLE or self._runtime_state != "Ready" or self._is_live_running:
+            self._status_message = "Stop the current operation before starting a batch."
+        elif not self._active_queue().get_paths():
+            self._status_message = "No files in queue to process."
+        else:
+            self.batchExportRequested.emit(context_key)
+            return True
+        self.statusMessageChanged.emit()
+        return False
+
+    @Slot(str, str, str, str, str, result=str)
+    def startActiveBatchWithExport(self, context_key: str, destination_mode: str,
+                                   folder_url_or_path: str, rename_mode: str,
+                                   custom_suffix: str) -> str:
+        """Validate the dialog's choices, then launch exactly one batch."""
+        if context_key != self._context_key() or self._active_tab not in {"neural-rendering", "upscale", "frame-interpolation"}:
+            return self._batch_export_error("The active workflow changed. Reopen Export Path.")
         if self._operation_state != IDLE or self._runtime_state != "Ready" or self._is_live_running:
-            self._status_message = "Another operation is active; stop it before starting a batch."
-            self.statusMessageChanged.emit()
-            return
+            return self._batch_export_error("Another operation is active; stop it before starting a batch.")
         queue = self._active_queue()
         paths = list(queue.get_paths())
         if not paths:
-            self._status_message = "No files in queue to process."
-            self.statusMessageChanged.emit()
-            return
-        if not self._active_render_configuration_valid():
-            self._status_message = f"Cannot render: {self.renderValidationMessage}"
-            self.statusMessageChanged.emit()
-            return
+            return self._batch_export_error("No files in queue to process.")
+        rename_fields = {
+            "nr-image": ("image_rename_mode", "image_custom_suffix"),
+            "nr-video": ("video_rename_mode", "video_custom_suffix"),
+            "upscale-image": ("upscale_image_rename_mode", "upscale_image_custom_suffix"),
+            "upscale-video": ("upscale_rename_mode", "upscale_custom_suffix"),
+            "fi-video": ("frame_interpolation_rename_mode", "frame_interpolation_custom_suffix"),
+        }
+        if context_key not in rename_fields:
+            return self._batch_export_error("This workspace does not support batch rendering.")
+        try:
+            validate_rename(rename_mode, custom_suffix)
+            mode_field, suffix_field = rename_fields[context_key]
+            candidate = _validate(replace(self._settings, **{
+                mode_field: rename_mode, suffix_field: custom_suffix,
+            }))
+            if context_key == "upscale-image":
+                image_upscale_options_from_settings(candidate).validate(for_render=True)
+            elif context_key == "upscale-video":
+                video_upscale_options_from_settings(candidate).validate(for_render=True)
+
+            if destination_mode == "input":
+                for parent in {Path(path).resolve().parent for path in paths}:
+                    prepare_output_dir(parent)
+                output_dir = None
+                same_as_input = True
+            elif destination_mode == "output":
+                output_dir = prepare_output_dir(OUTPUTS)
+                same_as_input = False
+            elif destination_mode == "folder":
+                folder = self._clean_path(folder_url_or_path)
+                if not folder or not Path(folder).is_dir():
+                    raise ValueError("Choose an existing export folder.")
+                output_dir = prepare_output_dir(folder)
+                same_as_input = False
+            else:
+                raise ValueError("Choose an Export Path option.")
+        except Exception as exc:
+            return self._batch_export_error(str(exc))
+
+        if not self._save_setting(**{mode_field: rename_mode, suffix_field: custom_suffix}):
+            return self._batch_export_error(self._status_message)
 
         self._flush_settings()
         queue.reset_all_states()
@@ -2814,21 +2923,31 @@ class AppBridge(QObject):
 
         try:
             if context_key == "nr-image":
-                worker = self._nr_image_batch_worker(paths, settings)
+                worker = self._nr_image_batch_worker(paths, settings, output_dir, same_as_input)
             elif context_key == "nr-video":
-                worker = self._nr_video_batch_worker(paths, settings)
+                worker = self._nr_video_batch_worker(paths, settings, output_dir, same_as_input)
             elif context_key == "upscale-image":
-                worker = self._upscale_image_batch_worker(paths, settings)
+                worker = self._upscale_image_batch_worker(paths, settings, output_dir, same_as_input)
             elif context_key == "upscale-video":
-                worker = self._upscale_video_batch_worker(paths, settings)
+                worker = self._upscale_video_batch_worker(paths, settings, output_dir, same_as_input)
             elif context_key == "fi-video":
-                worker = self._fi_batch_worker(paths, settings)
+                worker = self._fi_batch_worker(paths, settings, output_dir, same_as_input)
             else:
                 raise RuntimeError("This workspace does not support batch rendering.")
         except Exception as exc:
             self._finish_operation(operation_id, f"Cannot start batch: {exc}")
-            return
-        self._setup_worker(worker, queue, operation_id, context_key)
+            return f"Cannot start batch: {exc}"
+        try:
+            self._setup_worker(worker, queue, operation_id, context_key)
+        except Exception as exc:
+            self._finish_operation(operation_id, f"Cannot start batch: {exc}")
+            return f"Cannot start batch: {exc}"
+        return ""
+
+    def _batch_export_error(self, message: str) -> str:
+        self._status_message = message
+        self.statusMessageChanged.emit()
+        return message
 
     def _setup_worker(self, worker: JobWorker, queue: BatchListModel, operation_id: int, context_key: str) -> None:
         self._active_worker = worker
@@ -2917,7 +3036,8 @@ class AppBridge(QObject):
         if context_key == self._context_key():
             self._emit_context()
 
-    def _nr_image_batch_worker(self, paths: list[str], settings: UISettings) -> JobWorker:
+    def _nr_image_batch_worker(self, paths: list[str], settings: UISettings,
+                               output_dir: Path | None, same_as_input: bool) -> JobWorker:
         opts = ImageConversionOptions(
             ai_gpu_uuid=settings.ai_gpu_uuid,
             nr_style=settings.nr_style,
@@ -2939,9 +3059,11 @@ class AppBridge(QObject):
             rename_mode=settings.image_rename_mode,
             custom_suffix=settings.image_custom_suffix,
         )
-        return JobWorker(convert_images, paths, opts, output_dir=OUTPUTS, generate_previews=True, create_zip=False)
+        return JobWorker(convert_images, paths, opts, output_dir=output_dir,
+                         generate_previews=True, create_zip=False, same_as_input=same_as_input)
 
-    def _nr_video_batch_worker(self, paths: list[str], settings: UISettings) -> JobWorker:
+    def _nr_video_batch_worker(self, paths: list[str], settings: UISettings,
+                               output_dir: Path | None, same_as_input: bool) -> JobWorker:
         opts = ConversionOptions(
             ai_gpu_uuid=settings.ai_gpu_uuid,
             video_gpu_uuid=settings.video_gpu_uuid,
@@ -2967,19 +3089,25 @@ class AppBridge(QObject):
             rename_mode=settings.video_rename_mode,
             custom_suffix=settings.video_custom_suffix,
         )
-        return JobWorker(convert_videos, paths, opts, output_dir=OUTPUTS, create_archive=False)
+        return JobWorker(convert_videos, paths, opts, output_dir=output_dir,
+                         create_archive=False, same_as_input=same_as_input)
 
-    def _upscale_image_batch_worker(self, paths: list[str], settings: UISettings) -> JobWorker:
+    def _upscale_image_batch_worker(self, paths: list[str], settings: UISettings,
+                                    output_dir: Path | None, same_as_input: bool) -> JobWorker:
         opts = image_upscale_options_from_settings(settings)
         opts.validate(for_render=True)
-        return JobWorker(upscale_images, paths, opts, output_dir=OUTPUTS, generate_previews=True)
+        return JobWorker(upscale_images, paths, opts, output_dir=output_dir,
+                         generate_previews=True, same_as_input=same_as_input)
 
-    def _upscale_video_batch_worker(self, paths: list[str], settings: UISettings) -> JobWorker:
+    def _upscale_video_batch_worker(self, paths: list[str], settings: UISettings,
+                                    output_dir: Path | None, same_as_input: bool) -> JobWorker:
         opts = video_upscale_options_from_settings(settings)
         opts.validate(for_render=True)
-        return JobWorker(upscale_videos, paths, opts, output_dir=OUTPUTS)
+        return JobWorker(upscale_videos, paths, opts, output_dir=output_dir,
+                         same_as_input=same_as_input)
 
-    def _fi_batch_worker(self, paths: list[str], settings: UISettings) -> JobWorker:
+    def _fi_batch_worker(self, paths: list[str], settings: UISettings,
+                         output_dir: Path | None, same_as_input: bool) -> JobWorker:
         opts = FrameInterpolationOptions(
             ai_gpu_uuid=settings.ai_gpu_uuid,
             video_gpu_uuid=settings.video_gpu_uuid,
@@ -2992,7 +3120,8 @@ class AppBridge(QObject):
             rename_mode=settings.frame_interpolation_rename_mode,
             custom_suffix=settings.frame_interpolation_custom_suffix,
         )
-        return JobWorker(interpolate_videos, paths, opts, output_dir=OUTPUTS)
+        return JobWorker(interpolate_videos, paths, opts, output_dir=output_dir,
+                         same_as_input=same_as_input)
 
     @Slot()
     def stopActiveBatch(self) -> None:
@@ -3089,10 +3218,19 @@ class AppBridge(QObject):
 
     @Slot(float)
     def renderPreviewAt(self, position_ms: float = 0.0) -> None:
-        """Explicit Preview: enhance exactly the timeline playhead frame."""
+        """Explicit Preview: render the parked frame or selected Upscale clip."""
+        if self.canPreview:
+            # A pending realtime frame must not overwrite a manual clip as
+            # soon as it finishes (or erase its green timeline range).
+            self._auto_preview_pending = False
+            self._auto_preview_timer.stop()
+            self._scrub_pending_pos = None
+            self._scrub_preview_timer.stop()
         start_seconds, frame_index = self._quantize_playhead(position_ms)
         self.notePlayheadMs(position_ms)
-        self._render_preview_impl(start_seconds, frame_index)
+        clip_seconds = (self._upscale_preview_length_seconds()
+                        if self._context_key() == "upscale-video" else None)
+        self._render_preview_impl(start_seconds, frame_index, clip_seconds=clip_seconds)
 
     @Slot(float)
     def schedulePreviewAt(self, position_ms: float = 0.0) -> None:
@@ -3214,7 +3352,8 @@ class AppBridge(QObject):
         worker.signals.failed.connect(failed)
         self._thread_pool.start(worker)
 
-    def _render_preview_impl(self, start_seconds: float = 0.0, frame_index: int = 1) -> None:
+    def _render_preview_impl(self, start_seconds: float = 0.0, frame_index: int = 1,
+                             *, clip_seconds: float | None = None) -> None:
         if not self.canPreview:
             self._status_message = "Preview is unavailable while another operation is active."
             self.statusMessageChanged.emit()
@@ -3293,7 +3432,6 @@ class AppBridge(QObject):
                 def task(controller=None, progress=None):
                     return render_image_preview(
                         source, opts, controller=controller, progress=progress,
-                        full_size_preview=settings.full_size_image_previews,
                     )
                 result_kind = "image"
             elif context_key == "upscale-image":
@@ -3302,7 +3440,6 @@ class AppBridge(QObject):
                 def task(controller=None, progress=None):
                     return preview_upscale_image(
                         source, opts, controller=controller, progress=progress,
-                        full_size_preview=settings.full_size_image_previews,
                     )
                 result_kind = "image"
             elif context_key == "nr-video":
@@ -3343,10 +3480,11 @@ class AppBridge(QObject):
                 opts.validate(for_render=True)
                 def task(controller=None, progress=None):
                     return preview_upscale_native(
-                        source, opts, one_frame=True, progress=progress,
+                        source, opts, one_frame=clip_seconds is None, progress=progress,
                         controller=controller, output_dir=self._preview_cache,
                         preview_encoding=settings.preview_encoding,
                         start_seconds=start_seconds, frame_index=frame_index,
+                        preview_seconds=clip_seconds,
                     )
                 result_kind = "video"
             elif context_key == "fi-video":
@@ -3421,10 +3559,15 @@ class AppBridge(QObject):
                     except (TypeError, ValueError):
                         ctx.preview_source_frame = 0
                     if context_key == "fi-video":
-                        # Successful preview render: paint its span green on
-                        # the FI timeline (clamped to the source duration).
-                        self._add_fi_rendered_range(context_key, start_seconds, str(media),
-                                                    self._fi_preview_length_seconds())
+                        # Successful clip: paint its span green, clamped to
+                        # the source duration.
+                        self._add_rendered_range(context_key, start_seconds, str(media),
+                                                 self._fi_preview_length_seconds())
+                    elif context_key == "upscale-video":
+                        if clip_seconds is not None:
+                            self._add_rendered_range(context_key, start_seconds, str(media), clip_seconds)
+                        else:
+                            self._clear_rendered_ranges(context_key)
                     if start_seconds > 0.05 and _total > 0:
                         ctx.output_info = f"Preview f{frame_index}/{_total} @ {start_seconds:.2f}s | {Path(str(media)).name}"
                     elif start_seconds > 0.05:
@@ -3760,10 +3903,12 @@ class AppBridge(QObject):
         if self._shutting_down:
             return
         self._shutting_down = True
+        app_log.info("shutdown", "begin")
         self._operation_state = SHUTTING_DOWN
         self.operationStateChanged.emit()
         self.isProcessingChanged.emit()
         self._save_timer.stop()
+        self._sweep_timer.stop()
         self._auto_preview_timer.stop()
         self._auto_preview_pending = False
         self._scrub_preview_timer.stop()
@@ -3779,21 +3924,24 @@ class AppBridge(QObject):
                 except Exception:
                     pass
         self._live_timer.stop()
-        try:
-            self._thread_pool.waitForDone(5000)
-        except Exception:
-            pass
+        # Jobs own Qt signal objects and may still be inside native GPU code.
+        # A timed wait can return with a live QRunnable; destroying QML/Qt at
+        # that point leaves those objects and their callbacks without an owner.
+        if not self._thread_pool.waitForDone(5000):
+            app_log.info("shutdown", "workers still active after 5s; waiting for completion")
+            self._thread_pool.waitForDone()
         # The start worker may have published a LiveSession while shutdown was
         # waiting for workers. Stop after synchronization so no session escapes.
         if is_live_running():
             try:
-                stop_live_session()
+                stop_live_session(timeout=None)
             except Exception as exc:
                 self._log(f"Live shutdown warning: {exc}")
         try:
             self._mpv_embed.shutdown()
         except Exception:
             pass
+        self._main_window = None
         try:
             app_log.remove_listener(self._backend_log_listener)
         except Exception:
@@ -3803,6 +3951,7 @@ class AppBridge(QObject):
                 shutil.rmtree(self._preview_cache, ignore_errors=True)
         except OSError:
             pass
+        app_log.info("shutdown", "complete")
 
     # =========================================================================
     # Helpers

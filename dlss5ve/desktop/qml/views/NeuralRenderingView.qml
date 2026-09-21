@@ -251,21 +251,6 @@ model: appBridge ? appBridge.nrScaleChoices : []
                                         onValueModified: (v) => { if (appBridge) appBridge.imageQuality = Math.round(v) }
                                     }
 
-                                    AppSegmentedControl {
-                                        width: parent.width
-                                        label: "Rename Mode"
-                                        model: appBridge ? appBridge.renameModeChoices : []
-                                        currentValue: appBridge ? appBridge.imageRenameMode : "Auto"
-                                        onActivated: (v) => { if (appBridge) appBridge.imageRenameMode = v }
-                                    }
-
-                                    AppTextField {
-                                        visible: appBridge && appBridge.imageRenameMode === "Custom"
-                                        width: parent.width
-                                        label: "Custom Suffix"
-                                        text: appBridge ? appBridge.imageCustomSuffix : "_Neural_Rendering"
-                                        onTextEdited: (t) => { if (appBridge) appBridge.imageCustomSuffix = t }
-                                    }
                                 }
 
                                 // VIDEO SPECIFIC
@@ -293,9 +278,17 @@ model: appBridge ? appBridge.nrScaleChoices : []
                                     AppComboBox {
                                         width: parent.width
                                         label: "Encoding Quality"
+                                        visible: !appBridge || appBridge.fixedQualityCodecs.indexOf(appBridge.videoCodec) < 0
                                         model: appBridge ? appBridge.encodingQualityChoices : []
                                         currentValue: appBridge ? appBridge.videoQuality : "Auto (Default)"
                                         onActivated: (v) => { if (appBridge) appBridge.videoQuality = v }
+                                    }
+
+                                    Text {
+                                        visible: appBridge && appBridge.fixedQualityCodecs.indexOf(appBridge.videoCodec) >= 0
+                                        text: "Encoding Quality: Fixed by codec"
+                                        color: Theme.textSecondary
+                                        font.pixelSize: Theme.fontSizeSmall
                                     }
 
                                     AppCheckBox {
@@ -304,21 +297,6 @@ model: appBridge ? appBridge.nrScaleChoices : []
                                         onToggled: (c) => { if (appBridge) appBridge.videoHdrMode = c }
                                     }
 
-                                    AppSegmentedControl {
-                                        width: parent.width
-                                        label: "Rename Mode"
-                                        model: appBridge ? appBridge.renameModeChoices : []
-                                        currentValue: appBridge ? appBridge.videoRenameMode : "Auto"
-                                        onActivated: (v) => { if (appBridge) appBridge.videoRenameMode = v }
-                                    }
-
-                                    AppTextField {
-                                        visible: appBridge && appBridge.videoRenameMode === "Custom"
-                                        width: parent.width
-                                        label: "Custom Suffix"
-                                        text: appBridge ? appBridge.videoCustomSuffix : "_Neural_Rendering"
-                                        onTextEdited: (t) => { if (appBridge) appBridge.videoCustomSuffix = t }
-                                    }
                                 }
                             }
                         }
@@ -329,7 +307,7 @@ model: appBridge ? appBridge.nrScaleChoices : []
                 Rectangle {
                     id: actionBar
                     width: parent.width
-                    height: 54
+                    height: 88
                     color: Theme.bgSurface
                     border.color: Theme.borderSubtle
                     border.width: 1
@@ -337,7 +315,7 @@ model: appBridge ? appBridge.nrScaleChoices : []
                     Column {
                         anchors.fill: parent
                         anchors.margins: 8
-                        spacing: 4
+                        spacing: 6
 
                         Row {
                             width: parent.width
@@ -345,8 +323,9 @@ model: appBridge ? appBridge.nrScaleChoices : []
 
                             AppButton {
                                 text: "Preview"
-                                width: 90
-                                buttonHeight: 34
+                                iconName: "preview"
+                                width: (parent.width - 16) / 3
+                                buttonHeight: 30
                                 enabled: appBridge ? appBridge.canPreview : false
                                 onClicked: {
                                     if (appBridge) appBridge.renderPreviewAt(viewport.playheadMs)
@@ -354,34 +333,37 @@ model: appBridge ? appBridge.nrScaleChoices : []
                             }
 
                             AppButton {
-                                text: appBridge && appBridge.canStop ? "Stop" : (root.isImage ? "Render Image(s)" : "Render Video(s)")
-                                variant: appBridge && appBridge.canStop ? "danger" : "primary"
-                                width: parent.width - 294
-                                buttonHeight: 34
-                                enabled: appBridge ? (appBridge.canStop || appBridge.canRender) : false
-                                onClicked: {
-                                    if (appBridge) {
-                                        if (appBridge.canStop) {
-                                            appBridge.stopActiveBatch()
-                                        } else if (appBridge.canRender) {
-                                            appBridge.startActiveBatch()
-                                        }
-                                    }
-                                }
-                            }
-
-                            AppButton {
                                 text: "Reset"
-                                width: 90
-                                buttonHeight: 34
+                                iconName: "reset"
+                                width: (parent.width - 16) / 3
+                                buttonHeight: 30
                                 onClicked: { if (appBridge) appBridge.resetTabSettings("neural-rendering") }
                             }
 
                             AppButton {
                                 text: "Outputs"
-                                width: 90
-                                buttonHeight: 34
+                                iconName: "outputs_folder"
+                                width: (parent.width - 16) / 3
+                                buttonHeight: 30
                                 onClicked: { if (appBridge) appBridge.openFolder("") }
+                            }
+                        }
+
+                        AppButton {
+                            text: appBridge && appBridge.canStop ? "Stop" : (root.isImage ? "Render Image(s)" : "Render Video(s)")
+                            iconName: appBridge && appBridge.canStop ? "stop" : "start_render"
+                            variant: appBridge && appBridge.canStop ? "danger" : "primary"
+                            width: parent.width
+                            buttonHeight: 34
+                            enabled: appBridge ? (appBridge.canStop || (appBridge.operationState === "Idle" && appBridge.runtimeState === "Ready" && !appBridge.isLiveRunning)) : false
+                            onClicked: {
+                                if (appBridge) {
+                                    if (appBridge.canStop) {
+                                        appBridge.stopActiveBatch()
+                                    } else {
+                                        appBridge.requestActiveBatchExport()
+                                    }
+                                }
                             }
                         }
                     }

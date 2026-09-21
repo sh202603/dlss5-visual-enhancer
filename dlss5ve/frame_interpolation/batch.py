@@ -20,6 +20,7 @@ def interpolate_videos(
     *, output_dir: str | os.PathLike[str] | None = None,
     controller: JobController | None = None,
     on_item_update: Callable[[BatchItemUpdate], None] | None = None,
+    same_as_input: bool = False,
 ) -> FrameInterpolationBatchResult:
     options = replace(options) if options else FrameInterpolationOptions()
     paths = [Path(path).resolve() for path in input_paths]
@@ -29,7 +30,7 @@ def interpolate_videos(
     reporter = BatchProgress(paths, on_item_update, progress)
     successes, failures = [], []
     try:
-        destination = prepare_output_dir(output_dir, default=processor.OUTPUTS)
+        destination = None if same_as_input else prepare_output_dir(output_dir, default=processor.OUTPUTS)
         with active_job(controller):
             processor._BATCH_CONTEXT.controller = controller
             try:
@@ -40,7 +41,7 @@ def interpolate_videos(
                     try:
                         result = processor.interpolate_video(
                             path, options, lambda value, message, i=index: reporter.advance(i, value, message),
-                            output_dir=destination,
+                            output_dir=prepare_output_dir(path.parent) if same_as_input else destination,
                         )
                     except Exception as exc:
                         cancelled = isinstance(exc, Cancelled) or controller.cancel.is_set()

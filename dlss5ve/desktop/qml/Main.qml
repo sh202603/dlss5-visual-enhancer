@@ -14,10 +14,7 @@ Window {
     y: typeof backend !== "undefined" && backend && backend.windowY >= 0 ? Math.max(0, Math.min(Screen.height - height, backend.windowY)) : Math.max(0, (Screen.height - height) / 2)
     minimumWidth: 1080
     minimumHeight: 700
-    // Start windowed; the saved maximized state is applied natively in
-    // onCompleted (the OS filter supplies a real frame, so maximized fills
-    // the work area with no transparent insets).
-    visibility: Window.Windowed
+    // Python reveals the fully prepared window in its saved state.
     flags: Qt.Window | Qt.FramelessWindowHint
     title: "Visual Enhancer"
     color: Theme.bgBase
@@ -32,16 +29,6 @@ Window {
     property rect closeBtnRect: Qt.rect(0, 0, 0, 0)
     property rect navTabsRect: Qt.rect(0, 0, 0, 0)
     property bool chromeRectsReady: false
-
-    Component.onCompleted: {
-        // Native maximize is safe again: the OS filter supplies a real frame
-        // behind the frameless visuals (exact work-area geometry, no
-        // transparent insets). F11 toggles true fullscreen on demand.
-        Qt.callLater(function() {
-            if (typeof backend !== "undefined" && backend && backend.windowMaximized) appWindow.showMaximized()
-            else appWindow.showNormal()
-        })
-    }
 
     function saveWindowLayout() {
         if (typeof backend !== "undefined" && backend)
@@ -198,6 +185,17 @@ Window {
                 SettingsView { appBridge: typeof backend !== "undefined" ? backend : null }
                 AboutView { appBridge: typeof backend !== "undefined" ? backend : null }
             }
+        }
+    }
+
+    ExportDialog {
+        id: exportDialog
+        appBridge: typeof backend !== "undefined" ? backend : null
+    }
+    Connections {
+        target: typeof backend !== "undefined" ? backend : null
+        function onBatchExportRequested(contextKey) {
+            exportDialog.openForContext(contextKey)
         }
     }
 

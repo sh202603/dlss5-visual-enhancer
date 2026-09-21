@@ -2,14 +2,66 @@ from __future__ import annotations
 
 import threading
 from collections import OrderedDict
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
+import re
 
 import numpy as np
 from PIL import Image
-from PySide6.QtCore import QSize
-from PySide6.QtGui import QImage
+from PySide6.QtCore import QSize, Qt
+from PySide6.QtGui import QColor, QImage, QPainter
 from PySide6.QtQuick import QQuickImageProvider
+
+
+class IconImageProvider(QQuickImageProvider):
+    """Tint the authored PNG alpha without a scene-graph shader effect."""
+
+    _sizes = frozenset((16, 20, 24, 32, 48, 64, 128, 256))
+    _name_pattern = re.compile(r"[a-z0-9_]+\Z")
+    _asset_root = Path(__file__).resolve().parent / "qml" / "assets" / "icons" / "png"
+
+    def __init__(self) -> None:
+        super().__init__(QQuickImageProvider.ImageType.Image)
+
+    @classmethod
+    @lru_cache(maxsize=512)
+    def _tinted(cls, px: int, name: str, color_hex: str) -> QImage:
+        if px not in cls._sizes or not cls._name_pattern.fullmatch(name):
+            return QImage()
+        color = QColor("#" + color_hex)
+        if not color.isValid():
+            return QImage()
+        path = cls._asset_root / str(px) / f"{name}.png"
+        image = QImage(str(path))
+        if image.isNull():
+            return image
+        image = image.convertToFormat(QImage.Format.Format_ARGB32_Premultiplied)
+        painter = QPainter(image)
+        painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceIn)
+        painter.fillRect(image.rect(), color)
+        painter.end()
+        return image
+
+    def requestImage(self, image_id: str, size: QSize, requested_size: QSize) -> QImage:
+        try:
+            px_str, name, color_hex = image_id.split("/", 2)
+            image = self._tinted(int(px_str), name, color_hex)
+        except (ValueError, TypeError):
+            image = QImage()
+        if image.isNull():
+            return image
+        size.setWidth(image.width())
+        size.setHeight(image.height())
+        if requested_size.isValid() and requested_size.width() > 0 and requested_size.height() > 0:
+            if requested_size == image.size():
+                return image
+            return image.scaled(
+                requested_size,
+                Qt.AspectRatioMode.IgnoreAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+        return image
 
 
 class PreviewImageProvider(QQuickImageProvider):

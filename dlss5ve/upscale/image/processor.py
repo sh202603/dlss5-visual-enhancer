@@ -13,10 +13,10 @@ from ..video.native import RTXVideoSession, probe_capabilities
 from ...core import app_log
 from ...core.disk_paths import OutputFile, prepare_output_dir
 from ...core.jobs import Cancelled, active_job
-from ...core.naming import output_filename
+from ...core.naming import output_filename, unique_output_path
 from ...neural_rendering.image.decoder import decode_image
 from ...neural_rendering.image.encoder import (
-    _encode_image, make_image_preview, save_full_size_image_preview,
+    _encode_image, save_full_size_image_preview,
 )
 from ...neural_rendering.image.models import ImageConversionOptions
 from .models import IMAGE_EXTENSIONS, ImageUpscaleOptions, ImageUpscaleResult, output_size
@@ -46,7 +46,7 @@ def worker_to_srgb(data, width, height, alpha):
     return rgba
 
 
-def preview_upscale_image(input_path, options=None, progress=None, *, controller=None, full_size_preview=False):
+def preview_upscale_image(input_path, options=None, progress=None, *, controller=None):
     """Run the real RTX VSR still-image path without publishing output/report files."""
     options = replace(options) if options else ImageUpscaleOptions()
     options.validate()
@@ -82,14 +82,9 @@ def preview_upscale_image(input_path, options=None, progress=None, *, controller
             last_results = tuple(session.last_results)
 
         update(.88, "Preparing preview")
-        if full_size_preview:
-            preview = save_full_size_image_preview(
-                processed, options.output_format, decoded.alpha is not None
-            )
-        else:
-            preview = make_image_preview(
-                processed, options.output_format, decoded.alpha is not None
-            )
+        preview = save_full_size_image_preview(
+            processed, options.output_format, decoded.alpha is not None
+        )
         elapsed = time.monotonic() - started
         gpu_name = str(caps.gpu.get("name") or caps.gpu.get("display_name") or "NVIDIA GPU")
         status = (
@@ -136,9 +131,9 @@ def _process(source, options, progress, output_dir, controller, generate_preview
         height, width = decoded.rgba.shape[:2]
         ow, oh = output_size(width, height, options)
         caps = capabilities or probe_capabilities(options.ai_gpu_uuid, controller=controller)
-        output = prepare_output_dir(output_dir) / output_filename(
+        output = unique_output_path(prepare_output_dir(output_dir) / output_filename(
             source, IMAGE_EXTENSIONS[options.output_format], options.rename_mode, options.custom_suffix,
-            f"{source.stem}_RTXIMAGE_{stamp}")
+            f"{source.stem}_RTXIMAGE_{stamp}"))
         destination_file = OutputFile(output)
         update(.15, "Processing with RTX VSR")
         key = (width, height, ow, oh, int(options.vsr_quality), str(caps.gpu.get("uuid", "")))

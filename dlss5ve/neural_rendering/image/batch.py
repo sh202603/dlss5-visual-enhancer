@@ -16,7 +16,7 @@ from ...core.disk_paths import OutputFile, prepare_output_dir
 from ...core.gpu_selection import resolve_runtime_ai_gpu
 from ...core.jobs import Cancelled, JobController, active_job
 from ...core.render_metadata import prepare_render_note
-from ...core.naming import output_filename, validate_rename
+from ...core.naming import output_filename, unique_output_path, validate_rename
 from ...core.paths import OUTPUTS
 from ...core.runtime import (
     DLSSFrameSession, prepare_runtime, resize_fit, resolve_native_settings,
@@ -204,6 +204,7 @@ def convert_images(
     controller: JobController | None = None,
     on_item_update: Callable[[BatchItemUpdate], None] | None = None,
     generate_previews: bool = True, create_zip: bool = True,
+    same_as_input: bool = False,
 ) -> ImageBatchResult:
     options = _validate_options(replace(options) if options else ImageConversionOptions())
     paths = [Path(path).resolve() for path in input_paths]
@@ -216,13 +217,14 @@ def convert_images(
     session: DLSSFrameSession | None = None
     stamp = time.strftime("%Y%m%d-%H%M%S") + f"-{time.time_ns() % 1_000_000:06d}"
     archive: IncrementalImageArchive | None = None
-    pending: tuple[int, Path, Future[ImageConversionResult]] | None = None
+    pending: tuple[int, Path, Path, Future[ImageConversionResult]] | None = None
+    reserved_outputs: set[Path] = set()
 
     def collect_pending() -> None:
         nonlocal pending
         if pending is None:
             return
-        index, path, future = pending
+        index, path, output, future = pending
         pending = None
         try:
             result = future.result()
@@ -236,9 +238,11 @@ def convert_images(
             # Output tasks are submitted in input order and only one may be
             # outstanding, so appending here preserves stable result ordering.
             successes.append(result)
+        finally:
+            reserved_outputs.discard(output)
 
     try:
-        destination = prepare_output_dir(output_dir, default=OUTPUTS)
+        destination = prepare_output_dir(output_dir, default=OUTPUTS) if not same_as_input or create_zip else None
         if create_zip:
             archive = IncrementalImageArchive(
                 destination / f"DLSS5_IMAGE_BATCH_{stamp}.zip", controller,
@@ -263,10 +267,11 @@ def convert_images(
                     if controller.cancel.is_set():
                         break
                     reporter.advance(index, 0.0, "Decoding image")
-                    output = _output_path(
+                    item_destination = prepare_output_dir(path.parent) if same_as_input else destination
+                    output = unique_output_path(_output_path(
                         path, options.output_format, stamp, index,
-                        options.rename_mode, options.custom_suffix, output_dir=destination,
-                    )
+                        options.rename_mode, options.custom_suffix, output_dir=item_destination,
+                    ), reserved_outputs)
                     decoded = None
                     render_rgba = None
                     processed = None
@@ -413,11 +418,13 @@ def convert_images(
                         pending = (
                             index,
                             path,
+                            output,
                             output_worker.submit(
                                 _finalize_output, task, options, reporter, controller,
                                 generate_previews, archive,
                             ),
                         )
+                        reserved_outputs.add(output)
                         # Ownership of the full output moves to the worker.
                         processed = None
                     except Exception as exc:

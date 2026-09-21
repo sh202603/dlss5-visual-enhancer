@@ -22,7 +22,7 @@ def convert_videos(
     *, output_dir: str | os.PathLike[str] | None = None,
     controller: JobController | None = None,
     on_item_update: Callable[[BatchItemUpdate], None] | None = None,
-    create_archive: bool = False,
+    create_archive: bool = False, same_as_input: bool = False,
 ) -> VideoBatchResult:
     """Render in input order, publishing a completed row before starting the next file."""
     options = replace(options) if options else ConversionOptions()
@@ -37,7 +37,7 @@ def convert_videos(
     archive_error = ""
     stamp = time.strftime("%Y%m%d-%H%M%S") + f"-{time.time_ns() % 1_000_000:06d}"
     try:
-        destination = prepare_output_dir(output_dir, default=processor.OUTPUTS)
+        destination = prepare_output_dir(output_dir, default=processor.OUTPUTS) if not same_as_input or create_archive else None
         if create_archive and len(paths) > 1:
             archive = StreamingMediaArchive(
                 destination, "DLSS5_VIDEO_BATCH", controller=controller
@@ -56,7 +56,7 @@ def convert_videos(
                     try:
                         result = processor.convert_video(
                             path, options, lambda value, message, i=index: reporter.advance(i, value, message),
-                            output_dir=destination,
+                            output_dir=prepare_output_dir(path.parent) if same_as_input else destination,
                         )
                     except Exception as exc:
                         cancelled = isinstance(exc, Cancelled) or controller.cancel.is_set()
@@ -91,7 +91,7 @@ def convert_videos(
             diagnostics["archive_error"] = archive_error
         manifest = _write_video_batch_manifest(
             stamp, options, successes, failures, cancelled,
-            batch_diagnostics=diagnostics, output_dir=str(destination)
+            batch_diagnostics=diagnostics, output_dir=str(destination) if destination else None
         )
         reporter.finish(cancelled=cancelled, manifest_path=manifest)
         return VideoBatchResult(

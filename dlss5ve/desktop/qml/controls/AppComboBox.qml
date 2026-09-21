@@ -1,5 +1,6 @@
 import QtQuick
 import QtQuick.Controls as QQC2
+import QtQuick.Controls.Basic as Basic
 import ".."
 
 Item {
@@ -74,7 +75,7 @@ Item {
             text: control.displayText(); font.family: Theme.fontFamily; font.pixelSize: Theme.fontSizeLabel
             color: control.currentIndex >= 0 ? Theme.textPrimary : Theme.warning
         }
-        Text { id: arrow; anchors.right: parent.right; anchors.rightMargin: 10; anchors.verticalCenter: parent.verticalCenter; text: popup.visible ? "^" : "v"; color: Theme.textMuted }
+        AppIcon { id: arrow; anchors.right: parent.right; anchors.rightMargin: 10; anchors.verticalCenter: parent.verticalCenter; iconName: popup.visible ? "chevron_up" : "chevron_down"; iconSize: 12; color: Theme.textMuted }
         MouseArea {
             id: mouseArea; anchors.fill: parent; hoverEnabled: control.enabled
             cursorShape: control.enabled ? Qt.PointingHandCursor : Qt.ArrowCursor
@@ -90,7 +91,11 @@ Item {
         closePolicy: QQC2.Popup.CloseOnEscape | QQC2.Popup.CloseOnPressOutside
         background: Rectangle { radius: Theme.radiusMedium; color: Theme.bgSurface; border.color: Theme.borderActive; border.width: 1 }
         contentItem: ListView {
-            id: listView; clip: true; model: control.model; boundsBehavior: Flickable.StopAtBounds
+            id: listView
+            property bool hasOverflow: contentHeight > height + 0.5
+            clip: true
+            model: control.model
+            boundsBehavior: Flickable.StopAtBounds
             delegate: Rectangle {
                 required property var modelData
                 required property int index
@@ -102,10 +107,45 @@ Item {
                     font.family: Theme.fontFamily; font.pixelSize: Theme.fontSizeLabel
                     color: control.currentIndex === index ? Theme.accent : Theme.textSecondary
                 }
-                Text { id: check; anchors.right: parent.right; anchors.rightMargin: 8; anchors.verticalCenter: parent.verticalCenter; visible: control.currentIndex === index; text: "X"; color: Theme.accent }
+                AppIcon {
+                    id: check
+                    anchors.right: parent.right
+                    anchors.rightMargin: listView.hasOverflow ? verticalScrollBar.width + 8 : 8
+                    anchors.verticalCenter: parent.verticalCenter
+                    visible: control.currentIndex === index
+                    iconName: "check"
+                    iconSize: 14
+                    color: Theme.accent
+                }
                 MouseArea {
                     id: itemMouse; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor
                     onClicked: { control.activated(control.getValue(modelData), index); popup.close(); control.forceActiveFocus() }
+                }
+            }
+
+            QQC2.ScrollBar.vertical: Basic.ScrollBar {
+                id: verticalScrollBar
+                width: 10
+                padding: 2
+                policy: QQC2.ScrollBar.AlwaysOn
+                visible: listView.hasOverflow
+                active: visible
+                interactive: true
+
+                background: Rectangle {
+                    implicitWidth: 8
+                    radius: width / 2
+                    color: Theme.bgInput
+                    opacity: 0.8
+                }
+
+                contentItem: Rectangle {
+                    implicitWidth: 6
+                    radius: width / 2
+                    color: verticalScrollBar.pressed ? Theme.accent
+                                                     : (verticalScrollBar.hovered ? Theme.textSecondary
+                                                                                  : Theme.textMuted)
+                    opacity: verticalScrollBar.pressed || verticalScrollBar.hovered ? 1.0 : 0.85
                 }
             }
         }

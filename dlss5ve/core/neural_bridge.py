@@ -635,6 +635,12 @@ class NeuralBridgeManager:
     def version(self) -> str:
         return self._version
 
+    def preload(self) -> str:
+        """Load and validate the bridge DLL without binding an adapter."""
+        with self._lock:
+            self._load()
+            return self._version
+
     @property
     def gpu_name(self) -> str:
         return self._gpu_name

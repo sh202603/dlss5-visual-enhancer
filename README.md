@@ -4,7 +4,7 @@
 
 **Visual Enhancer** is a portable Windows application for AI-assisted image and video enhancement on NVIDIA RTX GPUs. It uses **NVIDIA DLSS 5 Neural Rendering** through the **Neuroframe Engine** for image and video processing, **NVIDIA DLSS Frame Generation** for video frame interpolation, and **NVIDIA RTX Video Super Resolution** and **RTX Video HDR** for dedicated upscale workflows. Live mode brings DLSS 5 Neural Rendering to local videos and supported online streams during playback.
 
-<img width="3840" height="2160" alt="Main Cover" src="https://github.com/user-attachments/assets/9354a287-2d21-4dee-9ca6-3d1cf2c69888" />
+<img width="1920" height="1080" alt="Main Cover_v2" src="https://github.com/user-attachments/assets/9248c946-391e-408c-b146-f7d8a6e9c695" />
 
 ## Installation
 
@@ -38,7 +38,7 @@ https://github.com/user-attachments/assets/81c29005-e4f0-4acf-b9f7-d58850bb055f
 - **Custom NR Mask:** use an image mask to control where Neural Rendering is applied. The selected mask is also available to Live during the current application session.
 - **Shimmer Suppression:** helps stabilize fine detail between frames in Video and Live processing.
 - **Processing scale:** process at Source, 125%, 150%, 175%, 200%, 75%, 50%, or 25% of the source dimensions. This is separate from RTX Video Super Resolution.
-- **HDR preservation:** supported video workflows can preserve 10-bit HDR with H.265, AV1, or ProRes Proxy output.
+- **HDR preservation:** supported video workflows can preserve 10-bit HDR with H.265, AV1, ProRes Proxy, ProRes HQ, or FFV1 Lossless RGB 10-bit output.
 
 ### RTX Video Upscale
 
@@ -47,7 +47,7 @@ https://github.com/user-attachments/assets/81c29005-e4f0-4acf-b9f7-d58850bb055f
 - **NVIDIA RTX Video HDR:** convert SDR video to HDR with adjustable contrast, saturation, middle gray, peak luminance, and processing precision.
 - **Combined processing:** RTX Video Super Resolution and RTX Video HDR can be used together, or RTX Video HDR can be used by itself.
 - **Image output:** PNG, JPEG, WebP, AVIF, and TIFF with quality, metadata, and naming controls.
-- **Video output:** H.264, H.265, AV1, and ProRes Proxy, with NVIDIA NVENC options where available.
+- **Video output:** H.264, H.265, AV1, ProRes Proxy, ProRes HQ, and FFV1 Lossless RGB 10-bit, with NVIDIA NVENC options where available.
 
 ### DLSS Frame Generation
 
@@ -55,26 +55,28 @@ https://github.com/user-attachments/assets/81c29005-e4f0-4acf-b9f7-d58850bb055f
 - **Target frame rates:** choose from 23.976 up to 480 FPS, including common cinema, broadcast, and high-refresh rates.
 - **DLSSG modes:** **Auto**, **Native DLSSG**, and **Cascade** provide flexible interpolation for different source and target frame rates.
 - **Preview clips:** render 3, 5, 10, 20, or 30 seconds from the current playhead before starting a full render.
-- **HDR preservation:** 10-bit HDR output is supported with H.265, AV1, and ProRes Proxy.
+- **HDR preservation:** 10-bit HDR output is supported with H.265, AV1, ProRes Proxy, ProRes HQ, and FFV1 Lossless RGB 10-bit.
 
 ### Live
 
 - **Local and online playback:** apply DLSS 5 Neural Rendering while watching local videos, direct network streams, YouTube, and Twitch sources.
 - **Integrated playback:** pause or resume playback, control volume and mute, expand the player, or enter fullscreen without leaving the Live workflow.
-- **Live quality controls:** choose source quality, maximum input resolution from 480p to 2160p, 1/2/4-second segments, Auto/Source/60/30/24 FPS modes, and a 2–30 second playback buffer.
+- **Live quality controls:** choose source quality, maximum input resolution from 480p to 2160p, 1/2/4-second segments, Auto/Source/60/30/24 FPS modes, a 2–30 second playback buffer, and an independent Live Scale with Source, 125%, 150%, 175%, 200%, 75%, 50%, and 25% options.
 - **Independent Live tuning:** Live keeps its own Neural Rendering settings, so Live adjustments do not overwrite the main Neural Rendering settings. The custom NR mask remains shared for the current session.
-- **Dynamic updates:** most Neural Rendering controls can be changed while Live is running. Source, scale, quality, frame-rate, segment, and buffer changes apply the next time Live starts.
+- **Dynamic updates:** most Neural Rendering controls can be changed while Live is running. Source selection, Live Scale, source quality, maximum input resolution, target FPS, segment duration, and playback buffer changes apply the next time Live starts.
 - **Performance information:** view processing and playback status while Live is running.
 
 ### Workflow and preview
 
 - **Unified media viewer:** compare Input and Output with **Split**, **2-Up**, and **Output** views, fit images to the viewer, inspect them at 100%, and scrub through video from a shared timeline.
-- **Realtime preview:** supported Neural Rendering and Upscale changes can refresh the current preview automatically. Video previews can follow the selected playhead position.
+- **Realtime preview:** supported Neural Rendering and Upscale changes can refresh the current preview automatically. Video previews can follow the selected playhead position; Frame Interpolation preview clips remain manual.
+- **Focus Preview:** hide the side panels to give the media viewer more space, using the viewer control, menu command, or `Ctrl+Shift+F`.
+- **Full-resolution image previews:** processed Neural Rendering and RTX Video image previews are retained at full output resolution for detailed inspection.
 - **Batch processing:** add multiple files or folders, drag and drop media, retry failed items, clear completed items, stop processing, and reveal completed files in Explorer.
-- **Clipboard images:** paste supported image content directly into image workflows.
+- **Clipboard media:** paste clipboard bitmap images, copied local files, or supported browser image URLs into compatible batch workflows; remote web images are downloaded before being added to the queue.
 - **Per-file progress:** each queue item shows its current state, progress, elapsed time, processing details, dimensions, and output path.
 - **GPU selection:** choose the GPU used for AI processing separately from the GPU used for NVIDIA NVENC video encoding.
-- **Automatic containers:** H.264 uses MP4, H.265 and AV1 use MKV, and ProRes Proxy uses MOV.
+- **Automatic containers:** H.264 uses MP4; H.265, AV1, and FFV1 Lossless RGB 10-bit use MKV; ProRes Proxy and ProRes HQ use MOV.
 - **Safe output handling:** completed files are kept, incomplete work is cleaned up when needed, and existing files are not silently overwritten.
 - **Media preservation:** supported workflows preserve useful source information such as rotation, timestamps, metadata, chapters, audio, and subtitles where possible.
 
@@ -85,7 +87,7 @@ Completed media is saved to `outputs/`. Logs and diagnostic reports are availabl
 | Type | Input | Output |
 | --- | --- | --- |
 | Images | Common image formats, HEIF/HEIC, SVG, TIFF, and many camera RAW formats | PNG, JPEG, WebP, AVIF, TIFF |
-| Video | MP4, MKV, MOV, AVI, WebM, M4V, TS/MTS/M2TS, MXF, VOB, WMV, FLV, MPG/MPEG and other supported video formats | H.264, H.265, AV1, ProRes Proxy |
+| Video | MP4, MKV, MOV, AVI, WebM, M4V, TS/MTS/M2TS, MXF, VOB, WMV, FLV, MPG/MPEG and other supported video formats | H.264, H.265, AV1, ProRes Proxy, ProRes HQ, FFV1 Lossless RGB 10-bit |
 | Live | Local video, direct network streams, YouTube, Twitch | Processed playback inside Visual Enhancer |
 
 Image processing applies EXIF orientation, handles supported color profiles, preserves supported metadata where possible, and keeps transparency except when saving to JPEG. Animated and multipage image sources use the first frame/page.
@@ -160,14 +162,14 @@ RTX Video Super Resolution can be used at **1×** to enhance an image without en
 | HDR middle gray | 10–100 | 50 |
 | HDR peak luminance | 400–2000 nits | 1000 nits |
 | HDR processing precision | Packed 10-bit, Packed 10-bit (FP16) | Packed 10-bit |
-| Video codec | H.264, H.265, AV1, ProRes Proxy; CPU/NVIDIA NVENC variants where available | H.265 (NVIDIA NVENC) |
+| Video codec | H.264, H.265, AV1, ProRes Proxy, ProRes HQ, FFV1 Lossless RGB 10-bit; CPU/NVIDIA NVENC variants where available | H.265 (NVIDIA NVENC) |
 | Container | Selected automatically from the codec | MKV |
-| Encoding quality | Auto (Default), Good, Best, Max | Auto (Default) |
+| Encoding quality | Auto (Default), Good, Best, Max; ProRes HQ and FFV1 use codec-fixed quality | Auto (Default) |
 | Rename | Auto, Copy, Custom | Auto |
 
 RTX Video Super Resolution and RTX Video HDR can be used together. VSR can also be disabled for HDR-only processing, but at least one RTX Video effect must be enabled.
 
-RTX Video HDR accepts SDR source video and creates HDR output. Existing HDR input is not accepted by this workflow. HDR output requires H.265, AV1, or ProRes Proxy.
+RTX Video HDR accepts SDR source video and creates HDR output. Existing HDR input is not accepted by this workflow. HDR output requires H.265, AV1, ProRes Proxy, ProRes HQ, or FFV1 Lossless RGB 10-bit.
 
 ### Frame Interpolation
 
@@ -176,10 +178,10 @@ RTX Video HDR accepts SDR source video and creates HDR output. Existing HDR inpu
 | Output FPS | 23.976, 25, 29.97, 30, 50, 59.94, 60, 90, 119.88, 120, 144, 165, 180, 240, 360, 480 | 60 |
 | DLSS engine | Auto, Native DLSSG, Cascade | Auto |
 | Preview length | 3, 5, 10, 20, 30 seconds | 3 seconds |
-| Video codec | H.264, H.265, AV1, ProRes Proxy; CPU/NVIDIA NVENC variants where available | H.264 (NVIDIA NVENC) |
+| Video codec | H.264, H.265, AV1, ProRes Proxy, ProRes HQ, FFV1 Lossless RGB 10-bit; CPU/NVIDIA NVENC variants where available | H.264 (NVIDIA NVENC) |
 | Container | Selected automatically from the codec | MP4 |
-| Encoding quality | Auto (Default), Good, Best, Max | Auto (Default) |
-| Preserve 10-bit HDR | Off, On; H.265/AV1/ProRes only | Off |
+| Encoding quality | Auto (Default), Good, Best, Max; ProRes HQ and FFV1 use codec-fixed quality | Auto (Default) |
+| Preserve 10-bit HDR | Off, On; H.265, AV1, ProRes Proxy, ProRes HQ, and FFV1 Lossless RGB 10-bit | Off |
 | Rename | Auto, Copy, Custom | Auto |
 
 **Auto** selects the appropriate DLSS Frame Generation path for the requested source and output frame rates. If the selected output FPS is equal to or below the source frame rate, frames are resampled without generating additional frames.
@@ -194,9 +196,10 @@ RTX Video HDR accepts SDR source video and creates HDR output. Existing HDR inpu
 | Segment duration | 1, 2, 4 seconds | 2 seconds |
 | Target FPS | Auto, Source, 60, 30, 24 | Auto |
 | Playback buffer | 2–30 seconds | 6 seconds |
+| Live Scale | Source (Original), 125%, 150%, 175%, 200%, 75%, 50%, 25% | Source (Original) |
 | Neural Rendering controls | Independent Live copy of the Neural Rendering controls | Neural Rendering defaults |
 
-Most Live Neural Rendering controls can be changed while playback is active. Buffered frames keep their previous appearance until playback reaches newly processed frames. Scale, source, source quality, maximum input resolution, segment duration, target FPS, and playback buffer take effect on the next **Start Live**.
+Most Live Neural Rendering controls can be changed while playback is active. Buffered frames keep their previous appearance until playback reaches newly processed frames. Live Scale, source selection, source quality, maximum input resolution, segment duration, target FPS, and playback buffer take effect on the next **Start Live**.
 
 ### Video output and encoding
 
@@ -206,7 +209,9 @@ Most Live Neural Rendering controls can be changed while playback is active. Buf
 | H.265 | MKV; CPU or NVIDIA NVENC; supports 10-bit HDR mode |
 | AV1 | MKV; CPU or NVIDIA NVENC; supports 10-bit HDR mode |
 | ProRes Proxy | MOV; CPU-based 10-bit 4:2:2 output; supports HDR mode |
-| Encoding quality | Auto (Default), Good, Best, Max |
+| ProRes HQ | MOV; CPU-based 10-bit 4:2:2 output; supports HDR mode |
+| FFV1 Lossless RGB 10-bit | MKV; CPU-based lossless 10-bit RGB output; supports HDR mode |
+| Encoding quality | Auto (Default), Good, Best, Max; ProRes HQ and FFV1 use codec-fixed quality |
 | Rename | Auto creates a workflow-specific name; Copy keeps the source base name; Custom adds the selected suffix |
 
 Compatible workflows preserve metadata and chapters where supported. MKV can keep compatible audio and subtitle streams, while MP4/MOV use AAC audio. Supported text subtitles can be retained where the selected workflow allows it.
@@ -219,8 +224,8 @@ Compatible workflows preserve metadata and chapters where supported. MKV can kee
 | Video Processing GPU | Automatic or a detected NVIDIA GPU used for NVIDIA NVENC/NVDEC work | Automatic |
 | Preview Encoding Strategy | Auto, Always H.264, Disabled | Auto |
 | Realtime Preview | Off, On; Neural Rendering and Upscale | On |
-| Full-size quality preview | Off, On; keeps full-resolution image previews where supported | On |
-| Settings preset | Export or import adjustable application settings as JSON | n/a |
+| Settings preset | Export or import adjustable application settings as versioned JSON; custom NR mask is not included | n/a |
+| Factory reset | Restores processing, GPU, mask, and encoding settings to defaults; window geometry is kept | n/a |
 
 Saved GPU selections follow the selected GPU identity. If that GPU is no longer available, the setting returns to Automatic. Compatible older settings presets can be imported and migrated automatically.
 

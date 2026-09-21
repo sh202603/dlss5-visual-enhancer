@@ -21,7 +21,7 @@ _LABELS = (
     "GPU Memory Path", "Scale",
 )
 _NUMBER = r"-?\d+(?:\.\d+)?(?:e[+-]?\d+)?"
-_SCALE_VALUE = r"(?:Source|200%|175%|150%|125%|75%|50%|25%)"
+_SCALE_VALUE = r"(?:Source(?: \(Original\))?|200%|175%|150%|125%|75%|50%|25%)"
 _VALUES = (
     r"(?:Default|Natural|Cinematic)",
     _NUMBER, r"[1-4]", _NUMBER, _NUMBER,

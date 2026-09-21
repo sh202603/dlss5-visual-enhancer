@@ -13,7 +13,7 @@ from .processor import upscale_image
 
 
 def upscale_images(input_paths, options=None, progress=None, *, output_dir=None, controller=None,
-                   on_item_update=None, generate_previews=True):
+                   on_item_update=None, generate_previews=True, same_as_input=False):
     options = replace(options) if options else ImageUpscaleOptions()
     options.validate()
     paths = [Path(p).resolve() for p in input_paths]
@@ -24,7 +24,7 @@ def upscale_images(input_paths, options=None, progress=None, *, output_dir=None,
     successes, failures = [], []
     session_cache = {}
     try:
-        destination = prepare_output_dir(output_dir)
+        destination = None if same_as_input else prepare_output_dir(output_dir)
         with active_job(controller):
             if controller.cancel.is_set():
                 raise Cancelled("Stopped before rendering.")
@@ -35,7 +35,8 @@ def upscale_images(input_paths, options=None, progress=None, *, output_dir=None,
                 reporter.advance(i)
                 try:
                     result = upscale_image(path, options, lambda v, m, i=i: reporter.advance(i, v, m),
-                                           output_dir=destination, controller=controller, _owns_slot=True,
+                                           output_dir=prepare_output_dir(path.parent) if same_as_input else destination,
+                                           controller=controller, _owns_slot=True,
                                            _capabilities=caps, generate_previews=generate_previews,
                                            _session_cache=session_cache)
                 except Exception as exc:

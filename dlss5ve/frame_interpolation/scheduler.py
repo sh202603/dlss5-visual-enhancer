@@ -83,6 +83,11 @@ def choose_interpolation_plan(
         stages = 1
     elif ratio == 4:
         stages = 2
+    elif cfr and ratio == Fraction(5, 2):
+        # The 8x grid lands at 75% of a 24 FPS interval for some 60 FPS
+        # frames. A 16x grid can select 81.25%, closer to the target instant
+        # and to the current DLSSG frame at difficult motion boundaries.
+        stages = 4
     else:
         stages = 3
     grid = 1 << stages

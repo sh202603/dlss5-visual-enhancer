@@ -597,3 +597,19 @@ def install_win_chrome(window) -> bool:
     except Exception as exc:
         log_native_chrome(f"install failed: {exc!r}")
         return False
+
+
+def remove_win_chrome(window) -> None:
+    """Release the Python native filter while Qt and its window still exist."""
+    filt = getattr(window, "_win_frameless_filter", None)
+    if filt is None:
+        return
+    try:
+        app = QCoreApplication.instance()
+        if app is not None:
+            app.removeNativeEventFilter(filt)
+    finally:
+        # The filter references the window, and the window keeps the filter
+        # alive. Break that cycle even if unregistering raises.
+        window._win_frameless_filter = None  # type: ignore[attr-defined]
+        filt._window = None

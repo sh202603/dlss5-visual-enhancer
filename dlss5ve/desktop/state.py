@@ -64,7 +64,7 @@ class PreviewState:
     # rendering. Empty = stale (first visit, cleared queue, cancelled
     # render). Tab/mode switches skip the GPU re-render while this matches.
     last_auto_fingerprint: tuple = ()
-    # Frame Interpolation pre-rendered timeline ranges, newest last. Each
+    # Video preview clips rendered for FI or Upscale, newest last. Each
     # entry is {"start": seconds, "end": seconds, "url": clip file URL}.
     # Overlapping ranges are kept as separate entries (they merge visually
     # by overdraw); playback picks the newest range containing the playhead

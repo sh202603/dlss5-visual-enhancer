@@ -19,7 +19,7 @@ import numpy as np
 from ...core import app_log, ffmpeg
 from ...core.gpu_selection import resolve_runtime_ai_gpu
 from ...core.jobs import Cancelled, active_job
-from ...core.naming import output_filename, validate_rename
+from ...core.naming import output_filename, unique_output_path, validate_rename
 from ...core.disk_paths import OutputFile, prepare_output_dir
 from ...core.render_metadata import prepare_render_note
 from ...core.paths import JOBS, OUTPUTS
@@ -92,7 +92,7 @@ def convert_video(
         hdr_requested = False
     if hdr_requested and not ffmpeg.hdr_mode_supported(options.codec):
         raise ValueError(
-            f"HDR Mode is only available for H.265, H.265 (NVIDIA NVENC), AV1, AV1 (NVIDIA NVENC) and ProRes Proxy; "
+            f"HDR Mode is only available for a 10-bit or higher codec; "
             f"current codec is {options.codec!r}."
         )
     prepared_runtime = getattr(_BATCH_CONTEXT, "prepared_runtime", None)
@@ -222,13 +222,13 @@ def convert_video(
                     else "DLSS5_PREVIEW"
                 )
             )
-            output = destination / output_filename(
+            output = unique_output_path(destination / output_filename(
                 source,
                 extension,
                 options.rename_mode,
                 options.custom_suffix,
                 f"{source.stem}_{output_kind}_{stamp}",
-            )
+            ))
             output_file = OutputFile(output)
             temp_video = job_dir / (f"processed-video{extension}" if preview_frames is not None else "processed-video.mkv")
             # Host-memory path (CPU codec): stage explicitly, never CUDA.
@@ -241,6 +241,13 @@ def convert_video(
                 and preview_frames is None
                 and (preview_seconds is not None or video_duration > 0.0)
             )
+            audio_diagnostics: dict = {}
+            direct_audio_plan = (
+                ffmpeg.plan_audio_streams(source, options.container, controller)
+                if direct_mux else None
+            )
+            if direct_audio_plan is not None:
+                audio_diagnostics["streams"] = direct_audio_plan.diagnostics()
             direct_comment = (
                 ffmpeg.prepare_mux_comment(
                     source, options.container, render_note, metadata_diagnostics, controller
@@ -294,6 +301,7 @@ def convert_video(
                             comment=direct_comment,
                             audio_duration=audio_duration if direct_mux else None,
                             include_source_metadata=not is_preview,
+                            audio_plan=direct_audio_plan,
                         )
                     )
                 except BaseException as exc:
@@ -725,6 +733,7 @@ def convert_video(
                 ffmpeg.final_mux(
                     temp_video, source, output_file.temporary, options.container, controller,
                     render_note=render_note, metadata_diagnostics=metadata_diagnostics,
+                    audio_diagnostics=audio_diagnostics,
                 )
                 timings["final_mux_seconds"] = time.perf_counter() - mux_started
             timings["muxing_seconds"] = timings["final_mux_seconds"]
@@ -757,6 +766,21 @@ def convert_video(
                     f"Output verification found {verified['width']}×{verified['height']} "
                     f"instead of {output_width}×{output_height}."
                 )
+            expected = {
+                "ProRes HQ": ("prores", "yuv422p10le", 10),
+                "FFV1 Lossless RGB 10-bit": ("ffv1", "gbrp10le", 10),
+            }.get(ffmpeg._normalize_codec(options.codec))
+            if expected and not compat_preview and (
+                verified.get("codec"), verified.get("pixel_format"),
+                int(verified.get("depth") or 0)
+            ) != expected:
+                raise RuntimeError(f"Saved output does not match {options.codec}.")
+            if expected and effective_hdr and metadata.get("hdr") and (
+                not verified.get("hdr") or verified.get("color_primaries") != "bt2020" or
+                verified.get("color_space") != (
+                    "gbr" if expected[0] == "ffv1" else "bt2020nc")
+            ):
+                raise RuntimeError(f"Saved {options.codec} output lost HDR color signaling.")
             timings["verification_seconds"] = time.perf_counter() - verify_started
 
             elapsed = time.perf_counter() - started
@@ -780,7 +804,7 @@ def convert_video(
                 output_height=output_height, upscaling_factor=factor,
                 neural_dimensions={"width": render_width, "height": render_height},
                 resize_method=resize_method, memory_path=memory_path,
-                bridge_status=session.structured_status(),
+                bridge_status={**session.structured_status(), "audio_streams": audio_diagnostics.get("streams", [])},
             )
         except Exception as exc:
             was_cancelled = controller.cancel.is_set()

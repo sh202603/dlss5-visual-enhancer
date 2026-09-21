@@ -146,9 +146,17 @@ Item {
                                 AppComboBox {
                                     width: parent.width
                                     label: "Quality Preset"
+                                    visible: !appBridge || appBridge.fixedQualityCodecs.indexOf(appBridge.fiCodec) < 0
                                     model: appBridge ? appBridge.encodingQualityChoices : []
                                     currentValue: appBridge ? appBridge.fiQuality : "Auto (Default)"
                                     onActivated: (v) => { if (appBridge) appBridge.fiQuality = v }
+                                }
+
+                                Text {
+                                    visible: appBridge && appBridge.fixedQualityCodecs.indexOf(appBridge.fiCodec) >= 0
+                                    text: "Quality Preset: Fixed by codec"
+                                    color: Theme.textSecondary
+                                    font.pixelSize: Theme.fontSizeSmall
                                 }
 
                                 AppCheckBox {
@@ -158,21 +166,6 @@ Item {
                                     onToggled: (c) => { if (appBridge) appBridge.fiHdrMode = c }
                                 }
 
-                                AppSegmentedControl {
-                                    width: parent.width
-                                    label: "Rename Mode"
-                                    model: appBridge ? appBridge.renameModeChoices : []
-                                    currentValue: appBridge ? appBridge.fiRenameMode : "Auto"
-                                    onActivated: (v) => { if (appBridge) appBridge.fiRenameMode = v }
-                                }
-
-                                AppTextField {
-                                    visible: appBridge && appBridge.fiRenameMode === "Custom"
-                                    width: parent.width
-                                    label: "Custom Suffix"
-                                    text: appBridge ? appBridge.fiCustomSuffix : "_Frame_Interpolation"
-                                    onTextEdited: (t) => { if (appBridge) appBridge.fiCustomSuffix = t }
-                                }
                             }
                         }
                     }
@@ -182,7 +175,7 @@ Item {
                 Rectangle {
                     id: actionBar
                     width: parent.width
-                    height: 54
+                    height: 88
                     color: Theme.bgSurface
                     border.color: Theme.borderSubtle
                     border.width: 1
@@ -190,7 +183,7 @@ Item {
                     Column {
                         anchors.fill: parent
                         anchors.margins: 8
-                        spacing: 4
+                        spacing: 6
 
                         Row {
                             width: parent.width
@@ -198,47 +191,49 @@ Item {
 
                             AppButton {
                                 text: "Preview"
-                                width: 90
-                                buttonHeight: 34
+                                iconName: "preview"
+                                width: Math.max(100, parent.width - 156)
+                                buttonHeight: 30
                                 enabled: appBridge ? appBridge.canPreview : false
                                 onClicked: { if (appBridge) appBridge.renderPreviewAt(viewport.playheadMs) }
                             }
 
                             AppComboBox {
-                                width: 60
-                                comboHeight: 34
+                                width: 72
+                                comboHeight: 30
                                 dropUp: true
                                 model: appBridge ? appBridge.fiPreviewLengthChoices : []
                                 currentValue: appBridge ? appBridge.fiPreviewLength : "3"
                                 onActivated: (v) => { if (appBridge) appBridge.fiPreviewLength = v }
                             }
 
-                            AppButton {
-                                text: appBridge && appBridge.canStop ? "Stop" : "Interpolate Video(s)"
-                                variant: appBridge && appBridge.canStop ? "danger" : "primary"
-                                width: parent.width - 362
-                                buttonHeight: 34
-                                enabled: appBridge ? (appBridge.canStop || appBridge.canRender) : false
-                                onClicked: {
-                                    if (appBridge) {
-                                        if (appBridge.canStop) appBridge.stopActiveBatch()
-                                        else if (appBridge.canRender) appBridge.startActiveBatch()
-                                    }
-                                }
-                            }
-
-                            AppButton {
-                                text: "Reset"
-                                width: 90
-                                buttonHeight: 34
+                            AppIconButton {
+                                iconName: "reset"
+                                buttonSize: 30
+                                tooltipText: "Reset interpolation settings"
                                 onClicked: { if (appBridge) appBridge.resetTabSettings("frame-interpolation") }
                             }
 
-                            AppButton {
-                                text: "Outputs"
-                                width: 90
-                                buttonHeight: 34
+                            AppIconButton {
+                                iconName: "outputs_folder"
+                                buttonSize: 30
+                                tooltipText: "Open outputs folder"
                                 onClicked: { if (appBridge) appBridge.openFolder("") }
+                            }
+                        }
+
+                        AppButton {
+                            text: appBridge && appBridge.canStop ? "Stop" : "Interpolate Video(s)"
+                            iconName: appBridge && appBridge.canStop ? "stop" : "start_render"
+                            variant: appBridge && appBridge.canStop ? "danger" : "primary"
+                            width: parent.width
+                            buttonHeight: 34
+                            enabled: appBridge ? (appBridge.canStop || (appBridge.operationState === "Idle" && appBridge.runtimeState === "Ready" && !appBridge.isLiveRunning)) : false
+                            onClicked: {
+                                if (appBridge) {
+                                    if (appBridge.canStop) appBridge.stopActiveBatch()
+                                    else appBridge.requestActiveBatchExport()
+                                }
                             }
                         }
                     }

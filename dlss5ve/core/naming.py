@@ -42,6 +42,20 @@ def output_filename(
     return f"{stem}{extension}"
 
 
+def unique_output_path(path: Path, reserved: set[Path] | None = None) -> Path:
+    """Choose the first unused filename without replacing an existing file."""
+    path = Path(path)
+    reserved = reserved if reserved is not None else set()
+    if not path.exists() and path not in reserved:
+        return path
+    number = 2
+    while True:
+        candidate = path.with_name(f"{path.stem}_{number}{path.suffix}")
+        if not candidate.exists() and candidate not in reserved:
+            return candidate
+        number += 1
+
+
 def require_available_output(path: Path) -> None:
     if path.exists():
         raise FileExistsError(

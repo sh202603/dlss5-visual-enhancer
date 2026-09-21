@@ -81,6 +81,7 @@ Rectangle {
         anchors.left: parent.left; anchors.leftMargin: 12; anchors.verticalCenter: parent.verticalCenter; spacing: 8
         Image {
             source: Qt.resolvedUrl("../../../../native (dev)/icon.png")
+            sourceSize: Qt.size(112, 112)
             width: 28; height: 28
             fillMode: Image.PreserveAspectFit
             smooth: true
@@ -106,14 +107,14 @@ Rectangle {
             // receives it — so a click arriving here always means the OS did
             // NOT claim it (mapping miss) and minimizing is the right action.
             // maxBtn/closeBtn keep the guard (toggle/close double-delivery).
-            AppIconButton { id: minBtn; iconKind: "min"; showTooltip: false; onClicked: { if (windowRef) windowRef.showMinimized() } }
+            AppIconButton { id: minBtn; iconName: "minimize"; showTooltip: false; onClicked: { if (windowRef) windowRef.showMinimized() } }
             AppIconButton {
                 id: maxBtn
-                iconKind: windowRef && (windowRef.visibility === Window.Maximized || windowRef.visibility === Window.FullScreen) ? "restore" : "max"
+                iconName: windowRef && (windowRef.visibility === Window.Maximized || windowRef.visibility === Window.FullScreen) ? "restore_window" : "maximize"
                 showTooltip: false
                 onClicked: { if (root.nativeChrome) return; root.toggleMaximize() }
             }
-            AppIconButton { id: closeBtn; iconKind: "close"; showTooltip: false; hoverColor: Theme.danger; onClicked: { if (root.nativeChrome) return; if (windowRef) windowRef.close() } }
+            AppIconButton { id: closeBtn; iconName: "close"; showTooltip: false; hoverColor: Theme.danger; onClicked: { if (root.nativeChrome) return; if (windowRef) windowRef.close() } }
         }
     }
 
@@ -125,28 +126,40 @@ Rectangle {
         anchors.verticalCenter: parent.verticalCenter
         spacing: 4
         readonly property var tabs: [
-            { id:"neural-rendering", full:"Neural Rendering", short:"Neural" },
-            { id:"upscale", full:"Upscale", short:"Upscale" },
-            { id:"frame-interpolation", full:"Frame Interpolation", short:"Interp" },
-            { id:"live", full:"Live", short:"Live" },
-            { id:"settings", full:"Settings", short:"Settings" },
-            { id:"help", full:"Help", short:"Help" }
+            { id:"neural-rendering", full:"Neural Rendering", short:"Neural", icon:"neural_rendering" },
+            { id:"upscale", full:"Upscale", short:"Upscale", icon:"upscale" },
+            { id:"frame-interpolation", full:"Frame Interpolation", short:"Interp", icon:"frame_interpolation" },
+            { id:"live", full:"Live", short:"Live", icon:"live_video" },
+            { id:"settings", full:"Settings", short:"Settings", icon:"settings" },
+            { id:"help", full:"Help", short:"Help", icon:"help" }
         ]
         Repeater {
             model: navTabs.tabs
             Item {
                 id: tabBtn
                 height: 28
-                width: tabLabel.implicitWidth + 20
+                width: tabLabel.implicitWidth + 42
                 readonly property bool isActive: appBridge ? appBridge.activeTab === modelData.id : false
-                Text {
-                    id: tabLabel
+                Row {
                     anchors.centerIn: parent
-                    text: root.compact ? modelData.short : modelData.full
-                    font.family: Theme.fontFamily; font.pixelSize: Theme.fontSizeLabel
-                    font.weight: Font.Normal
-                    color: tabBtn.isActive ? Theme.accent : (tabMouse.containsMouse ? Theme.textPrimary : Theme.textSecondary)
+                    spacing: 6
+                    AppIcon {
+                        iconName: modelData.icon
+                        iconSize: 20
+                        color: tabBtn.isActive ? Theme.accent : (tabMouse.containsMouse ? Theme.textPrimary : Theme.textSecondary)
+                        anchors.verticalCenter: parent.verticalCenter
+                    }
+                    Text {
+                        id: tabLabel
+                        text: root.compact ? modelData.short : modelData.full
+                        font.family: Theme.fontFamily; font.pixelSize: Theme.fontSizeLabel
+                        font.weight: Font.Normal
+                        color: tabBtn.isActive ? Theme.accent : (tabMouse.containsMouse ? Theme.textPrimary : Theme.textSecondary)
+                        anchors.verticalCenter: parent.verticalCenter
+                    }
                 }
+                Accessible.role: Accessible.PageTab
+                Accessible.name: modelData.full
                 MouseArea {
                     id: tabMouse; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor
                     onClicked: { if (appBridge) appBridge.activeTab = modelData.id }

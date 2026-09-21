@@ -12,7 +12,8 @@ from .native import probe_capabilities
 from .processor import upscale_video
 
 
-def upscale_videos(input_paths, options=None, progress=None, *, output_dir=None, controller=None, on_item_update=None):
+def upscale_videos(input_paths, options=None, progress=None, *, output_dir=None, controller=None,
+                   on_item_update=None, same_as_input=False):
     options = replace(options) if options else UpscaleOptions()
     options.validate()
     paths = [Path(p).resolve() for p in input_paths]
@@ -22,7 +23,7 @@ def upscale_videos(input_paths, options=None, progress=None, *, output_dir=None,
     reporter = BatchProgress(paths, on_item_update, progress)
     successes, failures = [], []
     try:
-        destination = prepare_output_dir(output_dir)
+        destination = None if same_as_input else prepare_output_dir(output_dir)
         with active_job(controller):
             if controller.cancel.is_set():
                 raise Cancelled("Stopped before rendering.")
@@ -33,7 +34,8 @@ def upscale_videos(input_paths, options=None, progress=None, *, output_dir=None,
                 reporter.advance(i)
                 try:
                     result = upscale_video(path, options, lambda v, m, i=i: reporter.advance(i, v, m),
-                                           output_dir=destination, controller=controller, _owns_slot=True, _capabilities=caps)
+                                           output_dir=prepare_output_dir(path.parent) if same_as_input else destination,
+                                           controller=controller, _owns_slot=True, _capabilities=caps)
                 except Exception as exc:
                     cancelled = controller.cancel.is_set() or isinstance(exc, Cancelled)
                     failures.append(UpscaleFailure(i, str(path), str(exc), cancelled))

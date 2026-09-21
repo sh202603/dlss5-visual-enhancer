@@ -39,14 +39,16 @@ Item {
     }
 
     function syncIndex() {
-        currentIndex = -1
-        if (!model || model.length === 0) return
-        for (var i = 0; i < model.length; i++) {
-            if (getValue(model[i]) === currentValue) {
-                currentIndex = i
-                return
+        var nextIndex = -1
+        if (model) {
+            for (var i = 0; i < model.length; i++) {
+                if (getValue(model[i]) === currentValue) {
+                    nextIndex = i
+                    break
+                }
             }
         }
+        if (currentIndex !== nextIndex) currentIndex = nextIndex
     }
 
     onCurrentValueChanged: syncIndex()
@@ -88,7 +90,7 @@ Item {
             border.width: 1
 
             Behavior on x {
-                NumberAnimation { duration: Theme.animFast; easing.type: Easing.OutQuad }
+                NumberAnimation { duration: Theme.animNormal; easing.type: Easing.OutQuad }
             }
         }
 

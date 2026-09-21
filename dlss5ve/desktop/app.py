@@ -3,17 +3,19 @@ from __future__ import annotations
 import ctypes
 import os
 import sys
+import time
 from pathlib import Path
 
-from PySide6.QtCore import QTimer, QUrl, Qt
+from PySide6.QtCore import QUrl, Qt
 from PySide6.QtGui import QGuiApplication, QIcon
 from PySide6.QtQml import QQmlApplicationEngine
 
 from ..core.paths import ROOT, OUTPUTS, LOGS, LIVE_DIR
 from ..core.cache_cleanup import cleanup_old_caches
-from .image_provider import PreviewImageProvider
+from ..core import app_log
+from .image_provider import IconImageProvider, PreviewImageProvider
 from .bridge import AppBridge
-from .win_frameless import install_win_chrome, ensure_win_style, log_native_chrome
+from .win_frameless import install_win_chrome, remove_win_chrome, ensure_win_style, log_native_chrome
 
 
 def hide_inherited_console() -> None:
@@ -264,14 +266,19 @@ def stamp_taskbar_relaunch(hwnd: int) -> bool:
 
 
 def launch_desktop() -> int:
-    """Launch the Qt shell immediately, then initialize heavyweight runtimes."""
+    """Prepare runtime and the first Qt frame before revealing the window."""
+    started = time.perf_counter()
+
+    def mark(stage: str) -> None:
+        app_log.info("startup", f"{stage}_ms={(time.perf_counter() - started) * 1000:.1f}")
+
     hide_inherited_console()
     OUTPUTS.mkdir(exist_ok=True)
     LOGS.mkdir(exist_ok=True)
     LIVE_DIR.mkdir(exist_ok=True)
     # Startup sweep of stale temp caches (24h+ old): crash orphans, old
     # staged pastes and previews. Queues are in-memory per session, so no
-    # live references can exist yet. Never blocks startup.
+    # live references can exist yet. Finish the sweep before showing the UI.
     try:
         cleanup_old_caches()
     except Exception:
@@ -288,6 +295,7 @@ def launch_desktop() -> int:
     app.setApplicationName("Visual Enhancer")
     app.setApplicationDisplayName("Visual Enhancer")
     app.setOrganizationName("Merserk")
+    icon_path = None
     try:
         icon_path = resolve_app_icon()
         if icon_path is not None:
@@ -295,25 +303,32 @@ def launch_desktop() -> int:
     except Exception:
         pass
 
-    engine = QQmlApplicationEngine()
     image_provider = PreviewImageProvider()
-    engine.addImageProvider("preview", image_provider)
-
     bridge = AppBridge(image_provider)
     app.aboutToQuit.connect(bridge.shutdown)
+    bridge.initializeRuntime()
+    mark("runtime_ready" if bridge.runtimeState == "Ready" else "runtime_failed")
+
+    engine = QQmlApplicationEngine()
+    engine.addImageProvider("preview", image_provider)
+    engine.addImageProvider("icons", IconImageProvider())
     engine.rootContext().setContextProperty("backend", bridge)
 
     qml_path = Path(__file__).resolve().parent / "qml" / "Main.qml"
     engine.load(QUrl.fromLocalFile(str(qml_path)))
+    mark("qml_loaded")
     if not engine.rootObjects():
         try:
             if sys.stderr is not None:
                 print("Error: Failed to load QML root object.", file=sys.stderr)
         except Exception:
             pass
+        bridge.shutdown()
+        del engine
         return 1
 
     root_window = engine.rootObjects()[0]
+    root_window.create()
     # Brand the live taskbar button (name + VE icon + launcher relaunch) and
     # pin the window icon explicitly so pythonw.exe art never leaks through.
     try:
@@ -333,31 +348,55 @@ def launch_desktop() -> int:
         bridge.attachMainWindow(root_window)
     except Exception:
         pass
-    # Show windowed; the QML shell applies the saved maximized state itself.
+    # Qt Quick can build its first scene graph while the native window remains
+    # hidden. Keep the resulting graphics resources for the visible frame.
     try:
-        root_window.show()
-    except Exception:
-        pass
-    # Qt re-applies its own window flags at show(), silently stripping the
-    # native frame bits install_win_chrome added pre-show. Re-assert now and
-    # once more deferred past QML's onCompleted showMaximized/showNormal.
-    def _reaffirm_chrome_style() -> None:
-        try:
-            ensure_win_style(int(root_window.winId()))
-        except Exception:
-            pass
+        app.processEvents()
+        frame = root_window.grabWindow()
+        if frame.isNull():
+            app_log.error("startup", "hidden Qt frame was empty")
+        del frame
+    except Exception as exc:
+        app_log.error("startup", f"hidden Qt frame failed: {exc}")
+    mark("hidden_frame")
 
+    first_frame_logged = False
+
+    def on_first_frame() -> None:
+        nonlocal first_frame_logged
+        if not first_frame_logged:
+            first_frame_logged = True
+            mark("first_visible_frame")
+
+    root_window.frameSwapped.connect(on_first_frame)
+
+    if bridge.windowMaximized:
+        root_window.showMaximized()
+    else:
+        root_window.showNormal()
+    mark("window_shown")
+
+    # Qt re-applies window flags when shown, so restore native chrome once.
     try:
         ensure_win_style(int(root_window.winId()))
     except Exception:
         pass
-    QTimer.singleShot(250, _reaffirm_chrome_style)
     try:
         apply_windows_dark_titlebar(int(root_window.winId()))
     except Exception:
         pass
 
-    # Heavy GPU/media initialization deliberately begins only after the first
-    # event-loop turn so the window can paint an Initialization/Diagnostics UI.
-    QTimer.singleShot(0, bridge.initializeRuntime)
-    return app.exec()
+    try:
+        return app.exec()
+    finally:
+        # aboutToQuit normally runs this first. Keep the fallback for exits
+        # that bypass the signal, then dismantle QML and the native event
+        # filter while the application object is still alive.
+        try:
+            bridge.shutdown()
+        finally:
+            try:
+                remove_win_chrome(root_window)
+            finally:
+                del root_window
+                del engine

@@ -66,7 +66,7 @@ class UpscaleOptions:
         if for_render and not (self.vsr_enabled or self.hdr_enabled):
             raise ValueError("Enable RTX Video Super Resolution or RTX Video HDR.")
         if self.hdr_enabled and not hdr_mode_supported(self.codec):
-            raise ValueError("RTX Video HDR requires H.265, AV1, or ProRes. H.264 cannot store this HDR output.")
+            raise ValueError("RTX Video HDR requires a 10-bit or higher video codec.")
         if self.preview_frames is not None and (isinstance(self.preview_frames, bool) or
                                                not isinstance(self.preview_frames, (int, float)) or
                                                not math.isfinite(self.preview_frames) or

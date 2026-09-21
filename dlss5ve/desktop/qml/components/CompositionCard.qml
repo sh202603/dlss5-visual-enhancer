@@ -20,6 +20,7 @@ AppCard {
 
             AppButton {
                 text: "Apply Detail-Only Preset"
+                iconName: "quality_enhance"
                 width: parent.width
                 buttonHeight: 28
                 onClicked: {
@@ -105,12 +106,14 @@ AppCard {
 
                     AppButton {
                         text: "Load Custom Mask..."
+                        iconName: "load_mask"
                         buttonHeight: 24
                         onClicked: maskDialog.open()
                     }
 
                     AppButton {
                         text: "Clear Mask"
+                        iconName: "clear_mask"
                         buttonHeight: 24
                         onClicked: {
                             if (appBridge) appBridge.clearCustomMask()

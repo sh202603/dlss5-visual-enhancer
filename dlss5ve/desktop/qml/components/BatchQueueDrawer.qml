@@ -25,16 +25,17 @@ Rectangle {
         height: 36; color: "transparent"
         Row {
             anchors.left: parent.left; anchors.leftMargin: 12; anchors.verticalCenter: parent.verticalCenter; spacing: 8
+            AppIcon { iconName: "queue"; iconSize: 16; color: Theme.textPrimary; anchors.verticalCenter: parent.verticalCenter }
             Text { text: "Batch Queue"; font.family: Theme.fontFamily; font.pixelSize: Theme.fontSizeLabel; font.weight: Font.DemiBold; color: Theme.textPrimary; anchors.verticalCenter: parent.verticalCenter }
             AppBadge { text: queueModel ? (queueModel.count + " files") : "0 files"; variant: queueModel && queueModel.count > 0 ? "accent" : "neutral"; anchors.verticalCenter: parent.verticalCenter }
-            AppButton { text: "+ Files"; buttonHeight: 22; enabled: appBridge ? appBridge.canModifyQueue : true; onClicked: fileDialog.open() }
-            AppButton { text: "+ Folder"; buttonHeight: 22; enabled: appBridge ? appBridge.canModifyQueue : true; onClicked: folderDialog.open() }
-            AppButton { text: "Clear Done"; buttonHeight: 22; enabled: queueModel && queueModel.count > 0 && (appBridge ? appBridge.canModifyQueue : true); onClicked: { if (appBridge) appBridge.clearCompletedQueueItems() } }
-            AppButton { text: "Clear All"; buttonHeight: 22; enabled: queueModel && queueModel.count > 0 && (appBridge ? appBridge.canModifyQueue : true); onClicked: { if (appBridge) appBridge.clearActiveQueue() } }
+            AppIconButton { iconName: "add_file"; buttonSize: 24; tooltipText: "Add files"; enabled: appBridge ? appBridge.canModifyQueue : true; onClicked: fileDialog.open() }
+            AppIconButton { iconName: "add_folder"; buttonSize: 24; tooltipText: "Add folder"; enabled: appBridge ? appBridge.canModifyQueue : true; onClicked: folderDialog.open() }
+            AppIconButton { iconName: "clear_done"; buttonSize: 24; tooltipText: "Clear completed items"; enabled: queueModel && queueModel.count > 0 && (appBridge ? appBridge.canModifyQueue : true); onClicked: { if (appBridge) appBridge.clearCompletedQueueItems() } }
+            AppIconButton { iconName: "clear_all"; buttonSize: 24; tooltipText: "Clear all items"; enabled: queueModel && queueModel.count > 0 && (appBridge ? appBridge.canModifyQueue : true); onClicked: { if (appBridge) appBridge.clearActiveQueue() } }
         }
         AppIconButton {
             anchors.right: parent.right; anchors.rightMargin: 10; anchors.verticalCenter: parent.verticalCenter
-            iconSymbol: drawer.collapsed ? "^" : "v"
+            iconName: drawer.collapsed ? "chevron_up" : "chevron_down"
             tooltipText: drawer.collapsed ? "Expand queue" : "Collapse queue"
             onClicked: drawer.collapsed = !drawer.collapsed
         }
@@ -43,9 +44,28 @@ Rectangle {
 
     ListView {
         id: queueList
+        objectName: "batchQueueList"
         anchors.top: header.bottom; anchors.left: parent.left; anchors.right: parent.right; anchors.bottom: parent.bottom
         anchors.margins: 8; orientation: ListView.Horizontal; spacing: 8; clip: true
+        flickableDirection: Flickable.HorizontalFlick
+        boundsBehavior: Flickable.StopAtBounds
+        pressDelay: 120
+        synchronousDrag: true
         visible: !drawer.collapsed; model: drawer.queueModel
+
+        WheelHandler {
+            target: null
+            enabled: queueList.contentWidth > queueList.width
+            onWheel: (event) => {
+                var delta = event.pixelDelta.x || event.pixelDelta.y
+                if (!delta) delta = event.angleDelta.x || event.angleDelta.y
+                if (!delta) return
+                var left = queueList.originX
+                var right = left + Math.max(0, queueList.contentWidth - queueList.width)
+                queueList.contentX = Math.max(left, Math.min(right, queueList.contentX - delta))
+                event.accepted = true
+            }
+        }
 
         delegate: Rectangle {
             id: itemCard
@@ -91,7 +111,7 @@ Rectangle {
                         width: parent.width; spacing: 6
                         Text { width: parent.width - removeBtn.width - 8; text: itemCard.fileName; elide: Text.ElideMiddle; font.family: Theme.fontFamily; font.pixelSize: Theme.fontSizeLabel; font.weight: Font.DemiBold; color: Theme.textPrimary }
                         AppIconButton {
-                            id: removeBtn; z: 20; iconSymbol: "x"; buttonSize: 20; showTooltip: false
+                            id: removeBtn; z: 20; iconName: "trash"; buttonSize: 20; tooltipText: "Remove from queue"
                             visible: appBridge ? appBridge.canModifyQueue : true
                             onClicked: { if (appBridge) appBridge.removeQueueItem(itemCard.index) }
                         }
@@ -113,7 +133,7 @@ Rectangle {
                     Row {
                         width: parent.width; spacing: 8
                         Text { text: itemCard.elapsedSeconds > 0 ? (itemCard.elapsedSeconds.toFixed(1) + "s") : ""; color: Theme.textMuted; font.family: Theme.monoFontFamily; font.pixelSize: 10 }
-                        AppButton { text: "Reveal"; buttonHeight: 20; visible: itemCard.outputPath !== ""; onClicked: { if (appBridge) appBridge.openFolder(itemCard.outputPath) } }
+                        AppButton { text: "Reveal"; iconName: "reveal_in_explorer"; buttonHeight: 20; visible: itemCard.outputPath !== ""; onClicked: { if (appBridge) appBridge.openFolder(itemCard.outputPath) } }
                     }
                 }
             }

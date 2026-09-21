@@ -203,8 +203,8 @@ Row {
         onClosed: root.onMenuClosed(processMenu)
         QQC2.MenuItem {
             text: "Start / Render"
-            enabled: root.appBridge ? root.appBridge.canRender : false
-            onTriggered: { if (root.appBridge) root.appBridge.startActiveBatch() }
+            enabled: root.appBridge ? ((root.appBridge.activeTab === "neural-rendering" || root.appBridge.activeTab === "upscale" || root.appBridge.activeTab === "frame-interpolation") && root.appBridge.operationState === "Idle" && root.appBridge.runtimeState === "Ready" && !root.appBridge.isLiveRunning) : false
+            onTriggered: { if (root.appBridge) root.appBridge.requestActiveBatchExport() }
         }
         QQC2.MenuItem {
             text: "Preview"

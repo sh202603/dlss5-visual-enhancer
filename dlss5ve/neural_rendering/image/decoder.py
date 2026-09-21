@@ -1,9 +1,7 @@
 from __future__ import annotations
 
-import hashlib
 import io
 import os
-import tempfile
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -14,17 +12,10 @@ import rawpy
 import resvg_py
 from PIL import Image, ImageCms, ImageOps
 
-from ...core.paths import APP_TEMP
 from .models import RAW_EXTENSIONS
 
 pillow_heif.register_heif_opener()
 Image.MAX_IMAGE_PIXELS = 100_000_000
-
-# Formats the native Qt image provider can display without a
-# conversion. Animated raster inputs are still converted below so the preview
-# matches the processing pipeline's first-frame/page semantics.
-_BROWSER_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".avif", ".bmp"}
-
 
 @dataclass(slots=True)
 class _DecodedImage:
@@ -168,14 +159,8 @@ def decode_image(path: str | os.PathLike[str]) -> _DecodedImage:
             opened_image.close()
 
 
-def decode_image_preview(
-    path: str | os.PathLike[str], max_size: tuple[int, int] | None = (1200, 900)
-) -> Image.Image:
-    """Decode a UI preview without constructing the full render-time NumPy payload.
-
-    ``max_size=None`` preserves the decoded source dimensions. This is used only
-    by the opt-in full-size native preview path.
-    """
+def decode_image_preview(path: str | os.PathLike[str]) -> Image.Image:
+    """Decode a full-resolution UI image without the render-time NumPy payload."""
     source = Path(path).resolve()
     suffix = source.suffix.lower()
     if suffix in RAW_EXTENSIONS:
@@ -184,26 +169,21 @@ def decode_image_preview(
                 use_camera_wb=True,
                 output_color=rawpy.ColorSpace.sRGB,
                 output_bps=8,
-                half_size=max_size is not None,
+                half_size=False,
             )
         image = Image.fromarray(array, mode="RGB")
-        if max_size is not None:
-            image.thumbnail(max_size, Image.Resampling.BILINEAR)
-        return image.convert("RGBA")
+        try:
+            return image.convert("RGBA")
+        finally:
+            image.close()
 
     image, _decoder = _open_pillow_source(source)
     opened_image = image
     try:
         if int(getattr(image, "n_frames", 1) or 1) > 1:
             image.seek(0)
-        if max_size is not None:
-            # JPEG can ask its decoder for a reduced-resolution IDCT before loading.
-            with __import__("contextlib").suppress(Exception):
-                image.draft("RGB", max_size)
         info = dict(image.info)
         image = ImageOps.exif_transpose(image)
-        if max_size is not None:
-            image.thumbnail(max_size, Image.Resampling.BILINEAR)
         icc_profile = info.get("icc_profile")
         if isinstance(icc_profile, bytes) and icc_profile:
             has_alpha = _has_alpha(image, info)
@@ -227,54 +207,3 @@ def decode_image_preview(
         image.close()
         if opened_image is not image:
             opened_image.close()
-
-
-def _direct_browser_image(source: Path) -> bool:
-    suffix = source.suffix.lower()
-    if suffix == ".svg":
-        return True
-    if suffix not in _BROWSER_IMAGE_EXTENSIONS:
-        return False
-    try:
-        with Image.open(source) as image:
-            return int(getattr(image, "n_frames", 1) or 1) <= 1
-    except Exception:
-        return False
-
-
-def full_size_image_preview_path(path: str | os.PathLike[str]) -> str:
-    """Return a displayable full-resolution path for an image.
-
-    Native single-frame formats are served directly so no pixels are
-    copied or re-encoded. RAW/HEIF/TIFF/animated/other Pillow-readable sources
-    are converted once to a lossless full-resolution PNG in the app-local
-    temp directory.
-    """
-    source = Path(path).resolve()
-    if not source.is_file():
-        raise FileNotFoundError(source)
-    if _direct_browser_image(source):
-        return str(source)
-
-    stat = source.stat()
-    identity = f"{source}|{stat.st_dev}|{stat.st_ino}|{stat.st_size}|{stat.st_mtime_ns}"
-    digest = hashlib.sha256(identity.encode("utf-8", "surrogatepass")).hexdigest()[:24]
-    APP_TEMP.mkdir(parents=True, exist_ok=True)
-    destination = APP_TEMP / f"dlss5-fullsize-source-{digest}.png"
-    if destination.is_file():
-        return str(destination.resolve())
-
-    image = decode_image_preview(source, None)
-    handle, raw_temp = tempfile.mkstemp(
-        prefix="dlss5-fullsize-source-write-", suffix=".png", dir=APP_TEMP
-    )
-    os.close(handle)
-    temporary = Path(raw_temp)
-    try:
-        image.save(temporary, format="PNG", optimize=False, compress_level=1)
-        os.replace(temporary, destination)
-    finally:
-        image.close()
-        temporary.unlink(missing_ok=True)
-    return str(destination.resolve())
-

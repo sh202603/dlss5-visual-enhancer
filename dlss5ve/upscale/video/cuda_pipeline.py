@@ -24,7 +24,7 @@ from ...core.disk_paths import OutputFile, prepare_output_dir
 from ...core.gpu_detection import detect_gpus
 from ...core.gpu_selection import resolve_ai_gpu
 from ...core.jobs import Cancelled
-from ...core.naming import output_filename
+from ...core.naming import output_filename, unique_output_path
 from ...core.paths import JOBS
 from .media import inspect_video, packed_bytes
 from .models import UpscaleCapabilities, UpscaleOptions, UpscaleResult, output_size
@@ -253,10 +253,10 @@ def convert_video_cuda_nvenc(
     extension = {"MP4": ".mp4", "MKV": ".mkv", "MOV": ".mov"}[options.container]
     destination = prepare_output_dir(output_dir)
     kind = "RTXVIDEO_PREVIEW" if preview else "RTXVIDEO"
-    output = destination / output_filename(
+    output = unique_output_path(destination / output_filename(
         source, extension, "Auto" if preview else options.rename_mode,
         options.custom_suffix, f"{source.stem}_{kind}_{stamp}",
-    )
+    ))
     destination_file = OutputFile(output)
     JOBS.mkdir(exist_ok=True)
     session: RTXVideoSession | None = None
@@ -524,9 +524,11 @@ def convert_video_cuda_nvenc(
                     raise RuntimeError(f"Source has {exact['frames']} frames but only {delivered} were processed.")
             update(0.90, "Muxing original audio, subtitles, chapters, and metadata")
             mux_started = time.perf_counter()
+            audio_diagnostics: dict = {}
             ffmpeg.final_mux(
                 temp_video, source, destination_file.temporary, options.container, controller,
                 preserve_supported_subtitles=True, source_time_origin=metadata["origin"],
+                audio_diagnostics=audio_diagnostics,
             )
             timings["final_mux_seconds"] = time.perf_counter() - mux_started
             update(0.96, "Verifying output frames, resolution, and HDR signaling")
@@ -563,6 +565,7 @@ def convert_video_cuda_nvenc(
             )
             session_status["timings"] = dict(timings)
             session_status["adapters"] = {"ai": ai_gpu, "decode": ai_gpu, "encode": video_gpu}
+            session_status["audio_streams"] = audio_diagnostics.get("streams", [])
             if transfer_diagnostics:
                 session_status["cross_gpu_transfer"] = transfer_diagnostics
                 session_status["memory_path"] = transfer_diagnostics["memory_path"]

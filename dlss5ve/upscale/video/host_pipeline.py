@@ -23,7 +23,7 @@ from av.codec.hwaccel import HWAccel
 from ...core import app_log, ffmpeg
 from ...core.disk_paths import OutputFile, prepare_output_dir
 from ...core.jobs import Cancelled
-from ...core.naming import output_filename
+from ...core.naming import output_filename, unique_output_path
 from ...core.paths import JOBS
 from ...core.ffmpeg.codecs import _x265_hdr_params
 from .cuda_pipeline import (
@@ -113,6 +113,14 @@ def _encoder_settings(options: UpscaleOptions, width: int, height: int,
         return _EncoderSettings(
             "prores_ks", "prores_ks (Proxy)", "yuv422p10le",
             FORMAT_YUV422P10, values, 0, quality)
+    if codec == "ProRes HQ":
+        return _EncoderSettings(
+            "prores_ks", "prores_ks (HQ)", "yuv422p10le",
+            FORMAT_YUV422P10, {"profile": "3"}, 0, quality)
+    if codec == "FFV1 Lossless RGB 10-bit":
+        return _EncoderSettings(
+            "ffv1", "ffv1 (Lossless RGB 10-bit)", "gbrp10le", FORMAT_YUV422P10,
+            {"level": "3", "slicecrc": "1"}, 0, quality)
     raise ValueError(f"The in-process host pipeline does not support codec {options.codec!r}.")
 
 
@@ -284,16 +292,18 @@ def convert_video_inprocess_host(
     ten_bit = bool(
         options.hdr_enabled or
         (input_format == 2 and ffmpeg.hdr_mode_supported(options.codec)) or
-        ffmpeg._normalize_codec(options.codec) == "ProRes Proxy")
+        ffmpeg._normalize_codec(options.codec) in {
+            "ProRes Proxy", "ProRes HQ", "FFV1 Lossless RGB 10-bit"
+        })
     encoder = _encoder_settings(options, output_width, output_height, metadata["rate"], ten_bit)
     preview = options.preview_frames is not None or options.preview_seconds is not None
     stamp = time.strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:8]
     extension = {"MP4": ".mp4", "MKV": ".mkv", "MOV": ".mov"}[options.container]
     destination = prepare_output_dir(output_dir)
     kind = "RTXVIDEO_PREVIEW" if preview else "RTXVIDEO"
-    output = destination / output_filename(
+    output = unique_output_path(destination / output_filename(
         source, extension, "Auto" if preview else options.rename_mode,
-        options.custom_suffix, f"{source.stem}_{kind}_{stamp}")
+        options.custom_suffix, f"{source.stem}_{kind}_{stamp}"))
     destination_file = OutputFile(output)
     decoded_container: Any | None = None
     encoded_container: Any | None = None
@@ -336,7 +346,10 @@ def convert_video_inprocess_host(
         job = tempfile.TemporaryDirectory(prefix="rtx-video-host-", dir=JOBS)
         try:
             job_dir = Path(job.name)
-            temp_video = job_dir / ("encoded.mov" if encoder.codec == "prores_ks" else "encoded.mp4")
+            temp_video = job_dir / (
+                "encoded.mkv" if encoder.codec == "ffv1" else
+                "encoded.mov" if encoder.codec == "prores_ks" else "encoded.mp4"
+            )
             decode_device = HWAccel(
                 "cuda", device=str(ordinal), allow_software_fallback=True,
                 options={"primary_ctx": "1"}, is_hw_owned=True)
@@ -361,6 +374,9 @@ def convert_video_inprocess_host(
             output_stream.codec_context.options = encoder.options
             output_stream.codec_context.bit_rate = encoder.bit_rate
             _set_color_properties(output_stream.codec_context, bool(options.hdr_enabled))
+            if encoder.codec == "ffv1":
+                output_stream.codec_context.colorspace = 0
+                output_stream.codec_context.color_range = 2
             output_stream.codec_context.open()
 
             session = RTXVideoSession(
@@ -422,6 +438,11 @@ def convert_video_inprocess_host(
                             copy_tick = time.perf_counter()
                             frame = frame.reformat(format=encoder.pixel_format)
                             timings["host_copy_seconds"] += time.perf_counter() - copy_tick
+                        if encoder.codec == "ffv1":
+                            frame.color_primaries = 9 if options.hdr_enabled else 1
+                            frame.color_trc = 16 if options.hdr_enabled else 1
+                            frame.colorspace = 0
+                            frame.color_range = 2
                         for packet in output_stream.encode(frame):
                             encoded_container.mux(packet)
                         timings["encode_seconds"] += time.perf_counter() - encode_tick
@@ -562,9 +583,11 @@ def convert_video_inprocess_host(
                         f"Source has {exact['frames']} frames but only {delivered} were processed.")
             update(0.90, "Muxing original audio, subtitles, chapters, and metadata")
             mux_tick = time.perf_counter()
+            audio_diagnostics: dict = {}
             ffmpeg.final_mux(
                 temp_video, source, destination_file.temporary, options.container, controller,
-                preserve_supported_subtitles=True, source_time_origin=metadata["origin"])
+                preserve_supported_subtitles=True, source_time_origin=metadata["origin"],
+                audio_diagnostics=audio_diagnostics)
             timings["final_mux_seconds"] = time.perf_counter() - mux_tick
             update(0.96, "Verifying output frames, resolution, chroma, and HDR signaling")
             verified = ffmpeg.probe_video(destination_file.temporary, count_mode="packets",
@@ -580,10 +603,18 @@ def convert_video_inprocess_host(
             saved = inspect_video(destination_file.temporary, controller)
             if encoder.codec == "prores_ks" and saved["stream"].get("pix_fmt") != "yuv422p10le":
                 raise RuntimeError("ProRes output did not preserve direct 10-bit 4:2:2 chroma.")
+            expected = {
+                "ProRes HQ": ("prores", "yuv422p10le", 10),
+                "FFV1 Lossless RGB 10-bit": ("ffv1", "gbrp10le", 10),
+            }.get(ffmpeg._normalize_codec(options.codec))
+            if expected and (saved["stream"].get("codec_name"), saved["stream"].get("pix_fmt"),
+                             int(saved["depth"])) != expected:
+                raise RuntimeError(f"Saved output does not match {options.codec}.")
             if options.hdr_enabled and (
                     saved["depth"] < 10 or not saved["hdr"] or
                     saved["stream"].get("color_primaries") != "bt2020" or
-                    saved["stream"].get("color_space") != "bt2020nc"):
+                    saved["stream"].get("color_space") != (
+                        "gbr" if encoder.codec == "ffv1" else "bt2020nc")):
                 raise RuntimeError("Saved file failed HDR color and bit-depth verification.")
             if not options.hdr_enabled and saved["hdr"]:
                 raise RuntimeError("SDR output unexpectedly contains HDR signaling.")
@@ -614,6 +645,7 @@ def convert_video_inprocess_host(
             session_status["memory_path"] = memory_path
             session_status["pinned_pool"] = pool_status
             session_status["adapters"] = {"ai": ai_gpu, "decode": ai_gpu, "encode": "CPU"}
+            session_status["audio_streams"] = audio_diagnostics.get("streams", [])
             destination_file.publish()
             app_log.info(
                 "upscale-host", f"done src={source.name} out={output.name} frames={delivered} "

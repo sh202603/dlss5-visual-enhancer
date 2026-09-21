@@ -172,23 +172,25 @@ Item {
                         spacing: 8
 
                         AppButton {
-                            width: 88
+                            width: 96
                             buttonHeight: 32
                             text: appBridge && appBridge.mpvEmbed && appBridge.mpvEmbed.paused ? "Resume" : "Pause"
+                            iconName: appBridge && appBridge.mpvEmbed && appBridge.mpvEmbed.paused ? "play" : "pause"
                             enabled: appBridge && appBridge.isLiveRunning
                             onClicked: { if (appBridge && appBridge.mpvEmbed) appBridge.mpvEmbed.togglePause() }
                         }
                         AppButton {
-                            width: 88
+                            width: 96
                             buttonHeight: 32
                             text: appBridge && appBridge.mpvEmbed && appBridge.mpvEmbed.muted ? "Unmute" : "Mute"
+                            iconName: appBridge && appBridge.mpvEmbed && appBridge.mpvEmbed.muted ? "volume_up" : "mute"
                             enabled: appBridge && appBridge.isLiveRunning
                             onClicked: { if (appBridge && appBridge.mpvEmbed) appBridge.mpvEmbed.toggleMute() }
                         }
-                        AppButton {
-                            width: 52
-                            buttonHeight: 32
-                            text: "Vol-"
+                        AppIconButton {
+                            buttonSize: 32
+                            iconName: "volume_down"
+                            tooltipText: "Volume down"
                             enabled: appBridge && appBridge.isLiveRunning
                             onClicked: { if (appBridge && appBridge.mpvEmbed) appBridge.mpvEmbed.volumeDown() }
                         }
@@ -202,10 +204,10 @@ Item {
                             anchors.verticalCenter: parent.verticalCenter
                             horizontalAlignment: Text.AlignHCenter
                         }
-                        AppButton {
-                            width: 52
-                            buttonHeight: 32
-                            text: "Vol+"
+                        AppIconButton {
+                            buttonSize: 32
+                            iconName: "volume_up"
+                            tooltipText: "Volume up"
                             enabled: appBridge && appBridge.isLiveRunning
                             onClicked: { if (appBridge && appBridge.mpvEmbed) appBridge.mpvEmbed.volumeUp() }
                         }
@@ -213,20 +215,22 @@ Item {
                         // (plain Row cannot right-anchor children). Clamped so
                         // narrow windows degrade to left-packed, never overlap.
                         Item {
-                            width: Math.max(0, parent.width - 600)
+                            width: Math.max(0, parent.width - 596)
                             height: 1
                         }
                         AppButton {
                             width: 104
                             buttonHeight: 32
                             text: root.videoExpanded ? "Restore" : "Expand"
+                            iconName: root.videoExpanded ? "collapse" : "expand"
                             enabled: appBridge && appBridge.isLiveRunning
                             onClicked: { root.videoExpanded = !root.videoExpanded; Qt.callLater(root.syncLiveVideo) }
                         }
                         AppButton {
-                            width: 104
+                            width: 124
                             buttonHeight: 32
                             text: appBridge && appBridge.mpvEmbed && appBridge.mpvEmbed.fullscreen ? "Exit Full" : "Full Screen"
+                            iconName: appBridge && appBridge.mpvEmbed && appBridge.mpvEmbed.fullscreen ? "exit_fullscreen" : "fullscreen"
                             enabled: appBridge && appBridge.isLiveRunning
                             onClicked: { if (appBridge && appBridge.mpvEmbed) appBridge.mpvEmbed.toggleFullscreen() }
                         }
@@ -545,6 +549,7 @@ Item {
                             width: parent.width - 98
                             buttonHeight: 36
                             text: appBridge && appBridge.operationState === "LiveStarting" ? "Cancel Live Startup" : (appBridge && appBridge.isLiveRunning ? "Stop Live Session" : (appBridge && appBridge.operationState === "LiveStopping" ? "Stopping Live..." : "Start Live Session"))
+                            iconName: appBridge && appBridge.canStop ? "stop" : "start_render"
                             variant: appBridge && appBridge.canStop ? "danger" : "primary"
                             enabled: appBridge ? (appBridge.canStartLive || appBridge.canStop) : false
                             onClicked: {
@@ -568,6 +573,7 @@ Item {
 
                         AppButton {
                             text: "Reset"
+                            iconName: "reset"
                             width: 90
                             buttonHeight: 36
                             onClicked: {

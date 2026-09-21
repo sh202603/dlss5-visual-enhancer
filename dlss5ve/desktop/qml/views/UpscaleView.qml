@@ -338,20 +338,6 @@ model: appBridge ? appBridge.vsrQualityChoices : []
                                         onToggled: (c) => { if (appBridge) appBridge.upscaleImagePreserveMetadata = c }
                                     }
 
-                                    AppSegmentedControl {
-                                        width: parent.width
-                                        label: "Rename Mode"
-                                        model: appBridge ? appBridge.renameModeChoices : []
-                                        currentValue: appBridge ? appBridge.upscaleImageRenameMode : "Auto"
-                                        onActivated: (v) => { if (appBridge) appBridge.upscaleImageRenameMode = v }
-                                    }
-                                    AppTextField {
-                                        visible: appBridge && appBridge.upscaleImageRenameMode === "Custom"
-                                        width: parent.width
-                                        label: "Custom Suffix"
-                                        text: appBridge ? appBridge.upscaleImageCustomSuffix : "_Upscale"
-                                        onTextEdited: (t) => { if (appBridge) appBridge.upscaleImageCustomSuffix = t }
-                                    }
                                 }
 
                                 Column {
@@ -370,25 +356,19 @@ model: appBridge ? appBridge.vsrQualityChoices : []
                                     AppComboBox {
                                         width: parent.width
                                         label: "Quality"
+                                        visible: !appBridge || appBridge.fixedQualityCodecs.indexOf(appBridge.upscaleCodec) < 0
                                         model: appBridge ? appBridge.encodingQualityChoices : []
                                         currentValue: appBridge ? appBridge.upscaleQuality : "Auto (Default)"
                                         onActivated: (v) => { if (appBridge) appBridge.upscaleQuality = v }
                                     }
 
-                                    AppSegmentedControl {
-                                        width: parent.width
-                                        label: "Rename Mode"
-                                        model: appBridge ? appBridge.renameModeChoices : []
-                                        currentValue: appBridge ? appBridge.upscaleRenameMode : "Auto"
-                                        onActivated: (v) => { if (appBridge) appBridge.upscaleRenameMode = v }
+                                    Text {
+                                        visible: appBridge && appBridge.fixedQualityCodecs.indexOf(appBridge.upscaleCodec) >= 0
+                                        text: "Quality: Fixed by codec"
+                                        color: Theme.textSecondary
+                                        font.pixelSize: Theme.fontSizeSmall
                                     }
-                                    AppTextField {
-                                        visible: appBridge && appBridge.upscaleRenameMode === "Custom"
-                                        width: parent.width
-                                        label: "Custom Suffix"
-                                        text: appBridge ? appBridge.upscaleCustomSuffix : "_Upscale"
-                                        onTextEdited: (t) => { if (appBridge) appBridge.upscaleCustomSuffix = t }
-                                    }
+
                                 }
                             }
                         }
@@ -399,7 +379,7 @@ model: appBridge ? appBridge.vsrQualityChoices : []
                 Rectangle {
                     id: actionBar
                     width: parent.width
-                    height: 54
+                    height: 88
                     color: Theme.bgSurface
                     border.color: Theme.borderSubtle
                     border.width: 1
@@ -407,16 +387,18 @@ model: appBridge ? appBridge.vsrQualityChoices : []
                     Column {
                         anchors.fill: parent
                         anchors.margins: 8
-                        spacing: 4
+                        spacing: 6
 
                         Row {
                             width: parent.width
                             spacing: 8
+                            visible: root.isImage
 
                             AppButton {
                                 text: "Preview"
-                                width: 90
-                                buttonHeight: 34
+                                iconName: "preview"
+                                width: (parent.width - 16) / 3
+                                buttonHeight: 30
                                 enabled: appBridge ? appBridge.canPreview : false
                                 onClicked: {
                                     if (appBridge) appBridge.renderPreviewAt(viewport.playheadMs)
@@ -424,31 +406,72 @@ model: appBridge ? appBridge.vsrQualityChoices : []
                             }
 
                             AppButton {
-                                text: appBridge && appBridge.canStop ? "Stop" : "Upscale Batch"
-                                variant: appBridge && appBridge.canStop ? "danger" : "primary"
-                                width: parent.width - 294
-                                buttonHeight: 34
-                                enabled: appBridge ? (appBridge.canStop || appBridge.canRender) : false
-                                onClicked: {
-                                    if (appBridge) {
-                                        if (appBridge.canStop) appBridge.stopActiveBatch()
-                                        else if (appBridge.canRender) appBridge.startActiveBatch()
-                                    }
-                                }
-                            }
-
-                            AppButton {
                                 text: "Reset"
-                                width: 90
-                                buttonHeight: 34
+                                iconName: "reset"
+                                width: (parent.width - 16) / 3
+                                buttonHeight: 30
                                 onClicked: { if (appBridge) appBridge.resetTabSettings("upscale") }
                             }
 
                             AppButton {
                                 text: "Outputs"
-                                width: 90
-                                buttonHeight: 34
+                                iconName: "outputs_folder"
+                                width: (parent.width - 16) / 3
+                                buttonHeight: 30
                                 onClicked: { if (appBridge) appBridge.openFolder("") }
+                            }
+                        }
+
+                        Row {
+                            width: parent.width
+                            spacing: 8
+                            visible: !root.isImage
+
+                            AppButton {
+                                text: "Preview"
+                                iconName: "preview"
+                                width: Math.max(100, parent.width - 156)
+                                buttonHeight: 30
+                                enabled: appBridge ? appBridge.canPreview : false
+                                onClicked: { if (appBridge) appBridge.renderPreviewAt(viewport.playheadMs) }
+                            }
+
+                            AppComboBox {
+                                width: 72
+                                comboHeight: 30
+                                dropUp: true
+                                model: appBridge ? appBridge.upscalePreviewLengthChoices : []
+                                currentValue: appBridge ? appBridge.upscalePreviewLength : "3"
+                                onActivated: (value) => { if (appBridge) appBridge.upscalePreviewLength = value }
+                            }
+
+                            AppIconButton {
+                                iconName: "reset"
+                                buttonSize: 30
+                                tooltipText: "Reset upscale settings"
+                                onClicked: { if (appBridge) appBridge.resetTabSettings("upscale") }
+                            }
+
+                            AppIconButton {
+                                iconName: "outputs_folder"
+                                buttonSize: 30
+                                tooltipText: "Open outputs folder"
+                                onClicked: { if (appBridge) appBridge.openFolder("") }
+                            }
+                        }
+
+                        AppButton {
+                            text: appBridge && appBridge.canStop ? "Stop" : (root.isImage ? "Upscale Image(s)" : "Upscale Video(s)")
+                            iconName: appBridge && appBridge.canStop ? "stop" : "start_render"
+                            variant: appBridge && appBridge.canStop ? "danger" : "primary"
+                            width: parent.width
+                            buttonHeight: 34
+                            enabled: appBridge ? (appBridge.canStop || (appBridge.operationState === "Idle" && appBridge.runtimeState === "Ready" && !appBridge.isLiveRunning)) : false
+                            onClicked: {
+                                if (appBridge) {
+                                    if (appBridge.canStop) appBridge.stopActiveBatch()
+                                    else appBridge.requestActiveBatchExport()
+                                }
                             }
                         }
                     }

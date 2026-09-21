@@ -85,16 +85,20 @@ def _sampled_packet_timeline_is_cfr(
 ) -> bool:
     """Reject VFR timelines that container-level average/nominal rates hide.
 
-    Packet PTS values are sorted to remove codec reordering. Reading 128 packet
-    headers is bounded and does not decode or transfer frame pixels.
+    Packet PTS values are sorted to remove codec reordering. Read past the
+    portion being tested: the final packets of a bounded B-frame sample can
+    contain a later PTS while an earlier PTS is still outside the sample.
     """
     data = _run_json([
         str(FFPROBE), "-v", "error", "-select_streams", "v:0",
-        "-read_intervals", "%+#128", "-show_packets", "-show_entries",
+        "-read_intervals", "%+#160", "-show_packets", "-show_entries",
         "packet=pts", "-of", "json", str(path),
     ], controller=controller)
-    timestamps = sorted({int(packet["pts"]) for packet in data.get("packets") or []
+    packets = data.get("packets") or []
+    timestamps = sorted({int(packet["pts"]) for packet in packets
                          if packet.get("pts") not in {None, "N/A"}})
+    if len(packets) >= 160:
+        timestamps = timestamps[:-16]
     deltas = [b - a for a, b in zip(timestamps, timestamps[1:]) if b > a]
     if len(deltas) < 2:
         return True

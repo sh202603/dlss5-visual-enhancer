@@ -30,6 +30,14 @@ Item {
             border.color: control.activeFocus ? Theme.accent : (control.checked ? Theme.accent : (mouseArea.containsMouse ? Theme.borderActive : Theme.borderDefault))
             border.width: 1
 
+            AppIcon {
+                anchors.centerIn: parent
+                iconName: "check"
+                iconSize: 12
+                color: "#FFFFFF"
+                visible: control.checked
+            }
+
             Behavior on color { ColorAnimation { duration: Theme.animFast } }
         }
 

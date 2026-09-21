@@ -41,24 +41,27 @@ Rectangle {
     // any layout. The transport always masters the input timeline (even on
     // the Output tab), so every scrub addresses input frames and refreshes
     // the preview at the settled playhead. The Preview button stays the
-    // manual render path. Frame Interpolation is manual-only ("Preview"):
-    // it never scrub-refreshes even when the global switch is on.
+    // manual render path. Frame Interpolation and a rendered Upscale clip
+    // use green timeline spans, so scrubbing those clips never starts a
+    // one-frame realtime render over the processed range.
     readonly property bool isFITab: appBridge && appBridge.activeTab === "frame-interpolation"
-    readonly property bool scrubRefreshEligible: appBridge && appBridge.autoPreviewEnabled && !viewport.isFITab && viewport.hasOutput && appBridge.previewOutputIsVideo
-    // FI pre-rendered span containing timeline second sec, newest first wins
+    readonly property var renderedPreviewRanges: appBridge ? appBridge.previewRenderedRanges : []
+    readonly property bool hasRangePlayback: viewport.isFITab || (appBridge && appBridge.activeTab === "upscale" && appBridge.upscaleMode === "Video" && viewport.renderedPreviewRanges.length > 0)
+    readonly property bool scrubRefreshEligible: appBridge && appBridge.autoPreviewEnabled && !viewport.hasRangePlayback && viewport.hasOutput && appBridge.previewOutputIsVideo
+    // Pre-rendered span containing timeline second sec, newest first wins
     // so re-rendered spans resolve to the latest clip. Null when outside all
     // green spans (or when ranges are unavailable).
     function fiRangeAt(sec) {
-        if (!viewport.isFITab || !appBridge || !appBridge.previewRenderedRanges) return null
-        var rs = appBridge.previewRenderedRanges
+        if (!viewport.hasRangePlayback) return null
+        var rs = viewport.renderedPreviewRanges
         for (var i = rs.length - 1; i >= 0; i--) {
             var r = rs[i]
             if (sec >= r.start && sec < r.end) return r
         }
         return null
     }
-    // Range under the live playhead + the clip the output pane should show
-    // on the FI tab. Swap discipline (this is what keeps playback smooth):
+    // Range under the live playhead + the clip the output pane should show.
+    // Swap discipline (this is what keeps playback smooth):
     // a VISIBLE player is never re-pointed. fiPinned is assigned only while
     // hidden (forward pre-warm), on settled pause/seek snaps, or in 2-Up
     // exact-follow. Boundary flips therefore land on an already-decoding
@@ -75,8 +78,14 @@ Rectangle {
         var bu = (r && r.url) ? r.url : ""
         if (au !== bu) viewport.fiPinned = r
     }
+    function syncRangePin() {
+        viewport.fiLastPosMs = -1
+        viewport.fiPinTo(viewport.hasRangePlayback ? viewport.fiRangeAt(viewport.playheadMs / 1000.0) : null)
+    }
+    onHasRangePlaybackChanged: Qt.callLater(viewport.syncRangePin)
+    onRenderedPreviewRangesChanged: Qt.callLater(viewport.syncRangePin)
     readonly property string fiOutputUrl: {
-        if (!viewport.isFITab || !appBridge) return ""
+        if (!viewport.hasRangePlayback || !appBridge) return ""
         if (viewport.fiPinned && viewport.fiPinned.url) return viewport.fiPinned.url
         return appBridge.previewInputIsVideo ? appBridge.previewInputUrl : ""
     }
@@ -166,21 +175,21 @@ Rectangle {
         onDurationChanged: (d) => { console.log("inputPlayer duration:", d, "source:", source) }
         // Output mirror: input is the master timeline in every layout; the
         // output follows clamped to its own (usually single-frame) duration.
-        // One-directional so no feedback loop is possible. On the FI tab the
+        // One-directional so no feedback loop is possible. For timed clips the
         // playhead is mapped into the green span's own clip instead, and
         // while playing the viewer auto-shows processed footage inside green
         // spans and the original outside (paused tabs stay manual; peek and
         // 2-Up are never overridden).
         onPositionChanged: (pos) => {
-            if (viewport.isFITab && viewport.mirrorOutput) {
+            if (viewport.hasRangePlayback && viewport.mirrorOutput) {
                 var r = viewport.fiRangeAt(pos / 1000.0)
                 var inputPlaying = inputPlayer.playbackState === MediaPlayer.PlayingState
                 var jump = viewport.fiLastPosMs < 0 || Math.abs(pos - viewport.fiLastPosMs) > 800
                 // Pinned clip went stale (ranges cleared by a settings tweak
                 // mid-play): drop it so the next rule re-pins exact.
-                if (viewport.fiPinned && viewport.fiPinned.url && appBridge && appBridge.previewRenderedRanges) {
+                if (viewport.fiPinned && viewport.fiPinned.url) {
                     var alive = false
-                    var rs0 = appBridge.previewRenderedRanges
+                    var rs0 = viewport.renderedPreviewRanges
                     for (var k = 0; k < rs0.length; k++) {
                         if (rs0[k].url === viewport.fiPinned.url) { alive = true; break }
                     }
@@ -267,12 +276,12 @@ Rectangle {
             if (state !== MediaPlayer.PlayingState && appBridge && viewport.isVideo)
                 appBridge.notePlayheadMs(inputPlayer.position)
             if (!viewport.mirrorOutput) return
-            // Output always carries timeline-meaningful footage (on FI the
+            // Output always carries timeline-meaningful footage (for ranges the
             // original outside green, the range clip inside), so it simply
-            // runs/pauses with the input on every tab. On FI pause the pin
+            // runs/pauses with the input on every tab. On range pause the pin
             // snaps exact (ticks don't fire while paused, so the Output tab
             // inspects the settled frame, not a stale pre-warmed clip).
-            if (viewport.isFITab && state !== MediaPlayer.PlayingState)
+            if (viewport.hasRangePlayback && state !== MediaPlayer.PlayingState)
                 viewport.fiPinTo(viewport.fiRangeAt(viewport.playheadMs / 1000.0))
             if (state === MediaPlayer.PlayingState) outputPlayer.play()
             else outputPlayer.pause()
@@ -280,18 +289,18 @@ Rectangle {
     }
         // Dedicated preview-output player (usually a single enhanced frame).
         // Independent from inputPlayer so stepping/scrubbing the source is never
-        // clamped to the 1-frame preview duration. On the FI tab the source
+        // clamped to the 1-frame preview duration. For timed clips the source
         // follows the pinned span (pre-warmed up to fiLookaheadSec ahead while
         // hidden, snapped exact on pause/seek); everywhere else it is the
-        // latest preview output. FI range clips play once (loops: 1) so a span
+        // latest preview output. Range clips play once (loops: 1) so a span
         // never replays at its end — playback continues with the original.
         MediaPlayer {
         id: outputPlayer
         objectName: "outputPlayer"
-        source: viewport.isVideo && appBridge ? (viewport.isFITab ? viewport.fiOutputUrl : (appBridge.previewOutputIsVideo ? appBridge.previewOutputUrl : "")) : ""
+        source: viewport.isVideo && appBridge ? (viewport.hasRangePlayback ? viewport.fiOutputUrl : (appBridge.previewOutputIsVideo ? appBridge.previewOutputUrl : "")) : ""
         audioOutput: mediaAudio
         videoOutput: outputSurface
-        loops: viewport.isFITab ? 1 : MediaPlayer.Infinite
+        loops: viewport.hasRangePlayback ? 1 : MediaPlayer.Infinite
         property bool primePending: false
         onSourceChanged: {
             pause()
@@ -372,14 +381,14 @@ Rectangle {
         Row {
             visible: !viewport.isVideo
             anchors.right: parent.right; anchors.rightMargin: 10; anchors.verticalCenter: parent.verticalCenter; spacing: 6
-            AppButton { text: "Fit"; buttonHeight: 26; width: 48; onClicked: viewport.fitToWindow() }
-            AppButton { text: "100%"; buttonHeight: 26; width: 54; onClicked: viewport.actualPixels() }
+            AppIconButton { iconName: "fit_to_window"; buttonSize: 26; tooltipText: "Fit to window"; onClicked: viewport.fitToWindow() }
+            AppIconButton { iconName: "actual_size"; buttonSize: 26; tooltipText: "Actual pixels"; onClicked: viewport.actualPixels() }
             Text { text: Math.round(viewport.displayScale * Math.max(1.0, Screen.devicePixelRatio) * 100) + "%"; color: Theme.textPrimary; font.family: Theme.monoFontFamily; anchors.verticalCenter: parent.verticalCenter }
-            AppIconButton { iconSymbol: "-"; showTooltip: false; onClicked: viewport.changeZoom(0.8) }
-            AppIconButton { iconSymbol: "+"; showTooltip: false; onClicked: viewport.changeZoom(1.25) }
+            AppIconButton { iconName: "zoom_out"; tooltipText: "Zoom out"; onClicked: viewport.changeZoom(0.8) }
+            AppIconButton { iconName: "zoom_in"; tooltipText: "Zoom in"; onClicked: viewport.changeZoom(1.25) }
             AppIconButton {
-                iconSymbol: appBridge && appBridge.focusPreview ? "[X]" : "[ ]"
-                showTooltip: false
+                iconName: appBridge && appBridge.focusPreview ? "exit_fullscreen" : "focus_preview"
+                tooltipText: appBridge && appBridge.focusPreview ? "Exit focus preview" : "Focus preview"
                 onClicked: { if (appBridge) appBridge.focusPreview = !appBridge.focusPreview }
             }
         }
@@ -656,8 +665,8 @@ Rectangle {
         frameRate: viewport.inputFps
         fallbackDurationMs: viewport.inputDurationMs
         fallbackFrameRate: viewport.inputFps
-        // Green pre-rendered spans (FI "Preview" only; [] elsewhere).
-        renderedRanges: viewport.isFITab && appBridge ? appBridge.previewRenderedRanges : []
+        // Green pre-rendered FI and Upscale clip spans.
+        renderedRanges: viewport.hasRangePlayback ? viewport.renderedPreviewRanges : []
         onUserScrubbed: (posMs) => {
             appBridge.notePlayheadMs(posMs)
             if (viewport.scrubRefreshEligible) appBridge.schedulePreviewAt(posMs)
@@ -727,7 +736,7 @@ Rectangle {
             border.color: Theme.borderDefault
             border.width: 1
             radius: Theme.radiusSmall
-            implicitWidth: Math.max(124, Math.ceil(previewFontMetrics.width) + 24)
+            implicitWidth: Math.max(150, Math.ceil(previewFontMetrics.width) + 48)
         }
 
         delegate: QQC2.MenuItem {
@@ -736,14 +745,25 @@ Rectangle {
             leftPadding: 10
             rightPadding: 10
             indicator: null
-            contentItem: Text {
-                text: previewMi.text
-                color: !previewMi.enabled ? Theme.textMuted : (previewMi.highlighted ? Theme.textPrimary : Theme.textSecondary)
-                font.family: Theme.fontFamily
-                font.pixelSize: Theme.fontSizeBody
-                font.weight: Font.Normal
-                elide: Text.ElideRight
-                verticalAlignment: Text.AlignVCenter
+            contentItem: Row {
+                spacing: 7
+                AppIcon {
+                    iconName: previewMi.icon.name
+                    iconSize: 14
+                    color: !previewMi.enabled ? Theme.textMuted : (previewMi.highlighted ? Theme.textPrimary : Theme.textSecondary)
+                    anchors.verticalCenter: parent.verticalCenter
+                }
+                Text {
+                    width: Math.max(0, previewMi.width - 42)
+                    text: previewMi.text
+                    color: !previewMi.enabled ? Theme.textMuted : (previewMi.highlighted ? Theme.textPrimary : Theme.textSecondary)
+                    font.family: Theme.fontFamily
+                    font.pixelSize: Theme.fontSizeBody
+                    font.weight: Font.Normal
+                    elide: Text.ElideRight
+                    verticalAlignment: Text.AlignVCenter
+                    anchors.verticalCenter: parent.verticalCenter
+                }
             }
             background: Rectangle {
                 color: previewMi.highlighted && previewMi.enabled ? Theme.bgHover : "transparent"
@@ -754,18 +774,21 @@ Rectangle {
         QQC2.MenuItem {
             implicitHeight: 25
             text: viewport.isVideo ? "Clear video" : "Clear image"
+            icon.name: "trash"
             enabled: viewport.hasInput && appBridge && appBridge.canModifyQueue
             onTriggered: { if (appBridge) appBridge.clearSelectedPreviewItem() }
         }
         QQC2.MenuItem {
             implicitHeight: 25
             text: "Clear all"
+            icon.name: "clear_all"
             enabled: viewport.hasInput && appBridge && appBridge.canModifyQueue
             onTriggered: { if (appBridge) appBridge.clearActiveQueue() }
         }
         QQC2.MenuItem {
             implicitHeight: 25
             text: "Show in Explorer"
+            icon.name: "reveal_in_explorer"
             enabled: viewport.hasInput && appBridge
             onTriggered: { if (appBridge) appBridge.showSelectedInExplorer() }
         }

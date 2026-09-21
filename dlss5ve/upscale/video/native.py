@@ -302,6 +302,12 @@ class _BridgeManager:
 _MANAGER = _BridgeManager()
 
 
+def preload_bridge() -> None:
+    """Load the bridge before showing the UI without fixing the GPU choice."""
+    with NGX_RUNTIME_LOCK:
+        _MANAGER._load()
+
+
 def _feature_record(status: dict[str, Any], prefix: str) -> dict[str, Any]:
     version = str(status.get(f"{prefix}_min_driver") or "0.0").split(".", 1)
     return {

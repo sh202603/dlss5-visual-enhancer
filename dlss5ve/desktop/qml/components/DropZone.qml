@@ -42,6 +42,13 @@ Rectangle {
         spacing: 16
         width: Math.min(parent.width - 40, 480)
 
+        AppIcon {
+            anchors.horizontalCenter: parent.horizontalCenter
+            iconName: "inbox_import"
+            iconSize: 48
+            color: dropArea.containsDrag ? Theme.accent : Theme.textSecondary
+        }
+
         // Main prompt
         Text {
             anchors.horizontalCenter: parent.horizontalCenter
@@ -59,12 +66,14 @@ Rectangle {
 
             AppButton {
                 text: "Choose Files..."
+                iconName: "add_file"
                 variant: "secondary"
                 onClicked: fileDialog.open()
             }
 
             AppButton {
                 text: "Choose Folder..."
+                iconName: "add_folder"
                 variant: "secondary"
                 onClicked: folderDialog.open()
             }

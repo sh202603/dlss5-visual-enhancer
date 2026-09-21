@@ -90,14 +90,14 @@ Item {
             }
         }
 
-        Text {
+        AppIcon {
             id: clearBtn
             visible: input.text !== "" && !control.readOnly && control.enabled
             anchors.right: parent.right
             anchors.rightMargin: 8
             anchors.verticalCenter: parent.verticalCenter
-            text: "x"
-            font.pixelSize: 14
+            iconName: "close"
+            iconSize: 14
             color: clearMouse.containsMouse ? Theme.textPrimary : Theme.textMuted
             MouseArea {
                 id: clearMouse

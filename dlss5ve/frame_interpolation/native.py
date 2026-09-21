@@ -18,9 +18,9 @@ from ..core.paths import RUNTIME
 
 RUNTIME_DIR = RUNTIME / "dlssg"
 BRIDGE = RUNTIME_DIR / "neuroframe_engine_frame_interpolation.dll"
-BRIDGE_ABI_VERSION = 1
+BRIDGE_ABI_VERSION = 3
 MEMORY_HOST, MEMORY_CUDA = 1, 2
-FORMAT_RGBA8, FORMAT_NV12, FORMAT_P010 = 1, 4, 5
+FORMAT_RGBA8, FORMAT_RGBA16F, FORMAT_NV12, FORMAT_P010 = 1, 2, 4, 5
 FLAG_FORCE_RESET, FLAG_DETECT_CUT = 1, 2
 MAX_GENERATED = 4
 
@@ -168,6 +168,8 @@ class _BridgeManager:
         library.fi_process_frame_v1.restype = ctypes.c_int
         library.fi_surface_frame_desc.argtypes = [ctypes.c_void_p, ctypes.POINTER(FrameDescriptorV1)]
         library.fi_surface_frame_desc.restype = ctypes.c_int
+        library.fi_session_copy_input_rgb.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int]
+        library.fi_session_copy_input_rgb.restype = ctypes.c_void_p
         library.fi_surface_retain.argtypes = [ctypes.c_void_p]
         library.fi_surface_release.argtypes = [ctypes.c_void_p]
         library.fi_surface_copy_to_host.argtypes = [
@@ -175,6 +177,27 @@ class _BridgeManager:
             ctypes.c_uint32, ctypes.c_void_p, ctypes.c_int,
         ]
         library.fi_surface_copy_to_host.restype = ctypes.c_int
+        library.fi_surface_copy_rgb_to_host.argtypes = [
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint32,
+            ctypes.c_void_p, ctypes.c_int,
+        ]
+        library.fi_surface_copy_rgb_to_host.restype = ctypes.c_int
+        library.fi_surface_convert.argtypes = [
+            ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32,
+            ctypes.c_void_p, ctypes.c_int,
+        ]
+        library.fi_surface_convert.restype = ctypes.c_void_p
+        library.fi_session_copy_motion.argtypes = [
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint32,
+            ctypes.c_void_p, ctypes.c_int,
+        ]
+        library.fi_session_copy_motion.restype = ctypes.c_int
+        library.fi_session_copy_nvof_flow.argtypes = [
+            ctypes.c_void_p, ctypes.c_uint32, ctypes.c_void_p, ctypes.c_uint32,
+            ctypes.POINTER(ctypes.c_uint32), ctypes.POINTER(ctypes.c_uint32),
+            ctypes.c_void_p, ctypes.c_int,
+        ]
+        library.fi_session_copy_nvof_flow.restype = ctypes.c_int
         library.fi_session_diagnostics.argtypes = [ctypes.c_void_p,
                                                     ctypes.POINTER(ctypes.c_uint64), ctypes.c_uint32]
         library.fi_session_diagnostics.restype = ctypes.c_int
@@ -251,6 +274,12 @@ class _BridgeManager:
 _MANAGER = _BridgeManager()
 
 
+def preload_bridge() -> None:
+    """Load the bridge before showing the UI without fixing the GPU choice."""
+    with NGX_RUNTIME_LOCK:
+        _MANAGER._load()
+
+
 def initialize_bridge(ordinal: int) -> dict[str, Any]:
     return _MANAGER.initialize(ordinal)
 
@@ -271,7 +300,16 @@ class DLSSGCudaSurface:
             self.release()
             self.closed = True
 
+    def __del__(self) -> None:
+        if not self.closed:
+            self.close()
+
+    def _require_yuv(self) -> None:
+        if self.descriptor.pixel_format not in {FORMAT_NV12, FORMAT_P010}:
+            raise DLSSGBridgeError("An RGB surface must be converted before YUV encoding.")
+
     def to_av_frame(self) -> av.VideoFrame:
+        self._require_yuv()
         descriptor = self.descriptor
         bits = 16 if descriptor.pixel_format == FORMAT_P010 else 8
         item_size = bits // 8
@@ -296,6 +334,7 @@ class DLSSGCudaSurface:
         return frame
 
     def to_host_frame(self) -> av.VideoFrame:
+        self._require_yuv()
         pixel_format = "p010le" if self.descriptor.pixel_format == FORMAT_P010 else "nv12"
         frame = av.VideoFrame(int(self.descriptor.width), int(self.descriptor.height), pixel_format)
         error = ctypes.create_string_buffer(2048)
@@ -306,6 +345,32 @@ class DLSSGCudaSurface:
             raise DLSSGBridgeError(error.value.decode("utf-8", "replace") or "CUDA download failed")
         self.close()
         return frame
+
+    def to_host_rgb(self) -> np.ndarray:
+        if self.descriptor.pixel_format not in {FORMAT_RGBA8, FORMAT_RGBA16F}:
+            raise DLSSGBridgeError("The surface does not contain RGB pixels.")
+        dtype = np.float16 if self.descriptor.pixel_format == FORMAT_RGBA16F else np.uint8
+        pixels = np.empty((int(self.descriptor.height), int(self.descriptor.width), 4), dtype=dtype)
+        error = ctypes.create_string_buffer(2048)
+        if not self.library.fi_surface_copy_rgb_to_host(
+                ctypes.c_void_p(self.handle), ctypes.c_void_p(int(pixels.ctypes.data)),
+                int(pixels.strides[0]), error, len(error)):
+            raise DLSSGBridgeError(error.value.decode("utf-8", "replace") or "RGB download failed")
+        return pixels
+
+    def to_yuv_surface(self, *, color_matrix: int, color_range: int,
+                       p010: bool) -> "DLSSGCudaSurface":
+        error = ctypes.create_string_buffer(2048)
+        handle = self.library.fi_surface_convert(
+            ctypes.c_void_p(self.handle), FORMAT_P010 if p010 else FORMAT_NV12,
+            int(color_matrix), int(color_range), error, len(error))
+        if not handle:
+            raise DLSSGBridgeError(error.value.decode("utf-8", "replace") or "RGB conversion failed")
+        descriptor = FrameDescriptorV1.empty()
+        if not self.library.fi_surface_frame_desc(ctypes.c_void_p(handle), ctypes.byref(descriptor)):
+            self.library.fi_surface_release(ctypes.c_void_p(handle))
+            raise DLSSGBridgeError("RGB conversion returned an invalid CUDA surface.")
+        return DLSSGCudaSurface(self.library, int(handle), descriptor, self.ordinal)
 
 
 class DirectDLSSGSession:
@@ -323,7 +388,7 @@ class DirectDLSSGSession:
         descriptor.struct_size, descriptor.abi_version = ctypes.sizeof(descriptor), BRIDGE_ABI_VERSION
         descriptor.width, descriptor.height = self.width, self.height
         descriptor.generated_count, descriptor.hdr = self.generated_count, int(self.hdr)
-        descriptor.surface_pool_size = 8
+        descriptor.surface_pool_size = 16
         error = ctypes.create_string_buffer(4096)
         handle = _MANAGER.call(
             "create", lambda: self.library.fi_session_create(ctypes.byref(descriptor), error, len(error)),
@@ -343,6 +408,18 @@ class DirectDLSSGSession:
         descriptor.color_matrix, descriptor.color_range = int(color_matrix), int(color_range)
         descriptor.color_primaries, descriptor.color_transfer = int(color_primaries), int(color_transfer)
         descriptor.rotation = int(rotation) % 360
+        if isinstance(frame, DLSSGCudaSurface):
+            if frame.closed:
+                raise DLSSGBridgeError("A released RGB surface cannot be interpolated.")
+            if frame.ordinal != self.ordinal:
+                raise DLSSGBridgeError("RGB surface belongs to a different CUDA device.")
+            descriptor.memory_type = MEMORY_CUDA
+            descriptor.pixel_format = frame.descriptor.pixel_format
+            descriptor.width, descriptor.height = frame.descriptor.width, frame.descriptor.height
+            descriptor.planes[:] = frame.descriptor.planes[:]
+            descriptor.strides[:] = frame.descriptor.strides[:]
+            descriptor.rotation = 0
+            return descriptor, (frame,)
         if isinstance(frame, np.ndarray):
             pixels = np.ascontiguousarray(frame, dtype=np.uint8)
             if pixels.shape != (self.height, self.width, 4):
@@ -379,9 +456,10 @@ class DirectDLSSGSession:
 
     def process_frame(self, frame: Any, *, force_reset: bool = False,
                       detect_scene_cut: bool = True, output_cuda: bool = True,
-                      output_p010: bool = False, color_matrix: int = 1,
+                      output_p010: bool = False, output_rgb: bool = False,
+                      color_matrix: int = 1,
                       color_range: int = 0, color_primaries: int = 1,
-                      color_transfer: int = 0, rotation: int = 0) -> tuple[list[av.VideoFrame], dict[str, Any]]:
+                      color_transfer: int = 0, rotation: int = 0) -> tuple[list[Any], dict[str, Any]]:
         if self.closed:
             raise DLSSGBridgeError("DLSSG session is closed.")
         if self.controller.cancel.is_set():
@@ -392,7 +470,8 @@ class DirectDLSSGSession:
         result = FrameResultV1.empty()
         error = ctypes.create_string_buffer(4096)
         flags = int(force_reset) * FLAG_FORCE_RESET | int(detect_scene_cut) * FLAG_DETECT_CUT
-        output_format = FORMAT_P010 if output_p010 else FORMAT_NV12
+        output_format = (FORMAT_RGBA16F if self.hdr else FORMAT_RGBA8) if output_rgb else (
+            FORMAT_P010 if output_p010 else FORMAT_NV12)
         ok = _MANAGER.call(
             "process", lambda: self.library.fi_process_frame_v1(
                 ctypes.c_void_p(self.handle), ctypes.byref(source), output_format, flags,
@@ -403,7 +482,7 @@ class DirectDLSSGSession:
             if "access violation" in detail.casefold() or "poison" in detail.casefold():
                 _MANAGER.poisoned_reason = detail
             raise DLSSGBridgeError(f"DLSSG evaluation failed: {detail}")
-        frames: list[av.VideoFrame] = []
+        frames: list[Any] = []
         try:
             for index in range(int(result.generated_count)):
                 handle = int(result.surface_handles[index])
@@ -412,7 +491,8 @@ class DirectDLSSGSession:
                         ctypes.c_void_p(handle), ctypes.byref(descriptor)):
                     raise DLSSGBridgeError("DLSSG returned an invalid output surface.")
                 surface = DLSSGCudaSurface(self.library, handle, descriptor, self.ordinal)
-                frames.append(surface.to_av_frame() if output_cuda else surface.to_host_frame())
+                frames.append(surface if output_rgb else (
+                    surface.to_av_frame() if output_cuda else surface.to_host_frame()))
         except BaseException:
             for index in range(len(frames), int(result.generated_count)):
                 handle = int(result.surface_handles[index])
@@ -440,6 +520,27 @@ class DirectDLSSGSession:
             self.stage_timings[key] += detail[key]
         return frames, detail
 
+    def copy_current_input_rgb(self) -> DLSSGCudaSurface:
+        """Retain the RGB input last supplied to this DLSSG session."""
+        if self.closed or not self.completed_frames:
+            raise DLSSGBridgeError("No current DLSSG RGB input is available.")
+        error = ctypes.create_string_buffer(2048)
+        handle = _MANAGER.call(
+            "copy input RGB", lambda: self.library.fi_session_copy_input_rgb(
+                ctypes.c_void_p(self.handle), error, len(error)),
+            (self, error), self.timeout)
+        if not handle:
+            raise DLSSGBridgeError(error.value.decode("utf-8", "replace") or "Input RGB copy failed")
+        descriptor = FrameDescriptorV1.empty()
+        if not self.library.fi_surface_frame_desc(ctypes.c_void_p(handle), ctypes.byref(descriptor)):
+            self.library.fi_surface_release(ctypes.c_void_p(handle))
+            raise DLSSGBridgeError("Input RGB copy returned an invalid surface.")
+        expected = FORMAT_RGBA16F if self.hdr else FORMAT_RGBA8
+        if descriptor.pixel_format != expected:
+            self.library.fi_surface_release(ctypes.c_void_p(handle))
+            raise DLSSGBridgeError("Input RGB copy returned an unexpected format.")
+        return DLSSGCudaSurface(self.library, int(handle), descriptor, self.ordinal)
+
     def diagnostics(self) -> dict[str, Any]:
         values = (ctypes.c_uint64 * 8)()
         if self.closed or not self.library.fi_session_diagnostics(
@@ -452,6 +553,41 @@ class DirectDLSSGSession:
             "surface_pool_allocated": int(values[6]), "surface_pool_capacity": int(values[7]),
             "nvof_mode": "SLOW", "timings_ms": dict(self.stage_timings),
         }
+
+    def motion_diagnostics(self) -> np.ndarray:
+        """Download the final current-to-previous pixel vectors for diagnostics."""
+        if self.closed:
+            raise DLSSGBridgeError("DLSSG session is closed.")
+        values = np.empty((self.height, self.width, 2), dtype=np.float16)
+        error = ctypes.create_string_buffer(2048)
+        ok = _MANAGER.call(
+            "motion diagnostics", lambda: self.library.fi_session_copy_motion(
+                ctypes.c_void_p(self.handle), ctypes.c_void_p(int(values.ctypes.data)),
+                int(values.strides[0]), error, len(error)),
+            (self, values, error), self.timeout)
+        if not ok:
+            raise DLSSGBridgeError(error.value.decode("utf-8", "replace") or "Motion readback failed")
+        return values.astype(np.float32)
+
+    def nvof_flow_diagnostics(self, *, backward: bool = False) -> np.ndarray:
+        """Download raw NVOF grid vectors in pixel units for motion validation."""
+        if self.closed:
+            raise DLSSGBridgeError("DLSSG session is closed.")
+        width, height = ctypes.c_uint32(), ctypes.c_uint32()
+        error = ctypes.create_string_buffer(2048)
+        args = (ctypes.c_void_p(self.handle), int(backward))
+        if not self.library.fi_session_copy_nvof_flow(
+                *args, None, 0, ctypes.byref(width), ctypes.byref(height), error, len(error)):
+            raise DLSSGBridgeError(error.value.decode("utf-8", "replace") or "NVOF dimensions failed")
+        values = np.empty((height.value, width.value, 2), dtype=np.int16)
+        ok = _MANAGER.call(
+            "NVOF flow diagnostics", lambda: self.library.fi_session_copy_nvof_flow(
+                *args, ctypes.c_void_p(int(values.ctypes.data)), int(values.strides[0]),
+                ctypes.byref(width), ctypes.byref(height), error, len(error)),
+            (self, values, error), self.timeout)
+        if not ok:
+            raise DLSSGBridgeError(error.value.decode("utf-8", "replace") or "NVOF flow readback failed")
+        return values.astype(np.float32) / 32.0
 
     def close(self, *, abort: bool = False) -> None:
         if self.closed:

@@ -28,34 +28,30 @@ Rectangle {
                 Text { width: parent.width; text: "Configure hardware assignment, preview behavior, native layout, and portable settings presets."; wrapMode: Text.Wrap; font.family: Theme.fontFamily; font.pixelSize: Theme.fontSizeLabel; color: Theme.textSecondary }
             }
 
-            Flow {
-                id: cardFlow
+            Column {
+                id: cardColumn
                 width: parent.width; spacing: 14
-                property real cardWidth: width >= 920 ? (width - spacing) / 2 : width
 
                 AppCard {
-                    width: cardFlow.cardWidth; title: "Hardware & GPU Acceleration"; collapsible: false
+                    width: cardColumn.width; title: "Hardware & GPU Acceleration"; collapsible: false
                     Column {
                         width: parent.width; spacing: 16
                         AppComboBox { width: parent.width; label: "AI Processing GPU (Tensor Cores / NGX)"; model: appBridge ? appBridge.aiGpuChoices : []; currentValue: appBridge ? appBridge.aiGpuUuid : "auto"; onActivated: (v) => { if (appBridge) appBridge.aiGpuUuid = v } }
                         AppComboBox { width: parent.width; label: "Video Processing GPU (NVENC / NVDEC)"; model: appBridge ? appBridge.videoGpuChoices : []; currentValue: appBridge ? appBridge.videoGpuUuid : "auto"; onActivated: (v) => { if (appBridge) appBridge.videoGpuUuid = v } }
-                        Text { width: parent.width; wrapMode: Text.Wrap; text: appBridge && appBridge.runtimeState === "Failed" ? appBridge.runtimeError : ("Runtime: " + (appBridge ? appBridge.runtimeState : "Initializing")); font.family: Theme.monoFontFamily; font.pixelSize: Theme.fontSizeSmall; color: appBridge && appBridge.runtimeState === "Failed" ? Theme.danger : Theme.textMuted }
                     }
                 }
 
                 AppCard {
-                    width: cardFlow.cardWidth; title: "Preview & Rendering Engine"; collapsible: false
+                    width: cardColumn.width; title: "Preview & Rendering Engine"; collapsible: false
                     Column {
                         width: parent.width; spacing: 16
                         AppSegmentedControl { width: parent.width; label: "Preview Encoding Strategy"; model: appBridge ? appBridge.previewEncodingChoices : []; currentValue: appBridge ? appBridge.previewEncoding : "Auto"; onActivated: (v) => { if (appBridge) appBridge.previewEncoding = v } }
                         AppSwitch { width: parent.width; label: "Realtime Preview"; checked: appBridge ? appBridge.autoPreviewEnabled : true; enabled: appBridge ? appBridge.runtimeState === "Ready" : false; onToggled: (v) => { if (appBridge) appBridge.autoPreviewEnabled = v } }
-                        AppCheckBox { label: "Full-size high-fidelity image previews"; checked: appBridge ? appBridge.fullSizeImagePreviews : false; onToggled: (c) => { if (appBridge) appBridge.fullSizeImagePreviews = c } }
-                        Text { width: parent.width; wrapMode: Text.Wrap; text: "Full-size previews preserve source detail but can use substantially more RAM on large RAW/8K images."; font.family: Theme.fontFamily; font.pixelSize: Theme.fontSizeSmall; color: Theme.textMuted }
                     }
                 }
 
                 AppCard {
-                    width: cardFlow.cardWidth; title: "Settings Presets"; collapsible: false
+                    width: cardColumn.width; title: "Settings Presets"; collapsible: false
                     Column {
                         width: parent.width; spacing: 12
                         AppTextField { width: parent.width; placeholderText: "Preset name (e.g. 4K Master)..."; text: root.presetName; onTextEdited: (t) => root.presetName = t }
@@ -63,26 +59,27 @@ Rectangle {
                             spacing: 8
                             AppButton {
                                 text: "Export Preset..."
+                                iconName: "export"
                                 onClicked: {
                                     if (root.presetName.trim().length === 0) { if (appBridge) appBridge.exportPreset(""); return }
                                     presetSaveDialog.open()
                                 }
                             }
-                            AppButton { text: "Import..."; onClicked: presetImportDialog.open() }
+                            AppButton { text: "Import..."; iconName: "import"; onClicked: presetImportDialog.open() }
                         }
                         Text { visible: appBridge && appBridge.presetStatus !== ""; width: parent.width; wrapMode: Text.Wrap; text: appBridge ? appBridge.presetStatus : ""; font.family: Theme.monoFontFamily; font.pixelSize: Theme.fontSizeSmall; color: Theme.accent }
                     }
                 }
 
                 AppCard {
-                    width: cardFlow.cardWidth; title: "Maintenance & Defaults"; collapsible: false
+                    width: cardColumn.width; title: "Maintenance & Defaults"; collapsible: false
                     Column {
                         width: parent.width; spacing: 12
                         Text { width: parent.width; wrapMode: Text.Wrap; text: "Factory reset restores all DLSS, upscale, interpolation, GPU, mask, and encoding settings. Window geometry remains a desktop preference."; font.family: Theme.fontFamily; font.pixelSize: Theme.fontSizeLabel; color: Theme.textSecondary }
                         Row {
                             width: parent.width; spacing: 8
-                            AppButton { text: "Open Logs"; onClicked: { if (appBridge) appBridge.openFolder(appBridge.currentLogPath) } }
-                            AppButton { text: "Reset All Settings to Defaults"; variant: "danger"; onClicked: resetDialog.open() }
+                            AppButton { text: "Open Logs"; iconName: "logs_folder"; onClicked: { if (appBridge) appBridge.openFolder(appBridge.currentLogPath) } }
+                            AppButton { text: "Reset All Settings to Defaults"; iconName: "reset"; variant: "danger"; onClicked: resetDialog.open() }
                         }
                     }
                 }

@@ -14,6 +14,8 @@ CODEC_CHOICES = (
     "AV1",
     "AV1 (NVIDIA NVENC)",
     "ProRes Proxy",
+    "ProRes HQ",
+    "FFV1 Lossless RGB 10-bit",
 )
 
 _CODEC_ALIASES = {
@@ -31,6 +33,8 @@ _BASE_CODEC_MAP = {
     "AV1": "AV1",
     "AV1 (NVIDIA NVENC)": "AV1",
     "ProRes Proxy": "ProRes Proxy",
+    "ProRes HQ": "ProRes HQ",
+    "FFV1 Lossless RGB 10-bit": "FFV1 Lossless RGB 10-bit",
 }
 
 _IS_NVENC_SET = {
@@ -53,6 +57,8 @@ _AUTOMATIC_CONTAINERS = {
     "AV1": "MKV",
     "AV1 (NVIDIA NVENC)": "MKV",
     "ProRes Proxy": "MOV",
+    "ProRes HQ": "MOV",
+    "FFV1 Lossless RGB 10-bit": "MKV",
 }
 
 # Keep AUTO_BITRATE_DIVISORS keyed by base codec; "HEVC" alias preserved for compat.
@@ -70,7 +76,13 @@ HDR_ALLOWED_CODECS = {
     "AV1",
     "AV1 (NVIDIA NVENC)",
     "ProRes Proxy",
+    "ProRes HQ",
+    "FFV1 Lossless RGB 10-bit",
 }
+
+FIXED_QUALITY_CODECS = frozenset({
+    "ProRes HQ", "FFV1 Lossless RGB 10-bit",
+})
 
 def _normalize_codec(codec: str) -> str:
     if not isinstance(codec, str):
@@ -164,9 +176,11 @@ def validate_codec_container(codec: str, container: str) -> None:
     norm = _normalize_codec(codec)
     if norm == "ProRes Proxy" and container == "MP4":
         raise ValueError("ProRes Proxy is not supported in MP4. Choose the MOV or MKV container.")
+    if norm in FIXED_QUALITY_CODECS and container != container_for_codec(norm):
+        raise ValueError(f"{norm} requires the {container_for_codec(norm)} container.")
     if norm not in CODEC_CHOICES and norm not in _CODEC_ALIASES.values():
         # Allow alias but error on truly unknown for early feedback; _codec_command will also validate.
-        if norm not in ("H.264", "H.264 (NVIDIA NVENC)", "H.265", "H.265 (NVIDIA NVENC)", "AV1", "AV1 (NVIDIA NVENC)", "ProRes Proxy", "HEVC"):
+        if norm not in _BASE_CODEC_MAP:
             raise ValueError(f"Unknown video codec: {codec!r}.")
 
 
@@ -180,7 +194,7 @@ def calculate_auto_bitrate_kbps(
     norm = _normalize_codec(codec)
     base = _base_codec(norm) if norm in _BASE_CODEC_MAP else norm
     # ProRes has no auto bitrate
-    if base == "ProRes Proxy":
+    if base == "ProRes Proxy" or base in FIXED_QUALITY_CODECS:
         raise ValueError(f"Automatic bitrate is unavailable for codec {codec!r}.")
     try:
         divisor = AUTO_BITRATE_DIVISORS[base]
@@ -211,6 +225,13 @@ def resolve_encoding_quality(
         # Accept HEVC alias
         if norm not in _BASE_CODEC_MAP and norm != "HEVC":
             raise ValueError(f"Unknown video codec: {codec!r}.")
+    if norm in FIXED_QUALITY_CODECS:
+        return {
+            "selection": quality_name,
+            "mode": "fixed-codec",
+            "target_bitrate_kbps": None,
+            "cq": None,
+        }
     if _normalize_codec(norm) == "ProRes Proxy" or _base_codec(norm) == "ProRes Proxy":
         # prores_ks otherwise ignores the application's quality selection.
         # Keep profile 0 while allowing higher selections to preserve fine

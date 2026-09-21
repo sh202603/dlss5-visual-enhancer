@@ -16,9 +16,9 @@ Rectangle {
     // for programmatic seeks or playback ticks. The viewport debounces these
     // into scrub-realtime preview refreshes.
     signal userScrubbed(real posMs)
-    // Pre-rendered timeline spans (seconds) painted green, e.g. Frame
-    // Interpolation "Preview" clips: [{start: 12.0, end: 15.0, url: ...}].
-    // Empty for every other workflow, which leaves the groove untouched.
+    // Pre-rendered video preview spans (seconds) painted green for Frame
+    // Interpolation and timed Upscale previews:
+    // [{start: 12.0, end: 15.0, url: ...}].
     property var renderedRanges: []
     height: 50
     color: Theme.bgSurface
@@ -64,25 +64,29 @@ Rectangle {
     }
 
     Row {
+        id: transportRow
         anchors.fill: parent
         anchors.margins: 8
         spacing: 7
 
-        AppIconButton { iconSymbol: "|<"; tooltipText: "Start"; onClicked: { if (root.player) { root.player.pause(); root.player.position = 0; root.userScrubbed(0) } } }
-        AppIconButton { iconSymbol: "<"; tooltipText: "Previous frame"; onClicked: root.stepFrames(-1) }
-        AppButton {
-            text: root.player && root.player.playbackState === MediaPlayer.PlayingState ? "Pause" : "Play"
-            width: 66; buttonHeight: 30
+        AppIconButton { id: startButton; iconName: "go_to_start"; tooltipText: "Start"; onClicked: { if (root.player) { root.player.pause(); root.player.position = 0; root.userScrubbed(0) } } }
+        AppIconButton { id: previousFrameButton; iconName: "previous_frame"; tooltipText: "Previous frame"; onClicked: root.stepFrames(-1) }
+        AppIconButton {
+            id: playPauseButton
+            tooltipText: root.player && root.player.playbackState === MediaPlayer.PlayingState ? "Pause" : "Play"
+            iconName: root.player && root.player.playbackState === MediaPlayer.PlayingState ? "pause" : "play"
             onClicked: {
                 if (!root.player) return
                 if (root.player.playbackState === MediaPlayer.PlayingState) root.player.pause()
                 else root.player.play()
             }
         }
-        AppIconButton { iconSymbol: ">"; tooltipText: "Next frame"; onClicked: root.stepFrames(1) }
+        AppIconButton { id: nextFrameButton; iconName: "next_frame"; tooltipText: "Next frame"; onClicked: root.stepFrames(1) }
 
         Rectangle {
-            width: Math.max(120, parent.width - 430)
+            width: Math.max(96, transportRow.width - startButton.width - previousFrameButton.width
+                - playPauseButton.width - nextFrameButton.width - timeLabel.implicitWidth
+                - speedCombo.width - 6 * transportRow.spacing)
             height: 14; radius: 7; anchors.verticalCenter: parent.verticalCenter; color: Theme.bgInput
             clip: true
             Rectangle {
@@ -107,7 +111,7 @@ Rectangle {
                     visible: parent.width >= 2 && !playheadFill.atEnd
                 }
             }
-            // Green pre-rendered spans (FI "Preview"). Painted over the
+            // Green pre-rendered preview spans. Painted over the
             // accent playhead fill so a rendered span always reads green:
             // blue advances up to it, green holds while playing through it,
             // blue resumes after it. Exact position still shows in the label.
@@ -148,6 +152,7 @@ Rectangle {
         }
 
         Text {
+            id: timeLabel
             anchors.verticalCenter: parent.verticalCenter
             text: {
                 var pos = root.player ? root.player.position : 0
@@ -163,6 +168,7 @@ Rectangle {
         }
 
         AppComboBox {
+            id: speedCombo
             width: 72; comboHeight: 30
             model: [{label:"0.5x",value:0.5},{label:"1x",value:1.0},{label:"1.5x",value:1.5},{label:"2x",value:2.0}]
             currentValue: root.player ? root.player.playbackRate : 1.0

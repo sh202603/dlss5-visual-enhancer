@@ -24,6 +24,7 @@ AUTOMATIC_MASK_CHOICES = ("Off", "On")
 
 PREVIEW_ENCODING_CHOICES = ("Auto", "Always H.264", "Disabled")
 UPSCALE_MODE_CHOICES = ("Image", "Video")
+UPSCALE_PREVIEW_LENGTH_CHOICES = PREVIEW_LENGTH_CHOICES
 
 
 def coerce_hdr_mode(codec: str, enabled: bool) -> bool:
@@ -102,7 +103,6 @@ class UISettings:
     frame_interpolation_custom_suffix: str = "_Frame_Interpolation"
     frame_interpolation_preview_length: str = "3"
     preview_encoding: str = "Auto"
-    full_size_image_previews: bool = True
     upscale_mode: str = "Image"
     upscale_image_vsr_quality: int = 4
     upscale_image_size_mode: str = "Scale factor"
@@ -131,6 +131,7 @@ class UISettings:
     upscale_codec: str = "H.265 (NVIDIA NVENC)"
     upscale_container: str = "MKV"
     upscale_quality: str = "Auto (Default)"
+    upscale_preview_length: str = "3"
     upscale_rename_mode: str = "Auto"
     upscale_custom_suffix: str = "_Upscale"
 
@@ -221,8 +222,6 @@ def _validate(settings: UISettings) -> UISettings:
         raise ValueError("HDR Mode must be a boolean value.")
     if not isinstance(settings.frame_interpolation_hdr_mode, bool):
         raise ValueError("Frame Interpolation HDR Mode must be a boolean value.")
-    if not isinstance(settings.full_size_image_previews, bool):
-        raise ValueError("Full size quality preview must be a boolean value.")
     # Migrate old codec names before validation
     migrated_codec = _migrate_codec(settings.codec)
     migrated_fi_codec = _migrate_codec(settings.frame_interpolation_codec)
@@ -268,6 +267,10 @@ def _validate(settings: UISettings) -> UISettings:
         "Frame Interpolation preview length": (
             settings.frame_interpolation_preview_length,
             PREVIEW_LENGTH_CHOICES,
+        ),
+        "Upscale preview length": (
+            settings.upscale_preview_length,
+            UPSCALE_PREVIEW_LENGTH_CHOICES,
         ),
         "Preview encoding": (
             settings.preview_encoding,

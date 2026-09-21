@@ -23,7 +23,7 @@ from ...core.runtime import (
 )
 from .batch import _validate_options
 from .decoder import decode_image
-from .encoder import make_image_preview, save_full_size_image_preview
+from .encoder import save_full_size_image_preview
 from .models import ImageConversionOptions
 
 
@@ -41,7 +41,6 @@ def render_image_preview(
     progress: Callable[[float, str], None] | None = None,
     *,
     controller: JobController | None = None,
-    full_size_preview: bool = False,
 ) -> tuple[Image.Image | str, str]:
     """Run the real single-image feature-18 path without publishing any files."""
     options = _validate_options(replace(options) if options else ImageConversionOptions())
@@ -122,14 +121,9 @@ def render_image_preview(
             session = None
 
             _update(controller, progress, .94, "Preparing preview")
-            if full_size_preview:
-                preview = save_full_size_image_preview(
-                    processed, options.output_format, decoded.alpha is not None,
-                )
-            else:
-                preview = make_image_preview(
-                    processed, options.output_format, decoded.alpha is not None,
-                )
+            preview = save_full_size_image_preview(
+                processed, options.output_format, decoded.alpha is not None,
+            )
             elapsed = time.monotonic() - started
             status = (
                 f"Preview complete: {source.name} | {width}×{height} → "

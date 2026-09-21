@@ -33,9 +33,11 @@ from .paths import (
     DLSSNR_BRIDGE,
     DLSSNR_CALLER_SHIM,
     DLSSNR_DIR,
+    DLSSG_DIR,
     FFMPEG,
     FFPROBE,
     NEURAL_RUNTIME,
+    RUNTIME,
 )
 
 
@@ -1015,7 +1017,9 @@ def _warm_mapping(path: Path) -> mmap.mmap | None:
     with path.open("rb") as stream:
         mapping = mmap.mmap(stream.fileno(), 0, access=mmap.ACCESS_READ)
     checksum = 0
-    for offset in range(0, len(mapping), 64 * 1024):
+    # Touch every OS page so the complete installed runtime is resident in the
+    # file cache before the window is shown, rather than faulting pages later.
+    for offset in range(0, len(mapping), mmap.PAGESIZE):
         checksum ^= mapping[offset]
     checksum ^= mapping[-1]
     del checksum
@@ -1039,6 +1043,7 @@ def _encoder_inventory() -> dict[str, bool]:
         "hevc_nvenc": "hevc_nvenc" in output,
         "av1_nvenc": "av1_nvenc" in output,
         "prores_ks": "prores_ks" in output,
+        "ffv1": "ffv1" in output,
     }
 
 
@@ -1050,27 +1055,46 @@ def prepare_runtime() -> PreparedRuntime:
         if _PREPARED is not None:
             return _PREPARED
         validate_runtime_files()
+        BRIDGE_MANAGER.preload()
         gpus = detect_gpus()
         runtime_bundle = inspect_runtime_bundle()
         gpu = resolve_runtime_ai_gpu(gpus, runtime_bundle)
         inventory = _encoder_inventory()
-        paths = (DLSSNR_BRIDGE, DLSSNR_CALLER_SHIM, NEURAL_RUNTIME, FFMPEG, FFPROBE)
+        required_paths = (DLSSNR_BRIDGE, DLSSNR_CALLER_SHIM, NEURAL_RUNTIME, FFMPEG, FFPROBE)
+        optional_paths = (
+            DLSSG_DIR / "neuroframe_engine_frame_interpolation.dll",
+            DLSSG_DIR / "nvngx_dlssg.dll",
+            RUNTIME / "rtx_video" / "neuroframe_engine_upscaling.dll",
+            RUNTIME / "rtx_video" / "nvngx_vsr.dll",
+            RUNTIME / "rtx_video" / "nvngx_truehdr.dll",
+        )
         mappings: list[mmap.mmap] = []
+        warmed_paths: list[Path] = []
         try:
-            for path in paths:
+            for path in required_paths:
                 mapping = _warm_mapping(path)
                 if mapping is not None:
                     mappings.append(mapping)
+                    warmed_paths.append(path)
         except Exception:
             for mapping in mappings:
                 mapping.close()
             raise
+        for path in optional_paths:
+            try:
+                mapping = _warm_mapping(path)
+                if mapping is not None:
+                    mappings.append(mapping)
+                    warmed_paths.append(path)
+            except Exception:
+                # A damaged optional feature must not disable Neural Rendering.
+                continue
         _PREPARED = PreparedRuntime(
             gpu=dict(gpu),
             gpus=tuple(dict(device) for device in gpus),
             runtime_bundle=runtime_bundle,
             encoder_inventory=inventory,
-            warmed_files=tuple(str(path.resolve()) for path in paths),
+            warmed_files=tuple(str(path.resolve()) for path in warmed_paths),
             _mappings=mappings,
         )
         return _PREPARED
