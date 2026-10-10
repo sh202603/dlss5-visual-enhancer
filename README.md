@@ -396,7 +396,7 @@ $result.items
 
 This fork (`sh202603/dlss5-visual-enhancer`, branch `cli`) tracks upstream and renames the source package from `src` to `dlss5ve` so that other programs can install it. Everything above describes the unchanged upstream application, including its command line (`VE_CLI.exe`, here also `dlss5ve-cli` and `dlss5ve-cli.bat`). The additions are:
 
-- `dlss5ve.engine`: `NeuralRenderStream` and `FrameGenStream`, frame-level wrappers around the Neural Rendering and Frame Generation bridges for use inside another process (numpy frames in, numpy frames out, no files). [lada-ex](https://github.com/sh202603/lada-ex) uses them for secondary restoration and frame generation.
+- `dlss5ve.engine`: `NeuralRenderStream` and `FrameGenStream`, frame-level wrappers around the Neural Rendering and Frame Generation bridges for use inside another process (numpy frames in, numpy frames out, no files), for example as a post-processing or frame-generation stage of a video restoration pipeline.
 - `pyproject.toml`: `uv add --editable <path to this folder>` installs the package; the `image` extra adds the still-image decoders and `desktop` adds PySide6 for `app.py`.
 - `DLSS5VE_HOME`: when the package is installed outside this folder, point it at a folder that carries `bin/runtime` and `bin/ffmpeg`.
 
