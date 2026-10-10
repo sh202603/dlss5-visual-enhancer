@@ -19,9 +19,18 @@ bridge until the process restarts. Frame Generation returns NV12 surfaces, so
 4:2:0 chroma. Neither stream takes the process-wide render slot
 (``core.jobs.active_job``): the caller owns the lifecycle and may pass its
 own ``JobController``.
+
+Both bridges create the GPU's CUDA primary context themselves and refuse one
+created by another library, and since v15 Neural Rendering has no host-memory
+fallback. ``initialize_neural_rendering`` and ``initialize_frame_generation``
+bind the bridges without opening a stream, for callers (lada-ex) that construct
+their adapters before loading torch models but open the streams later.
 """
 
-from .framegen import FrameGenStream
-from .neural import NeuralRenderStream
+from .framegen import FrameGenStream, initialize_frame_generation
+from .neural import NeuralRenderStream, initialize_neural_rendering
 
-__all__ = ["FrameGenStream", "NeuralRenderStream"]
+__all__ = [
+    "FrameGenStream", "NeuralRenderStream",
+    "initialize_frame_generation", "initialize_neural_rendering",
+]

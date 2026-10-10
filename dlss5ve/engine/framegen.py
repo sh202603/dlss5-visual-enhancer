@@ -7,11 +7,39 @@ import numpy as np
 
 from ..core.gpu_selection import detect_gpu
 from ..core.jobs import JobController
+from ..core.runtime import OPTICAL_FLOW_QUALITIES
 from ..frame_interpolation.capabilities import probe_frame_interpolation_capabilities
-from ..frame_interpolation.native import DirectDLSSGSession
+from ..frame_interpolation.native import DLSSGBridgeError, DirectDLSSGSession, initialize_bridge
 from .neural import ensure_rgba
 
 SCENE_CUT_MODES = ("duplicate", "skip")
+
+_ORDERING_HINT = (
+    " Call initialize_frame_generation() or open the first FrameGenStream before the first "
+    "CUDA call of any other library (torch included): the bridge creates FFmpeg's CUDA primary "
+    "context itself and cannot adopt one it did not create."
+)
+
+
+def initialize_frame_generation(gpu_uuid: str = "auto"):
+    """Bind the Frame Generation bridge to the GPU in this process and report its capabilities.
+
+    Since v15 ``probe_frame_interpolation_capabilities`` runs its probe in a
+    helper process, so probing no longer initialises the bridge in the caller's
+    process; the first ``DirectDLSSGSession`` would, and by then torch may own
+    the device's CUDA primary context (the ``-129`` failure). Call this once
+    before loading any torch model, or open the first stream there. Repeated
+    calls are cheap: the bridge stays bound for the life of the process.
+    """
+    gpu = detect_gpu(gpu_uuid)
+    try:
+        initialize_bridge(int(gpu["cuda_ordinal"]))
+    except DLSSGBridgeError as exc:
+        message = str(exc).rstrip()
+        if "primary-context" in message or "primary context" in message:
+            message += ("" if message.endswith(".") else ".") + _ORDERING_HINT
+        raise type(exc)(message) from exc
+    return probe_frame_interpolation_capabilities(gpu_uuid)
 
 # The bridge takes and returns BT.709. Full range avoids the 16..235
 # quantization of limited range; the matching decode below is "JPEG".
@@ -57,7 +85,9 @@ class FrameGenStream:
 
     ``expected_frames`` and ``frame_rate`` are accepted for compatibility with
     the v8 signature and ignored: the v9 bridge declares no frame count and
-    derives no timing from the caller.
+    derives no timing from the caller. ``optical_flow_quality`` (v15: High,
+    Medium, or Low) is the Optical Flow Quality control of the app's Frame
+    Generation stage.
     """
 
     def __init__(
@@ -71,14 +101,19 @@ class FrameGenStream:
         expected_frames: int | None = None,
         on_scene_cut: str = "duplicate",
         frame_rate: Fraction | int = 30,
+        optical_flow_quality: str = "High",
     ) -> None:
         del expected_frames, frame_rate
+        if optical_flow_quality not in OPTICAL_FLOW_QUALITIES:
+            raise ValueError(
+                f"optical_flow_quality must be one of {', '.join(OPTICAL_FLOW_QUALITIES)}."
+            )
         if on_scene_cut not in SCENE_CUT_MODES:
             raise ValueError(f"on_scene_cut must be one of {', '.join(SCENE_CUT_MODES)}.")
         multiplier = int(multiplier)
         if multiplier < 2:
             raise ValueError("multiplier must be 2 or more.")
-        capabilities = probe_frame_interpolation_capabilities(gpu_uuid)
+        capabilities = initialize_frame_generation(gpu_uuid)
         if not capabilities.available:
             detail = capabilities.detail or "DLSS Frame Generation is unavailable on this GPU."
             if "primary-context" in detail or "primary context" in detail:
@@ -102,9 +137,11 @@ class FrameGenStream:
         self.controller = controller or JobController()
         self._reformatter = av.video.reformatter.VideoReformatter()
         self._output_cuda = bool(capabilities.cuda_interop)
+        self.optical_flow_quality = optical_flow_quality
         self._session = DirectDLSSGSession(
             int(width), int(height), self.generated_count,
             self.controller, int(detect_gpu(gpu_uuid)["cuda_ordinal"]),
+            optical_flow_quality=optical_flow_quality,
         )
         self._previous: np.ndarray | None = None
         self._index = 0

@@ -1,39 +1,45 @@
 [project]
 name = "dlss5ve"
 dynamic = ["version"]
-description = "Visual Enhancer: NVIDIA DLSS 5 Neural Rendering, Frame Generation, and RTX Video for images and videos"
+description = "Visual Enhancer: NVIDIA DLSS 5 Neural Rendering, DLSS Super Resolution, Frame Generation, and RTX Video for images and videos"
 readme = "README.md"
-# The v11 release bundles Python 3.14 and this checkout pins 3.14 for its own
+# The v15 release bundles Python 3.14 and this checkout pins 3.14 for its own
 # environment (.python-version). The floor stays at 3.12 so that consuming
-# projects on an older interpreter (lada-ex runs 3.13) can still resolve the
-# editable dependency; every runtime dependency ships wheels for both.
+# projects on an older interpreter (lada-ex and jasna run 3.13) can still
+# resolve the editable dependency; every runtime dependency ships wheels for both.
 requires-python = ">=3.12"
-license = "MIT"
-license-files = ["LICENSE"]
+# Upstream switched from MIT to its own source-available license in v11
+# (LICENSE); third-party components keep their own terms (THIRD-PARTY-NOTICES).
+license = "LicenseRef-Merserk-Source-License-1.0"
+license-files = ["LICENSE", "THIRD-PARTY-NOTICES"]
 dependencies = [
     "numpy>=2.0",
     # PyAV 18: VideoFrame.from_dlpack and owned CUDA hwaccel devices (v8 NVDEC/NVENC path).
     "av>=18.1",
     "opencv-python-headless>=4.10",
-    # The Custom NR Mask and the render note are decoded with Pillow in core.
+    # The NR Control Mask and the render note are decoded with Pillow in core.
     "pillow>=11",
 ]
 
 [project.optional-dependencies]
 image = [
     "rawpy>=0.25",
-    "pillow-heif>=1.0",
+    # v15 bundles 1.8.0 and tifffile 2026.9.20 (16-bit TIFF export).
+    "pillow-heif>=1.8",
     "resvg-py>=0.5",
+    "tifffile>=2025.1",
 ]
 desktop = [
     # v10 replaced the Gradio WebUI with a PySide6 + Qt Quick desktop app.
-    # v11 bundles 6.11.2.
+    # v15 bundles 6.11.2.
     # Only app.py needs this; the CLI and the engine API never import it.
     "pyside6>=6.11",
     "dlss5ve[image]",
 ]
 
 [project.scripts]
+# Upstream's own CLI since v15 (render, upscale, interpolate, devices); the
+# release ships it as VE_CLI.exe / cli.py.
 dlss5ve-cli = "dlss5ve.cli.main:main"
 
 [build-system]
@@ -46,11 +52,18 @@ packages = { find = { where = ["."], include = ["dlss5ve", "dlss5ve.*"] } }
 [tool.setuptools.package-data]
 # The desktop app loads its QML from next to dlss5ve/desktop/app.py, so the
 # QML tree has to survive a wheel build (an editable install needs nothing).
-# v11 added the icon set the QML reads through the "icons" image provider.
+# v11 added the icon set the QML reads through the "icons" image provider;
+# v15 added the Qt translation catalogs, the window icon, and the license
+# texts of the NIS/CAS sharpening shaders.
 "dlss5ve.desktop" = [
     "qml/*.qml", "qml/*/*.qml", "qml/qmldir", "qml/*/qmldir",
+    "qml/*/*.js",
     "qml/assets/icons/png/*/*.png",
+    "translations/*.qm",
+    "app.ico",
+    "*.txt",
 ]
+"dlss5ve.live" = ["*.lua"]
 
 [tool.setuptools.dynamic]
 version = { attr = "dlss5ve.version.__version__" }

@@ -12,6 +12,36 @@ from ..core.runtime import (
 )
 from ..settings.models import DEFAULT_SETTINGS, UISettings
 
+_ORDERING_HINT = (
+    " Call initialize_neural_rendering() or open the first NeuralRenderStream before the first "
+    "CUDA call of any other library (torch included): the bridge accepts the CUDA path only for "
+    "a primary context it created itself, and since Visual Enhancer v15 there is no host-memory "
+    "fallback."
+)
+
+
+def initialize_neural_rendering(gpu_uuid: str = "auto") -> dict[str, Any]:
+    """Bind the Neural Rendering bridge to the GPU in this process and return its status.
+
+    The bridge takes the CUDA path only for a primary context it created itself,
+    and v15 has no other path, so this has to run before any torch CUDA call in
+    the process. Opening a ``NeuralRenderStream`` does the same; this function
+    exists for callers that open their streams later (lada-ex constructs its
+    restorer before loading models but opens the stream on the first clip).
+    Repeated calls are cheap: NGX state is process-lifetime.
+    """
+    prepared = prepare_runtime()
+    gpu = resolve_runtime_ai_gpu(prepared.gpus, prepared.runtime_bundle, gpu_uuid)
+    from ..core.neural_bridge import BRIDGE_MANAGER, NeuralBridgeError
+
+    try:
+        return BRIDGE_MANAGER.initialize(gpu)
+    except NeuralBridgeError as exc:
+        message = str(exc).rstrip()
+        if "interoperab" in message or "primary context" in message or "CUDA" in message:
+            message += ("" if message.endswith(".") else ".") + _ORDERING_HINT
+        raise type(exc)(message) from exc
+
 
 def ensure_rgba(frame: np.ndarray) -> np.ndarray:
     """Accept HxWx3 or HxWx4 uint8 and return a contiguous HxWx4 array."""
@@ -42,26 +72,28 @@ class NeuralRenderStream:
     size. Feature 18 itself never resizes. The 7680x4320 boundary of
     ``resolve_output_size`` applies to the scaled size.
 
+    ``settings`` carries the Neural Rendering controls of ``UISettings``
+    (``nr_style``, ``nr_intensity``, ``nr_passes``, the three strengths,
+    ``automatic_mask``, ``nr_optical_flow_quality``, and the ``nr_mask``
+    control mask). ``still_image=True`` selects the bridge's static motion
+    mode, as the app does for still images; the default is the video mode
+    with NVIDIA Optical Flow between consecutive frames.
+
     The feature-18 runtime lives in this process (``core.neural_bridge``):
     the first stream initialises NGX on the selected GPU and every later
     stream shares that state until the process exits. Native calls run on a
     watchdog thread; after a timeout or a native exception the bridge refuses
     further work (``NeuralBridgePoisonedError``) and the process has to be
-    restarted. With ``gpu_mode`` the bridge retains the GPU's CUDA primary
-    context and leaves no context current on the calling thread afterwards.
+    restarted.
 
-    ``gpu_mode=None`` takes the CUDA path when the bridge reports CUDA interop
-    for the GPU and falls back to host staging otherwise. Since v10 the
-    settings carry no memory-path field, so this keyword is the only way to
-    choose: the processing layer decides from the codec, and Options without a
-    codec (images, Live) stay GPU-resident. The bridge accepts the CUDA path
-    only when it creates the device's primary context itself (it needs
-    FFmpeg's blocking-sync flags); when another library (torch) created the
-    context first, the CUDA path is refused. With ``gpu_mode=None`` the stream
-    then falls back to host staging and records why in
-    ``gpu_fallback_reason``; an explicit ``gpu_mode=True`` raises instead.
-    Open the first stream before the first torch CUDA call to keep the CUDA
-    path.
+    Since Visual Enhancer v15 Neural Rendering runs only on the CUDA/D3D12
+    path: the bridge retains the GPU's CUDA primary context, leaves no context
+    current on the calling thread afterwards, and refuses to initialise when
+    another library (torch) created that context first. The v11 host-staging
+    fallback is gone, so ``gpu_mode`` is kept only for compatibility:
+    ``None`` and ``True`` take the CUDA path and ``False`` raises
+    ``ValueError``. ``gpu_fallback_reason`` is always ``None``. Open the first
+    stream before the first torch CUDA call.
 
     ``expected_frames`` keeps the counted mode available: the session then
     insists on exactly that many frames before ``close``.
@@ -78,27 +110,30 @@ class NeuralRenderStream:
         gpu_mode: bool | None = None,
         controller: JobController | None = None,
         expected_frames: int | None = None,
+        still_image: bool = False,
     ) -> None:
+        if gpu_mode is False:
+            raise ValueError(
+                "gpu_mode=False is not available: since Visual Enhancer v15 Neural Rendering "
+                "runs only on the CUDA/D3D12 path and has no host-memory fallback."
+            )
         settings = settings or DEFAULT_SETTINGS
         prepared = prepare_runtime()
         gpu = resolve_runtime_ai_gpu(prepared.gpus, prepared.runtime_bundle, gpu_uuid)
+        # Kept for callers written against v11, where a refused CUDA path fell
+        # back to host staging and this recorded why. v15 has no such path.
         self.gpu_fallback_reason: str | None = None
-        if gpu_mode is None:
-            # Ask the bridge before opening the session: an explicit True would
-            # raise here, and the caller asked for whichever path works.
-            from ..core.neural_bridge import BRIDGE_MANAGER
-
-            status = BRIDGE_MANAGER.initialize(gpu, require_cuda=False)
-            gpu_mode = bool(status.get("cuda_supported"))
-            if not gpu_mode:
-                self.gpu_fallback_reason = str(status.get("cuda_status") or "CUDA interop unavailable")
+        # The session would initialise the bridge itself; doing it here first
+        # lets the ordering hint reach the caller on failure.
+        initialize_neural_rendering(gpu_uuid)
         self.factor, mode = resolve_upscaling_mode(factor)
-        native = resolve_native_settings(settings, gpu_mode=bool(gpu_mode))
+        native = resolve_native_settings(settings)
         output_width, output_height = resolve_output_size(int(width), int(height), self.factor)
         self.input_size = (int(width), int(height))
         self.output_size = (output_width, output_height)
         self.gpu_name = str(gpu.get("display_name") or gpu.get("name") or "NVIDIA RTX GPU")
-        self.gpu_mode = bool(native.get("gpu_mode", True))
+        self.gpu_mode = True
+        self.still_image = bool(still_image)
         self.controller = controller or JobController()
         self._session = DLSSFrameSession(
             input_width=int(width),
@@ -110,10 +145,11 @@ class NeuralRenderStream:
             factor=self.factor,
             mode=mode,
             native_settings=native,
-            composition_mask=settings.nr_mask,
             gpu=gpu,
             runtime_bundle=prepared.runtime_bundle,
             controller=self.controller,
+            still_image=self.still_image,
+            control_mask=settings.nr_mask,
         )
         self.render_size = (self._session.render_width, self._session.render_height)
         self._index = 0

@@ -392,67 +392,26 @@ $result.items
 | `2` | Invalid arguments, paths, or settings |
 | `130` | Cancelled |
 
-## Command line
+## This branch: the `dlss5ve` package and the engine API
 
-The same processing layer is available as a `dlss5ve-cli` command for scripts and other programs. The portable package runs it with the embedded interpreter; a development checkout can also install it with uv.
+This fork (`sh202603/dlss5-visual-enhancer`, branch `cli`) tracks upstream and renames the source package from `src` to `dlss5ve` so that other programs can install it. Everything above describes the unchanged upstream application, including its command line (`VE_CLI.exe`, here also `dlss5ve-cli` and `dlss5ve-cli.bat`). The additions are:
 
-### Setup
+- `dlss5ve.engine`: `NeuralRenderStream` and `FrameGenStream`, frame-level wrappers around the Neural Rendering and Frame Generation bridges for use inside another process (numpy frames in, numpy frames out, no files). [lada-ex](https://github.com/sh202603/lada-ex) uses them for secondary restoration and frame generation.
+- `pyproject.toml`: `uv add --editable <path to this folder>` installs the package; the `image` extra adds the still-image decoders and `desktop` adds PySide6 for `app.py`.
+- `DLSS5VE_HOME`: when the package is installed outside this folder, point it at a folder that carries `bin/runtime` and `bin/ffmpeg`.
 
-This branch tracks the Python sources only. `bin/` holds the embedded Python, FFmpeg, mpv, yt-dlp, and the NVIDIA runtime DLLs, and none of it is committed, so a clone on its own cannot run. Take those binaries from the upstream release of the same version and lay this branch over them:
-
-```powershell
-# 1. Extract the upstream release ZIP; it supplies bin/ and the desktop app.
-New-Item -ItemType Directory D:\visual-enhancer-cli | Out-Null
-tar -xf .\Visual.Enhancer.v11.0.zip -C D:\visual-enhancer-cli
-
-# 2. Overlay this branch's tracked files (dlss5ve/, dlss5ve-cli.bat, examples/).
-git clone --branch cli --depth 1 https://github.com/sh202603/dlss5-visual-enhancer.git C:\src\ve-cli
-git -C C:\src\ve-cli archive -o "$env:TEMP\ve-cli.tar" cli
-tar -xf "$env:TEMP\ve-cli.tar" -C D:\visual-enhancer-cli
-
-# 3. Remove the upstream package directory; this branch renamed it to dlss5ve/.
-Remove-Item -Recurse -Force D:\visual-enhancer-cli\src
-
-# 4. Check the result: GPU, encoders, and the three NGX bridges.
-D:\visual-enhancer-cli\dlss5ve-cli.bat info
-```
-
-Two things trip this up. `tar` has to be the Windows one (`C:\Windows\System32\tar.exe`, which reads ZIPs); if a Git for Windows directory comes first on `PATH`, that name resolves to GNU tar, which cannot read a ZIP and reads `H:\...` as a host name. And `git archive` must not be piped straight into `tar` in PowerShell, because the pipeline would convert the archive to text; write the tar file first, as above.
-
-The release and the branch have to be the same upstream version, which `dlss5ve-cli --version` prints as `<package version> (Visual Enhancer <release>)`. The desktop app keeps working in that folder, so the same install serves both.
-
-For development, clone the branch and let uv build the environment instead. The package still needs the vendored binaries, so either extract a release's `bin/` into the clone or point `DLSS5VE_HOME` at an extracted release folder.
+`bin/` is not tracked. Take it from the upstream release of the same version (the package version's first two components, printed by `python -c "import dlss5ve; print(dlss5ve.__version__)"`), and keep the bridge DLLs and the code from the same release: each bridge checks its ABI.
 
 ```powershell
-uv sync                           # core: video and frame interpolation
-uv sync --extra image             # adds RAW, HEIF, and SVG decoding for images
-uv sync --extra desktop           # adds PySide6 for app.py (implies image)
-uv run dlss5ve-cli info
+# Extract the release ZIP, lay this branch over it, and drop upstream's src/.
+tar -xf .\Visual.Enhancer.v15.0.zip -C D:\visual-enhancer
+git -C C:\src\ve archive -o "$env:TEMP\ve.tar" cli
+tar -xf "$env:TEMP\ve.tar" -C D:\visual-enhancer
+Remove-Item -Recurse -Force D:\visual-enhancer\src
+D:\visual-enhancer\dlss5ve-cli.bat devices
 ```
 
-### Usage
-
-```powershell
-.\dlss5ve-cli.bat info                                           # GPUs, encoders, frame generation, RTX Video
-.\dlss5ve-cli.bat image photo.png --nr-passes 2 --format PNG
-.\dlss5ve-cli.bat image photo.png --color-strength 0 --tone-preservation 1  # Detail-Only composition
-.\dlss5ve-cli.bat video clip.mp4 --codec "H.265 (NVIDIA NVENC)" --hdr --output-dir D:\out
-.\dlss5ve-cli.bat interpolate D:\clips --fps 60                  # a folder processes its supported files in name order
-.\dlss5ve-cli.bat upscale-video clip.mp4 --scale 2 --hdr         # RTX Video Super Resolution plus RTX Video HDR
-.\dlss5ve-cli.bat upscale-image photo.jpg --width 3840 --format PNG
-```
-
-- Defaults come from `config/config.ini`, the same file the app writes. `--preset FILE` applies a preset exported from Settings instead; flags override individual values on top.
-- `image` and `video` expose every Neural Rendering control of the app: `--nr-style`, `--nr-intensity`, `--nr-passes`, the tone and structure strengths, the composition controls (`--color-strength`, `--tone-preservation`, `--face-skin-protection`, `--grain-preservation`), `--nr-mask FILE` with `--mask-feather`, `--nr-scale` (0.25 to 2: the resolution entering Neural Rendering, downsized or enlarged with Lanczos before rendering; RTX Video enlargement is `upscale-*`), and for video `--shimmer-suppression`. The memory path is chosen by the processing layer and has no flag: NVENC codecs keep decode, render, and encode on the AI GPU and ignore `--video-gpu`; CPU codecs stage through system memory; images stay GPU-resident. The container follows the codec (H.264 MP4; H.265, AV1 and FFV1 MKV; ProRes MOV).
-- `upscale-video` and `upscale-image` run RTX Video Super Resolution (and RTX Video HDR for video) with the Upscale settings as defaults. `--scale FACTOR` or `--width PX` (with `--aspect-lock`, or `--height PX` with `--no-aspect-lock`) chooses the output size; `--no-vsr --hdr` converts SDR to HDR10 at the source size.
-- Each enhancer runs through its own NGX bridge and holds the render slot alone, so combining them means chaining commands. Two example scripts do that: `examples\full_pipeline.ps1 INPUT -OutputDir DIR -Scale 2 -Fps 60` runs Upscale, then Frame Interpolation, then Neural Rendering, passing each stage's output to the next (add `-Hdr` to convert to HDR10 in the first stage and keep 10-bit through the rest); `examples\nr_vsr_hdr.ps1 INPUT -OutputDir DIR -Scale 2` takes the other order, rendering NR first (SDR, source size) and then applying VSR and RTX Video HDR to the result.
-- `--output-dir DIR` collects every rendered file in one directory (`outputs/` by default). `--same-as-input` publishes each file next to its own source instead, and then `output_directory` in the `--json` payload reads `same as input`; a `--zip` archive still goes to `--output-dir`, and `zip_path` names it. The two flags are mutually exclusive.
-- `--codec` also takes the two v11 codecs: `ProRes HQ` (MOV, 10-bit 4:2:2) and `FFV1 Lossless RGB 10-bit` (MKV, lossless RGB). Both ignore `--encoding-quality`, and both accept `--hdr`, as do H.265, AV1, and ProRes Proxy.
-- `--json` writes the batch result to stdout: `status` (`success`, `partial`, `cancelled`), `output_directory`, `log_path` (the session log in `logs/`), the effective `options`, and the per-file `successes` and `failures` with their dimensions, frame counts, and bridge diagnostics. Progress and the per-file summary go to stderr; `--progress json` turns progress into JSON Lines with one object per file state change, `--quiet` silences both.
-- `--version` (also the first line of `info` and `--help`) prints the package version and the upstream release it is built on; the package version follows the upstream release in its first two components.
-- Exit codes: 0 all inputs succeeded, 1 some failed, 2 usage error or missing input, 3 runtime or GPU unavailable, 130 interrupted. Ctrl+C stops the batch cleanly (incomplete output removed, finished files kept); a second Ctrl+C aborts.
-- `image`, `video`, and `upscale-image` write files only; add `--zip` to bundle the outputs into one archive. `video` also takes `--preview-seconds SEC` or `--preview-frames N` for a short test render. One GPU render per process; two `dlss5ve-cli` processes at once will both initialise the Neural Rendering runtime.
-- To use the package from another project, add this checkout as an editable dependency (`uv add --editable <path to this folder>`). If the package ends up outside the checkout, point `DLSS5VE_HOME` at the checkout so the runtime binaries are found.
+`tar` has to be the Windows one (`C:\Windows\System32\tar.exe`, which reads ZIPs). Both bridges must be initialised before any other library (torch included) creates the GPU's CUDA primary context: since v15 Neural Rendering has no host-memory fallback, and Frame Generation has never had one.
 
 ## License and third-party notices
 
