@@ -14,9 +14,9 @@ from pathlib import Path
 from typing import Any, Callable
 
 import av
+from ..core.ffmpeg.frames import open_video_decoder, VideoOutput
 import numpy as np
 from av.codec.hwaccel import HWAccel
-from av.video.reformatter import Colorspace
 
 from ..core import app_log, ffmpeg
 from ..core.disk_paths import OutputFile, prepare_output_dir
@@ -24,10 +24,10 @@ from ..core.gpu_selection import resolve_runtime_ai_gpu
 from ..core.jobs import Cancelled, active_job
 from ..core.naming import output_filename, unique_output_path, validate_rename
 from ..core.paths import JOBS, OUTPUTS
-from ..core.runtime import prepare_runtime, rotate_frame
+from ..core.runtime import prepare_runtime
 from ..upscale.video.cuda_transfer import CudaTransferPool
 from .capabilities import probe_frame_interpolation_capabilities
-from .models import FrameInterpolationOptions, FrameInterpolationResult
+from .models import FrameInterpolationOptions, FrameInterpolationResult, OPTICAL_FLOW_QUALITIES
 from .native import DLSSGCudaSurface, DirectDLSSGSession
 from .scheduler import choose_interpolation_plan, output_frame_count
 
@@ -70,11 +70,8 @@ def automatic_cuda_path(codec: str, rotation: int | float = 0) -> bool:
 
 
 def _codec_available(name: str) -> bool:
-    try:
-        av.codec.Codec(name, "w")
-        return True
-    except Exception:
-        return False
+    from ..core.ffmpeg.vulkan import ffmpeg_encoders
+    return name in ffmpeg_encoders()
 
 
 def _encoder(options: FrameInterpolationOptions, codec: str, width: int, height: int,
@@ -87,11 +84,13 @@ def _encoder(options: FrameInterpolationOptions, codec: str, width: int, height:
         name = _NVENC[normalized]
         values = {"preset": "p6", "rc": "vbr", "gpu": str(ordinal),
                   "rc-lookahead": "0", "surfaces": "8", "delay": "3"}
+        if name == "h264_nvenc":
+            # Match the CLI route: CUDA-owned PyAV frames otherwise default
+            # to Main and lose High profile's 8x8 transform on fine detail.
+            values["profile"] = "high"
         if name != "av1_nvenc":
             values["tune"] = "hq"
-        if quality["mode"] == "constant-quality":
-            values["cq"] = "0"
-            bitrate = 0
+        values.update(ffmpeg.nvenc_rate_control_options(quality))
         return _Encoder(name, name, "cuda" if cuda_input else ("p010le" if hdr else "nv12"),
                         cuda_input, values, bitrate)
     common = {"crf": "0"} if quality["mode"] == "constant-quality" else {}
@@ -106,7 +105,8 @@ def _encoder(options: FrameInterpolationOptions, codec: str, width: int, height:
         if not _codec_available(name):
             raise RuntimeError("No in-process CPU AV1 encoder is available.")
         values = ({"preset": "6"} if name == "libsvtav1" else {"cpu-used": "4"})
-        values.update(common)
+        if quality["mode"] == "constant-quality":
+            values.update(ffmpeg.software_max_quality_options(name))
         return _Encoder(name, name, "yuv420p10le" if hdr else "yuv420p", False, values, bitrate)
     if normalized == "ProRes Proxy":
         values = {"profile": "0"}
@@ -167,7 +167,7 @@ def _set_color_properties(context: Any, metadata: dict[str, Any], hdr: bool) -> 
     context.color_trc = {"bt709": 1, "bt470m": 4, "bt470bg": 5,
                          "smpte170m": 6, "smpte240m": 7, "linear": 8, "iec61966-2-1": 13,
                          "smpte2084": 16, "arib-std-b67": 18}.get(transfer, 2)
-    context.colorspace = {"bt709": 1, "fcc": 4, "bt470bg": 5,
+    context.colorspace = {"gbr": 0, "bt709": 1, "fcc": 4, "bt470bg": 5,
                           "smpte170m": 6, "smpte240m": 7, "bt2020nc": 9,
                           "bt2020c": 10}.get(matrix, 9 if hdr else 6)
     context.color_range = 2 if _range_code(metadata) else 1
@@ -212,6 +212,37 @@ def _validate_decoded_frame(frame: Any) -> Any:
     if bool(getattr(frame, "is_corrupt", False)):
         raise RuntimeError("The video decoder returned a corrupt frame.")
     return frame
+
+
+def _open_frame_decoder(source: Path, controller, *, decode_device, hdr: bool,
+                        rotation_filter: str):
+    if decode_device is not None:
+        decoded = None
+        try:
+            decoded = av.open(str(source), hwaccel=decode_device)
+            stream = decoded.streams.video[0]
+            stream.thread_type = "AUTO"
+            frames = iter(decoded.decode(stream))
+            first = _validate_decoded_frame(next(frames))
+            sw_format = str(getattr(getattr(first, "sw_format", None), "name", ""))
+            if first.format.name != "cuda" or sw_format not in {"nv12", "p010", "p010le"}:
+                raise ValueError("NVDEC did not return a supported CUDA NV12/P010 surface.")
+            return decoded, frames, first, "PyAV CUDA/NVDEC"
+        except (av.error.FFmpegError, ValueError, RuntimeError, StopIteration) as exc:
+            if decoded is not None:
+                decoded.close()
+            app_log.info("frame-interp", f"NVDEC unavailable; using the host frame boundary: {exc}")
+    decoded = open_video_decoder(source, controller, pixel_format="p010le" if hdr else "rgba",
+                                 video_filter=rotation_filter)
+    stream = decoded.streams.video[0]
+    stream.thread_type = "AUTO"
+    frames = iter(decoded.decode(stream))
+    try:
+        first = _validate_decoded_frame(next(frames))
+    except BaseException:
+        decoded.close()
+        raise
+    return decoded, frames, first, "FFmpeg Vulkan/software fallback"
 
 
 class DLSSGStage:
@@ -279,6 +310,11 @@ class NearestTimestampWriter:
         self.next_index += 1
 
     def push(self, current: TimedFrame) -> None:
+        for _ in self.iter_push(current):
+            pass
+
+    def iter_push(self, current: TimedFrame):
+        """Emit lazily so long VFR holds cannot allocate an entire output burst."""
         if self.previous is None:
             self.previous = current
             return
@@ -292,13 +328,19 @@ class NearestTimestampWriter:
                 self.tie_late = not self.tie_late
             else:
                 break
+            yield None
         self.previous = current
 
     def finish(self) -> None:
+        for _ in self.iter_finish():
+            pass
+
+    def iter_finish(self):
         if self.previous is None:
             raise ValueError("The input video contains no decodable frames.")
         while self.next_index < self.output_count:
             self._write(self.previous, Fraction(self.next_index, 1) / self.target_rate)
+            yield None
 
 
 def _duration_fraction(metadata: dict, source_rate: Fraction, frames: int, *, cfr: bool) -> Fraction:
@@ -308,6 +350,8 @@ def _duration_fraction(metadata: dict, source_rate: Fraction, frames: int, *, cf
 
 
 def _validate(options: FrameInterpolationOptions) -> None:
+    if not isinstance(options.optical_flow_quality, str) or options.optical_flow_quality not in OPTICAL_FLOW_QUALITIES:
+        raise ValueError("Optical Flow Quality must be High, Medium, or Low.")
     _ = options.target_rate
     validate_rename(options.rename_mode, options.custom_suffix)
     ffmpeg.validate_codec_container(options.codec, options.container)
@@ -325,7 +369,6 @@ def interpolate_video(
 ) -> FrameInterpolationResult:
     operation_started = time.perf_counter()
     options = replace(options) if options is not None else FrameInterpolationOptions()
-    options.container = ffmpeg.container_for_codec(options.codec)
     _validate(options)
     source = Path(input_path).resolve()
     if not source.is_file():
@@ -384,8 +427,7 @@ def interpolate_video(
                 source_frames = int(ffmpeg.probe_video(source, count_mode="exact")["frames"])
             duration = _duration_fraction(metadata, source_rate, source_frames, cfr=cfr)
             preview = options.preview_seconds is not None
-            compat_preview = preview and bool(options.preview_compat)
-            effective_hdr = bool(options.hdr_mode and not compat_preview)
+            effective_hdr = bool(options.hdr_mode)
             if metadata["hdr"] and not effective_hdr:
                 raise ValueError("HDR input requires Frame Interpolation HDR Mode with a 10-bit codec.")
             if preview:
@@ -399,7 +441,7 @@ def interpolate_video(
             timings["probe_seconds"] = time.perf_counter() - probe_start
             update(.01, "Preparing frame interpolation")
 
-            selected_codec = "H.264 (NVIDIA NVENC)" if compat_preview else options.codec
+            selected_codec = options.codec
             video_gpu = ffmpeg.resolve_video_gpu(
                 runtime.gpus, options.video_gpu_uuid, selected_codec,
                 int(metadata["width"]), int(metadata["height"]))
@@ -412,20 +454,19 @@ def interpolate_video(
             # codec uses the in-process host-staging ABI.
             want_cuda = automatic_cuda_path(selected_codec, metadata["rotation"])
             decode_device = HWAccel(
-                "cuda", device=str(ai_ordinal), allow_software_fallback=True,
+                "cuda", device=str(ai_ordinal), allow_software_fallback=False,
                 options={"primary_ctx": "1"}, is_hw_owned=True) if want_cuda else None
-            decoded_container = av.open(str(source), hwaccel=decode_device)
-            input_stream = decoded_container.streams.video[0]
-            input_stream.thread_type = "AUTO"
-            decoder = iter(decoded_container.decode(input_stream))
+            rotation_filter = {90: "transpose=clock", 180: "hflip,vflip", 270: "transpose=cclock"}.get(int(metadata["rotation"]), "")
             tick = time.perf_counter()
             try:
-                first_frame = _validate_decoded_frame(next(decoder))
+                decoded_container, decoder, first_frame, decode_backend = _open_frame_decoder(
+                    source, controller, decode_device=decode_device, hdr=effective_hdr,
+                    rotation_filter=rotation_filter)
             except StopIteration as exc:
                 raise ValueError("The input contains no decodable video frames.") from exc
             timings["decode_seconds"] += time.perf_counter() - tick
+            metadata["rotation"] = 0
             cuda_route = bool(want_cuda and first_frame.format.name == "cuda")
-            decode_backend = "nvdec" if cuda_route else "software"
             output_p010 = bool(effective_hdr)
             encoder = _encoder(options, selected_codec, int(metadata["width"]),
                                int(metadata["height"]), options.target_rate,
@@ -443,7 +484,8 @@ def interpolate_video(
             try:
                 temp_video = Path(job.name) / ("encoded.mov" if options.container == "MOV" else
                                                "encoded.mkv" if options.container == "MKV" else "encoded.mp4")
-                encoded_container = av.open(str(temp_video), mode="w")
+                encoded_container = (av.open(str(temp_video), mode="w") if cuda_route
+                                     else VideoOutput(temp_video, controller))
                 encode_device = HWAccel(
                     "cuda", device=str(encode_ordinal), options={"primary_ctx": "1"},
                     is_hw_owned=True) if cuda_route else None
@@ -464,6 +506,10 @@ def interpolate_video(
                     output_stream.codec_context.qscale = True
                     output_stream.codec_context.global_quality = 3
                 _set_color_properties(output_stream.codec_context, metadata, effective_hdr)
+                if encoder.name == "prores_ks":
+                    # Generated RGB is full range, but ProRes delivery must
+                    # convert to limited YUV even when the source was full range.
+                    output_stream.codec_context.color_range = 1
                 if encoder.name == "ffv1":
                     output_stream.codec_context.colorspace = 0  # RGB, no YUV matrix.
                     output_stream.codec_context.color_range = 2  # Full range.
@@ -475,7 +521,9 @@ def interpolate_video(
                 for _ in range(session_count):
                     sessions.append(DirectDLSSGSession(
                         int(metadata["width"]), int(metadata["height"]), generated_count,
-                        controller, ai_ordinal, hdr=effective_hdr))
+                        controller, ai_ordinal, hdr=effective_hdr,
+                        chroma_location=metadata.get("chroma_location", "left"),
+                        optical_flow_quality=options.optical_flow_quality))
                 timings["session_initialization_seconds"] = time.perf_counter() - initialization_start
                 colors = {"color_matrix": _matrix_code(metadata, hdr=effective_hdr),
                           "color_range": _range_code(metadata),
@@ -489,12 +537,6 @@ def interpolate_video(
                     for index, session in enumerate(sessions)]
                 if cuda_route and encode_ordinal != ai_ordinal:
                     transfer_pool = CudaTransferPool(ai_ordinal, encode_ordinal, controller)
-
-                rgb_colorspace = {
-                    0: Colorspace.ITU601, 1: Colorspace.ITU709,
-                    2: Colorspace.BT2020, 3: Colorspace.FCC,
-                    4: Colorspace.SMPTE240M,
-                }[colors["color_matrix"]]
 
                 decode_queue: queue.Queue = queue.Queue(maxsize=4)
                 encode_queue: queue.Queue = queue.Queue(maxsize=4)
@@ -529,16 +571,6 @@ def interpolate_video(
                                 break
                             frame, pts = item
                             encode_start = time.perf_counter()
-                            if not cuda_route and frame.format.name != encoder.pixel_format:
-                                frame = frame.reformat(
-                                    format=encoder.pixel_format,
-                                    src_colorspace=rgb_colorspace,
-                                    dst_colorspace=rgb_colorspace)
-                            if encoder.name == "ffv1":
-                                frame.color_primaries = output_stream.codec_context.color_primaries
-                                frame.color_trc = output_stream.codec_context.color_trc
-                                frame.colorspace = 0
-                                frame.color_range = 2
                             frame.pts, frame.time_base, frame.duration = pts, output_tb, 1
                             for packet in output_stream.encode(frame):
                                 encoded_container.mux(packet)
@@ -569,17 +601,12 @@ def interpolate_video(
                     if isinstance(frame, DLSSGCudaSurface):
                         convert_start = time.perf_counter()
                         if encoder.name == "prores_ks" or not cuda_route:
-                            pixels = frame.to_host_rgb()
                             if effective_hdr:
-                                # DLSSG returns normalized, transfer-encoded half float RGB.
-                                # Keep the 10-bit precision until the final 4:2:2 conversion.
-                                depth = 10
-                                maximum = (1 << depth) - 1
-                                rgb = np.rint(np.clip(pixels[..., :3].astype(np.float32),
-                                                      0.0, 1.0) * maximum).astype(np.uint16)
-                                gbr = np.ascontiguousarray(rgb[..., [1, 2, 0]])
-                                frame = av.VideoFrame.from_ndarray(gbr, format=f"gbrp{depth}le")
+                                # Pack transfer-encoded HDR RGB to physical G,B,R planes
+                                # on CUDA, retaining exact round-to-even 10-bit precision.
+                                frame = frame.to_host_gbrp10_frame()
                             else:
+                                pixels = frame.to_host_rgb()
                                 frame = av.VideoFrame.from_ndarray(pixels, format="rgba")
                         else:
                             yuv = frame.to_yuv_surface(
@@ -619,24 +646,10 @@ def interpolate_video(
                     else:
                         prepare_start = time.perf_counter()
                         if effective_hdr:
-                            if metadata["rotation"]:
-                                rgb10 = rotate_frame(
-                                    frame.to_ndarray(format="gbrp10le"),
-                                    int(metadata["rotation"]),
-                                )
-                                oriented = av.VideoFrame.from_ndarray(
-                                    np.ascontiguousarray(rgb10), format="gbrp10le")
-                                bridge_frame = oriented.reformat(format="p010le")
-                                encode_frame = bridge_frame
-                            else:
-                                bridge_frame = frame.reformat(format="p010le")
-                                encode_frame = frame
+                            bridge_frame = encode_frame = frame
                         else:
-                            rgba = rotate_frame(frame.to_ndarray(format="rgba"), int(metadata["rotation"]))
-                            rgba = np.ascontiguousarray(rgba)
-                            encode_frame = (frame if not metadata["rotation"]
-                                            else av.VideoFrame.from_ndarray(rgba, format="rgba"))
-                            bridge_frame = rgba
+                            rgba = np.ascontiguousarray(frame.to_ndarray(format="rgba"))
+                            bridge_frame, encode_frame = rgba, frame
                         timings["software_prepare_seconds"] += time.perf_counter() - prepare_start
                     items = [TimedFrame(bridge_frame, encode_frame, timestamp, source_segment,
                                         "Source", decoded)]
@@ -656,7 +669,7 @@ def interpolate_video(
                     now = time.perf_counter()
                     if now - last_update > .2:
                         update(.04 + .82 * decoded / max(1, source_frames),
-                               "Interpolating frames")
+                               f"Interpolating frames: {decoded:,} / {source_frames:,} frames")
                         last_update = now
                 if decoded != source_frames:
                     raise RuntimeError(f"Decoded {decoded} source frames; expected {source_frames}.")
@@ -679,6 +692,7 @@ def interpolate_video(
                 if encoded_frames[0] != output_count:
                     raise RuntimeError(f"Encoder accepted {encoded_frames[0]} frames; expected {output_count}.")
                 timings["pipeline_seconds"] = time.perf_counter() - pipeline_start
+                actual_encoder = (encoder.name if cuda_route else encoded_container.actual_encoder)
                 encoded_container.close(); encoded_container = None
                 decoded_container.close(); decoded_container = None
                 gc.collect()
@@ -787,7 +801,7 @@ def interpolate_video(
                     bridge_version=capabilities.bridge_version,
                     bridge_abi_version=capabilities.bridge_abi_version,
                     nvof_available=capabilities.nvof_available, memory_path=memory_path,
-                    decode_backend=decode_backend, encode_backend=encoder.display,
+                    decode_backend=decode_backend, encode_backend=actual_encoder,
                     upload_bytes=upload_bytes, download_bytes=download_bytes,
                     surface_pool_pressure=pool_pressure, diagnostics=diagnostics)
             finally:

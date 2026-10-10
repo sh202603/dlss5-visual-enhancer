@@ -6,25 +6,31 @@ import sys
 import time
 from pathlib import Path
 
-from PySide6.QtCore import QUrl, Qt
+from ..portable import configure_portable_environment
+
+configure_portable_environment()
+
+from PySide6.QtCore import QRect, QUrl, Qt
 from PySide6.QtGui import QGuiApplication, QIcon
 from PySide6.QtQml import QQmlApplicationEngine
 
-from ..core.paths import ROOT, OUTPUTS, LOGS, LIVE_DIR
+from ..core.paths import ROOT, OUTPUTS, LOGS, LIVE_DIR, JOBS
 from ..core.cache_cleanup import cleanup_old_caches
 from ..core import app_log
 from .image_provider import IconImageProvider, PreviewImageProvider
 from .bridge import AppBridge
+from .preview_player import PreviewPlayer
+from .responsiveness import UiResponsivenessMonitor
+from .window_geometry import restore_window_geometry
+from .window_focus import ClickFocusFilter
 from .win_frameless import install_win_chrome, remove_win_chrome, ensure_win_style, log_native_chrome
 
 
 def hide_inherited_console() -> None:
-    """Detach/hide any console inherited when launched windowless.
+    """Detach any console inherited when launched through the GUI launcher.
 
-    The GUI launcher sets DLSS5_WINDOWLESS=1 and starts pythonw.exe with
-    CREATE_NO_WINDOW. If Windows still attached a console (e.g. launched
-    from a console python, or a flashing helper), hide it so double-clicking
-    the .exe shows only the Qt window.
+    pythonw.exe does not allocate a console. If launched from a terminal,
+    detach our process without hiding the caller's terminal window.
     """
     if os.environ.get("DLSS5_WINDOWLESS") != "1":
         return
@@ -32,17 +38,9 @@ def hide_inherited_console() -> None:
         return
     try:
         kernel32 = ctypes.windll.kernel32
-        user32 = ctypes.windll.user32
         hwnd = kernel32.GetConsoleWindow()
         if hwnd:
-            try:
-                user32.ShowWindow(hwnd, 0)  # SW_HIDE
-            except Exception:
-                pass
-            try:
-                kernel32.FreeConsole()
-            except Exception:
-                pass
+            kernel32.FreeConsole()
     except Exception:
         pass
 
@@ -98,10 +96,13 @@ def enable_dpi_awareness() -> str:
 
 
 def resolve_app_icon() -> Path | None:
-    """Locate the canonical app icon (native (dev)/icon.png). Never raises."""
+    """Locate the deployed multi-size Windows icon, with PNG fallbacks."""
     try:
         candidates = (
-            ROOT / "native (dev)" / "icon.png",
+            Path(__file__).resolve().parent / "app.ico",
+            ROOT / "app.ico",
+            ROOT / "native (dev)" / "ui" / "launcher (qt6)" / "app.ico",
+            ROOT / "native (dev)" / "assets" / "icon.png",
             ROOT / "icon.png",
             Path(__file__).resolve().parent / "icon.png",
         )
@@ -116,8 +117,59 @@ def resolve_app_icon() -> Path | None:
     return None
 
 
-APP_USER_MODEL_ID = "Merserk.VisualEnhancer.v10"
+# Keep the shell identity stable across releases and independent of the
+# obsolete v10 taskbar group, whose cached branding can survive icon updates.
+APP_USER_MODEL_ID = "Merserk.VisualEnhancer"
 APP_DISPLAY_NAME = "Visual Enhancer"
+
+
+def set_native_taskbar_icons(window) -> bool:
+    """Give Windows' window-class fallback the same icons as the Qt window."""
+    if sys.platform != "win32":
+        return False
+    try:
+        user32 = ctypes.windll.user32
+        user32.SendMessageW.argtypes = [ctypes.c_void_p, ctypes.c_uint,
+                                       ctypes.c_size_t, ctypes.c_ssize_t]
+        user32.SendMessageW.restype = ctypes.c_size_t
+        user32.CopyIcon.argtypes = [ctypes.c_void_p]
+        user32.CopyIcon.restype = ctypes.c_void_p
+        user32.SetClassLongPtrW.argtypes = [ctypes.c_void_p, ctypes.c_int,
+                                          ctypes.c_size_t]
+        user32.SetClassLongPtrW.restype = ctypes.c_size_t
+        user32.GetClassLongPtrW.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        user32.GetClassLongPtrW.restype = ctypes.c_size_t
+        user32.DestroyIcon.argtypes = [ctypes.c_void_p]
+        hwnd = int(window.winId())
+        owned = getattr(window, "_taskbar_class_icons", None)
+        if owned is None:
+            owned = []
+            for class_index, icon_size in ((-14, 1), (-34, 0)):
+                source = user32.SendMessageW(hwnd, 0x007F, icon_size, 0)
+                copied = user32.CopyIcon(source) if source else None
+                if not copied:
+                    for _, icon, _ in owned:
+                        user32.DestroyIcon(icon)
+                    return False
+                previous = user32.GetClassLongPtrW(hwnd, class_index)
+                owned.append((class_index, copied, previous))
+            window._taskbar_class_icons = owned
+
+            def release_icons() -> None:
+                for class_index, icon, previous in owned:
+                    if user32.GetClassLongPtrW(hwnd, class_index) == icon:
+                        user32.SetClassLongPtrW(hwnd, class_index, previous)
+                    user32.DestroyIcon(icon)
+                window._taskbar_class_icons = None
+
+            QGuiApplication.instance().aboutToQuit.connect(release_icons)
+        for class_index, icon, _ in owned:
+            user32.SetClassLongPtrW(hwnd, class_index, icon)
+            if user32.GetClassLongPtrW(hwnd, class_index) != icon:
+                return False
+        return True
+    except Exception:
+        return False
 
 
 def resolve_launcher_exe() -> Path | None:
@@ -183,14 +235,15 @@ def stamp_taskbar_relaunch(hwnd: int) -> bool:
             _fields_ = [("fmtid", _GUID), ("pid", ctypes.c_ulong)]
 
         class _PROPVARIANT(ctypes.Structure):
-            # 16 bytes: vt + reserved, then the value union. Only VT_LPWSTR
-            # is used here; SetValue copies the string synchronously.
+            # PROPVARIANT is 24 bytes on Win64: the union also contains
+            # counted arrays (a count plus an aligned pointer).
             _fields_ = [
                 ("vt", ctypes.c_ushort),
                 ("wReserved1", ctypes.c_ushort),
                 ("wReserved2", ctypes.c_ushort),
                 ("wReserved3", ctypes.c_ushort),
                 ("value", ctypes.c_void_p),
+                ("union_tail", ctypes.c_void_p),
             ]
 
         def _guid(s: str) -> _GUID:
@@ -240,10 +293,14 @@ def stamp_taskbar_relaunch(hwnd: int) -> bool:
 
             keepalive = []
             if launcher_str:
+                icon_path = resolve_app_icon()
+                icon_resource = ('"' + str(icon_path) + '",0'
+                                 if icon_path is not None and icon_path.suffix.lower() == ".ico"
+                                 else '"' + launcher_str + '",0')
                 for key, text in (
-                    (PKEY_RelaunchCommand, launcher_str),
+                    (PKEY_RelaunchCommand, '"' + launcher_str + '"'),
                     (PKEY_RelaunchDisplayName, APP_DISPLAY_NAME),
-                    (PKEY_RelaunchIconResource, launcher_str + ",0"),
+                    (PKEY_RelaunchIconResource, icon_resource),
                 ):
                     var, buf = _str_var(text)
                     keepalive.append(buf)
@@ -276,6 +333,7 @@ def launch_desktop() -> int:
     OUTPUTS.mkdir(exist_ok=True)
     LOGS.mkdir(exist_ok=True)
     LIVE_DIR.mkdir(exist_ok=True)
+    JOBS.mkdir(exist_ok=True)
     # Startup sweep of stale temp caches (24h+ old): crash orphans, old
     # staged pastes and previews. Queues are in-memory per session, so no
     # live references can exist yet. Finish the sweep before showing the UI.
@@ -291,7 +349,12 @@ def launch_desktop() -> int:
     QGuiApplication.setHighDpiScaleFactorRoundingPolicy(
         Qt.HighDpiScaleFactorRoundingPolicy.PassThrough
     )
+    # Use FFmpeg for the original-media player as well as export formats.
+    # Cached previews use our direct 10-bit frame player below.
+    os.environ["QT_MEDIA_BACKEND"] = "ffmpeg"
     app = QGuiApplication(sys.argv)
+    from PySide6.QtQml import qmlRegisterType
+    qmlRegisterType(PreviewPlayer, "VisualEnhancer", 1, 0, "PreviewPlayer")
     app.setApplicationName("Visual Enhancer")
     app.setApplicationDisplayName("Visual Enhancer")
     app.setOrganizationName("Merserk")
@@ -305,6 +368,9 @@ def launch_desktop() -> int:
 
     image_provider = PreviewImageProvider()
     bridge = AppBridge(image_provider)
+    from .export_power import ExportPowerFilter
+    export_power = ExportPowerFilter(bridge)
+    app.installNativeEventFilter(export_power)
     app.aboutToQuit.connect(bridge.shutdown)
     bridge.initializeRuntime()
     mark("runtime_ready" if bridge.runtimeState == "Ready" else "runtime_failed")
@@ -313,6 +379,7 @@ def launch_desktop() -> int:
     engine.addImageProvider("preview", image_provider)
     engine.addImageProvider("icons", IconImageProvider())
     engine.rootContext().setContextProperty("backend", bridge)
+    bridge.languageChanged.connect(engine.retranslate)
 
     qml_path = Path(__file__).resolve().parent / "qml" / "Main.qml"
     engine.load(QUrl.fromLocalFile(str(qml_path)))
@@ -328,12 +395,19 @@ def launch_desktop() -> int:
         return 1
 
     root_window = engine.rootObjects()[0]
+    focus_filter = ClickFocusFilter(root_window)
+    restore_window_geometry(
+        root_window,
+        QRect(bridge.windowX, bridge.windowY, bridge.windowWidth, bridge.windowHeight),
+        has_position=(bridge.windowX, bridge.windowY) != (-1, -1),
+    )
     root_window.create()
     # Brand the live taskbar button (name + VE icon + launcher relaunch) and
     # pin the window icon explicitly so pythonw.exe art never leaks through.
     try:
         if icon_path is not None:
             root_window.setIcon(QIcon(str(icon_path)))
+            log_native_chrome(f"taskbar-class-icons={set_native_taskbar_icons(root_window)}")
     except Exception:
         pass
     try:
@@ -370,10 +444,9 @@ def launch_desktop() -> int:
 
     root_window.frameSwapped.connect(on_first_frame)
 
-    if bridge.windowMaximized:
-        root_window.showMaximized()
-    else:
-        root_window.showNormal()
+    # Always launch maximized, even when the last session was restored or
+    # snapped to one side. Saved geometry still supplies the restore size.
+    root_window.showMaximized()
     mark("window_shown")
 
     # Qt re-applies window flags when shown, so restore native chrome once.
@@ -386,9 +459,17 @@ def launch_desktop() -> int:
     except Exception:
         pass
 
+    responsiveness = UiResponsivenessMonitor(
+        Path(app_log.session_path()).with_suffix(".ui-hang.err"),
+        context=lambda: (f"operation={bridge.operationState}; "
+                         f"selected={bridge._context().selected_path}"),
+        parent=app,
+    )
+    app.aboutToQuit.connect(responsiveness.stop)
     try:
         return app.exec()
     finally:
+        responsiveness.stop()
         # aboutToQuit normally runs this first. Keep the fallback for exits
         # that bypass the signal, then dismantle QML and the native event
         # filter while the application object is still alive.

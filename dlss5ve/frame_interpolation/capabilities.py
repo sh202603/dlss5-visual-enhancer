@@ -2,11 +2,11 @@ from __future__ import annotations
 
 import ctypes
 import os
-import subprocess
 from functools import lru_cache
 from pathlib import Path
 
 from ..core.gpu_selection import detect_gpu
+from ..core.authenticode import authenticode_status as _authenticode_status
 from .models import FrameInterpolationCapabilities
 from .native import BRIDGE, BRIDGE_ABI_VERSION, RUNTIME_DIR, initialize_bridge
 
@@ -27,23 +27,6 @@ def _hags_enabled() -> bool:
         return False
 
 
-def _authenticode_status(path: Path) -> str:
-    if os.name != "nt":
-        return "Unavailable"
-    escaped = str(path.resolve()).replace("'", "''")
-    try:
-        process = subprocess.run(
-            ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command",
-             "Import-Module \"$env:WINDIR\\System32\\WindowsPowerShell\\v1.0\\Modules\\"
-             "Microsoft.PowerShell.Security\\Microsoft.PowerShell.Security.psd1\"; "
-             f"[string](Get-AuthenticodeSignature -LiteralPath '{escaped}').Status"],
-            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=15,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-    except (OSError, subprocess.TimeoutExpired):
-        return "Unavailable"
-    return process.stdout.strip() if process.returncode == 0 else "Unavailable"
-
-
 def _nvof_present() -> bool:
     try:
         ctypes.WinDLL("nvofapi64.dll")
@@ -53,8 +36,21 @@ def _nvof_present() -> bool:
 
 
 @lru_cache(maxsize=32)
+def _isolated_capabilities(ai_gpu_uuid, fingerprint):
+    from ..desktop.pass_process import isolated_probe
+    values = isolated_probe("fg-probe", ai_gpu_uuid)
+    values.pop("worker", None)
+    return FrameInterpolationCapabilities(**values)
+
+
 def probe_frame_interpolation_capabilities(
         ai_gpu_uuid: str = "auto") -> FrameInterpolationCapabilities:
+    if not os.environ.get("VE_STAGE_WORKER"):
+        gpu = detect_gpu(ai_gpu_uuid)
+        files = tuple((str(path), path.stat().st_size, path.stat().st_mtime_ns) if path.is_file()
+                      else (str(path), 0, 0) for path in (BRIDGE, DLSSG_RUNTIME))
+        fingerprint = (str(gpu.get("uuid")), str(gpu.get("driver")), BRIDGE_ABI_VERSION, files)
+        return _isolated_capabilities(ai_gpu_uuid, fingerprint)
     gpu = detect_gpu(ai_gpu_uuid)
     gpu_name = str(gpu.get("display_name") or gpu.get("name") or "NVIDIA RTX GPU")
     driver = str(gpu.get("driver") or "unknown")
@@ -94,4 +90,4 @@ def probe_frame_interpolation_capabilities(
 
 
 def clear_capability_cache() -> None:
-    probe_frame_interpolation_capabilities.cache_clear()
+    _isolated_capabilities.cache_clear()

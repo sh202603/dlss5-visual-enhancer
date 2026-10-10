@@ -1,32 +1,19 @@
 from __future__ import annotations
 
-import os
-from pathlib import Path
+from ..portable import ROOT, TEMP, UI_SETTINGS_PATH
 
 
-def _resolve_root() -> Path:
-    """Locate the checkout that carries bin/runtime and bin/ffmpeg.
-
-    The package normally lives inside that checkout (editable install or the
-    embedded interpreter), so the default is two levels above this file. When
-    the package is installed elsewhere, DLSS5VE_HOME must point at the checkout.
-    """
-    override = os.environ.get("DLSS5VE_HOME", "").strip()
-    if override:
-        return Path(override).expanduser().resolve()
-    return Path(__file__).resolve().parents[2]
-
-
-ROOT = _resolve_root()
-TEMP = ROOT / "temp"
 APP_TEMP = TEMP / "app"
+PREVIEW_CACHE = APP_TEMP / "cache"
 RUNTIME = ROOT / "bin" / "runtime"
 DLSSG_DIR = RUNTIME / "dlssg"
-# In-process D3D12/NGX feature-18 runtime. The bridge and caller shim are
-# self-contained and require no Python tensor framework or external add-on.
+DLSSSR_DIR = RUNTIME / "dlsssr"
+DLSSSR_BRIDGE = DLSSSR_DIR / "neuroframe_engine_super_resolution.dll"
+DLSSSR_RUNTIME = DLSSSR_DIR / "nvngx_dlss.dll"
+# In-process D3D12/NGX feature-18 runtime. The engine includes its NGX caller
+# and requires no Python tensor framework or external add-on.
 DLSSNR_DIR = RUNTIME / "dlssnr"
 DLSSNR_BRIDGE = DLSSNR_DIR / "neuroframe_engine_neural_rendering.dll"
-DLSSNR_CALLER_SHIM = DLSSNR_DIR / "neuroframe_caller.dll"
 FFMPEG = ROOT / "bin" / "ffmpeg" / "bin" / "ffmpeg.exe"
 FFPROBE = ROOT / "bin" / "ffmpeg" / "bin" / "ffprobe.exe"
 NEURAL_RUNTIME = DLSSNR_DIR / "nvngx_dlssnr.dll"

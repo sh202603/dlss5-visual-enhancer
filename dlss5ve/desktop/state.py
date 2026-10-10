@@ -37,6 +37,7 @@ class PreviewState:
     input_url: str = ""
     output_url: str = ""
     poster_url: str = ""
+    preview_error: str = ""
     input_is_video: bool = False
     output_is_video: bool = False
     input_info: str = ""
@@ -45,6 +46,7 @@ class PreviewState:
     source_width: int = 0
     source_height: int = 0
     source_fps: float = 0.0
+    source_hdr: bool = False
     duration_seconds: float = 0.0
     output_width: int = 0
     output_height: int = 0
@@ -59,8 +61,8 @@ class PreviewState:
     selected_path: str = ""
     selected_row: int = -1
     generation: int = 0
-    # Skip-if-fresh marker for realtime auto-preview: (selected source,
-    # settings snapshot) captured when the current output preview finished
+    # Skip-if-fresh marker for realtime auto-preview: source identity,
+    # active settings and timeline frame captured when its preview finished
     # rendering. Empty = stale (first visit, cleared queue, cancelled
     # render). Tab/mode switches skip the GPU re-render while this matches.
     last_auto_fingerprint: tuple = ()

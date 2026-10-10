@@ -12,7 +12,9 @@ import cv2
 import numpy as np
 
 from ...core.batch_progress import BatchItemUpdate, BatchProgress
+from ...core import app_log
 from ...core.disk_paths import OutputFile, prepare_output_dir
+from ...core.dlss_modes import DLSS_MODES, validate_dlss
 from ...core.gpu_selection import resolve_runtime_ai_gpu
 from ...core.jobs import Cancelled, JobController, active_job
 from ...core.render_metadata import prepare_render_note
@@ -29,10 +31,8 @@ from .models import (
     ImageConversionOptions, ImageConversionResult,
 )
 from .reports import (
-    IncrementalImageArchive, _ImageReportData, _SessionReportData, _build_manifest,
-    _report_data, _write_report, snapshot_session, update_report_performance,
+    IncrementalImageArchive, record_image_result,
 )
-
 
 @dataclass(slots=True)
 class _OutputTask:
@@ -41,10 +41,7 @@ class _OutputTask:
     output: Path
     processed: np.ndarray
     metadata: dict[str, object]
-    report_data: _ImageReportData
-    session_data: _SessionReportData
-    evidence: dict[str, object]
-    gpu: dict[str, object]
+    gpu_name: str
     input_width: int
     input_height: int
     render_width: int
@@ -58,8 +55,10 @@ class _OutputTask:
     has_transparency: bool
     timings: dict[str, float]
 
-
 def _validate_options(options: ImageConversionOptions) -> ImageConversionOptions:
+    if options.scale_method not in {"Standard", "DLSS"}:
+        raise ValueError("Unknown Neural Rendering scale method.")
+    validate_dlss(options.dlss_mode, options.dlss_preset)
     if options.output_format not in IMAGE_FORMATS:
         raise ValueError(f"Unknown image output format: {options.output_format!r}.")
     if isinstance(options.quality, bool):
@@ -75,7 +74,6 @@ def _validate_options(options: ImageConversionOptions) -> ImageConversionOptions
     resolve_upscaling_mode(options.upscaling_factor)
     return options
 
-
 def _output_path(source, output_format, stamp, index, rename_mode, custom_suffix, *, output_dir=None):
     safe_stem = source.stem.strip().rstrip(".") or "image"
     return (output_dir or OUTPUTS) / output_filename(
@@ -83,12 +81,10 @@ def _output_path(source, output_format, stamp, index, rename_mode, custom_suffix
         f"{safe_stem}_DLSS5_IMAGE_{stamp}-{index + 1:04d}",
     )
 
-
 def _timed_decode(path: Path) -> tuple[_DecodedImage, float]:
     started = time.monotonic()
     decoded = decode_image(path)
     return decoded, time.monotonic() - started
-
 
 def _finalize_output(
     task: _OutputTask,
@@ -126,20 +122,21 @@ def _finalize_output(
         if controller.cancel.is_set():
             raise Cancelled("Image rendering stopped by user.")
 
-        reporter.advance(task.index, .95, "Writing diagnostic report")
+        reporter.advance(task.index, .95, "Finalizing image")
         result = ImageConversionResult(
             input_path=str(task.path),
             output_path=str(task.output),
             report_path="",
             elapsed_seconds=reporter.elapsed(task.index),
-            gpu=str(task.gpu["display_name"]),
+            gpu=task.gpu_name,
             input_width=task.input_width,
             input_height=task.input_height,
             render_width=task.render_width,
             render_height=task.render_height,
             output_width=task.output_width,
             output_height=task.output_height,
-            upscaling_factor=float(options.upscaling_factor),
+            upscaling_factor=(float(DLSS_MODES[options.dlss_mode][0])
+                              if options.scale_method == "DLSS" else float(options.upscaling_factor)),
             output_format=options.output_format,
             neural_dimensions={"width": task.render_width, "height": task.render_height},
             resize_method=task.resize_method,
@@ -148,22 +145,16 @@ def _finalize_output(
             warnings=[*task.source_warnings, *warnings],
             timings=task.timings,
         )
-        # Keep the externally reported GPU name identical to the selected GPU.
-        # The batch caller replaces the temporary value below before report write.
-        report_started = time.monotonic()
-        result.report_path = _write_report(
-            result, options, task.report_data,
-            task.gpu,
-            task.session_data, task.evidence,
-            metadata_diagnostics=metadata_diagnostics,
-        )
-        task.timings["report"] = time.monotonic() - report_started
         if controller.cancel.is_set():
             raise Cancelled("Image rendering stopped by user.")
 
         publish_started = time.monotonic()
         output_file.publish()
         task.timings["publish"] = time.monotonic() - publish_started
+        result.elapsed_seconds = reporter.elapsed(task.index)
+        report_started = time.monotonic()
+        result.report_path = record_image_result(result)
+        task.timings["report"] = time.monotonic() - report_started
 
         # Archive work is deliberately after publication: cancellation or archive
         # failure must never roll back a valid completed image.
@@ -177,8 +168,6 @@ def _finalize_output(
 
         result.elapsed_seconds = reporter.elapsed(task.index)
         task.timings["total"] = result.elapsed_seconds
-        with suppress(Exception):
-            update_report_performance(result)
         reporter.complete(
             task.index, str(task.output),
             "; ".join([*result.warnings, f"Report: {result.report_path}"]),
@@ -194,7 +183,6 @@ def _finalize_output(
     finally:
         if output_file is not None:
             output_file.cleanup()
-
 
 def convert_images(
     input_paths: Iterable[str | os.PathLike[str]],
@@ -256,7 +244,8 @@ def convert_images(
                 raise Cancelled("Stopped before rendering.")
             prepared = prepare_runtime()
             gpu = resolve_runtime_ai_gpu(prepared.gpus, prepared.runtime_bundle, options.ai_gpu_uuid)
-            factor, mode = resolve_upscaling_mode(options.upscaling_factor)
+            factor, mode = resolve_upscaling_mode(
+                1.0 if options.scale_method == "DLSS" else options.upscaling_factor)
             native = resolve_native_settings(options)
             next_decode: Future[tuple[_DecodedImage, float]] | None = None
             session_size: tuple[int, int] | None = None
@@ -298,9 +287,19 @@ def convert_images(
                             raise ValueError(
                                 f"{path.name} is {width}×{height}; DLSS requires at least 64×64."
                             )
-                        output_width, output_height = resolve_output_size(
-                            width, height, options.upscaling_factor,
-                        )
+                        dlss_details = None
+                        if options.scale_method == "DLSS":
+                            from ...core.dlss_bridge import process_image as process_dlss_image
+                            dlss_started = time.monotonic()
+                            dlss_rgba, dlss_details = process_dlss_image(
+                                decoded.rgba, options.dlss_mode, options.dlss_preset,
+                                gpu_uuid=options.ai_gpu_uuid, controller=controller)
+                            timings["dlss_super_resolution"] = time.monotonic() - dlss_started
+                            output_height, output_width = dlss_rgba.shape[:2]
+                        else:
+                            dlss_rgba = None
+                            output_width, output_height = resolve_output_size(
+                                width, height, options.upscaling_factor)
                         dimensions = (output_width, output_height)
                         if session is not None and dimensions != session_size:
                             close_started = time.monotonic()
@@ -313,16 +312,17 @@ def convert_images(
                             reporter.advance(index, .10, "Starting D3D12/NGX bridge")
                             setup_started = time.monotonic()
                             session = DLSSFrameSession(
-                                input_width=width,
-                                input_height=height,
+                                input_width=output_width if dlss_rgba is not None else width,
+                                input_height=output_height if dlss_rgba is not None else height,
                                 output_width=output_width,
                                 output_height=output_height,
                                 frame_count=None,
                                 warmup_frames=options.warmup_frames,
                                 factor=factor,
                                 mode=mode,
-                                native_settings=native,
-                                composition_mask=options.nr_mask,
+                                native_settings={**native, "motion_mode": 0},
+                                still_image=True,
+                                control_mask=options.nr_mask,
                                 gpu=gpu,
                                 runtime_bundle=prepared.runtime_bundle,
                                 controller=controller,
@@ -334,7 +334,10 @@ def convert_images(
                         reporter.advance(index, .25, "Processing image")
                         prep_started = time.monotonic()
                         render_rgba = resize_fit(
-                            decoded.rgba, session.render_width, session.render_height,
+                            dlss_rgba if dlss_rgba is not None else decoded.rgba,
+                            session.render_width, session.render_height, controller=controller)
+                        session.diagnostics.source_format = (
+                            f"{decoded.metadata['source_format']}/{decoded.metadata['source_bit_depth']}"
                         )
                         timings["render_prepare"] = time.monotonic() - prep_started
 
@@ -358,7 +361,7 @@ def convert_images(
 
                         alpha_started = time.monotonic()
                         if decoded.alpha is None:
-                            processed[..., 3] = 255
+                            processed[..., 3] = np.iinfo(processed.dtype).max
                         elif decoded.alpha.shape == dimensions[::-1]:
                             processed[..., 3] = decoded.alpha
                         else:
@@ -366,14 +369,23 @@ def convert_images(
                                 decoded.alpha, dimensions, interpolation=cv2.INTER_LANCZOS4,
                             )
                         timings["alpha"] = time.monotonic() - alpha_started
+                        output_depth = 8
+                        if processed.dtype == np.uint16:
+                            if options.output_format in {"PNG", "TIFF"}:
+                                output_depth = 16
+                            elif options.output_format == "AVIF":
+                                output_depth = (
+                                    12 if int(decoded.metadata["source_bit_depth"]) > 10 else 10
+                                )
+                        session.diagnostics.output_format = f"{options.output_format}/{output_depth}"
 
-                        session_data = snapshot_session(session)
-                        evidence_snapshot = dict(session_evidence)
                         render_width = session.render_width
                         render_height = session.render_height
-                        resize_method = "none" if factor == 1.0 else "lanczos"
+                        resize_method = "dlss" if dlss_details else ("none" if factor == 1.0 else "lanczos")
                         memory_path = session.diagnostics.memory_path
                         bridge_status = session.structured_status()
+                        if dlss_details:
+                            bridge_status = {**bridge_status, "dlss_super_resolution": dlss_details}
 
                         # Preserve the old invariant that the final image is not
                         # published if native streaming completion fails.
@@ -398,10 +410,7 @@ def convert_images(
                             output=output,
                             processed=processed,
                             metadata=decoded.metadata,
-                            report_data=_report_data(decoded),
-                            session_data=session_data,
-                            evidence=evidence_snapshot,
-                            gpu=dict(gpu),
+                            gpu_name=str(gpu["display_name"]),
                             input_width=width,
                             input_height=height,
                             render_width=render_width,
@@ -482,11 +491,9 @@ def convert_images(
 
         zip_path = archive.finish(cancelled=cancelled) if archive is not None else None
         archive_error = archive.error if archive is not None else None
-        manifest = _build_manifest(
-            stamp, options, successes, failures, cancelled,
-            output_dir=destination,
-            batch_diagnostics=reporter.diagnostics(final=True),
-            archive_error=archive_error,
+        manifest = app_log.record_batch_summary(
+            "image-batch", len(successes), len(failures), cancelled,
+            archive_error=archive_error or "",
         )
         reporter.finish(cancelled=cancelled, manifest_path=manifest)
         return ImageBatchResult(successes, failures, cancelled, manifest, zip_path)

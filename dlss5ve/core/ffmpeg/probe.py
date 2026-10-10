@@ -5,6 +5,7 @@ import math
 import os
 import subprocess
 import tempfile
+import time
 from fractions import Fraction
 from pathlib import Path
 
@@ -17,7 +18,11 @@ from .. import app_log
 def _run_json(
     command: list[str], *, strict_decode: bool = False,
     controller: JobController | None = None,
+    timeout: float | None = None,
 ) -> dict:
+    if timeout is not None and (not math.isfinite(timeout) or timeout <= 0):
+        raise ValueError("Media probe timeout must be finite and positive.")
+    deadline = time.monotonic() + timeout if timeout is not None else None
     if controller is not None and controller.cancel.is_set():
         raise Cancelled("Render stopped by user.")
     # ffprobe can report decoding errors and still exit with code zero. Keep its
@@ -33,8 +38,11 @@ def _run_json(
             while True:
                 if controller is not None and controller.cancel.is_set():
                     raise Cancelled("Render stopped by user.")
+                remaining = deadline - time.monotonic() if deadline is not None else None
+                if remaining is not None and remaining <= 0:
+                    raise TimeoutError(f"Video metadata probe timed out after {timeout:g} seconds.")
                 try:
-                    stdout, _ = process.communicate(timeout=0.2)
+                    stdout, _ = process.communicate(timeout=min(0.2, remaining) if remaining is not None else 0.2)
                     break
                 except subprocess.TimeoutExpired:
                     continue
@@ -82,6 +90,7 @@ def _positive_count(value: object) -> int:
 def _sampled_packet_timeline_is_cfr(
     path: str | os.PathLike[str], time_base: Fraction,
     controller: JobController | None,
+    timeout: float | None = None,
 ) -> bool:
     """Reject VFR timelines that container-level average/nominal rates hide.
 
@@ -93,7 +102,7 @@ def _sampled_packet_timeline_is_cfr(
         str(FFPROBE), "-v", "error", "-select_streams", "v:0",
         "-read_intervals", "%+#160", "-show_packets", "-show_entries",
         "packet=pts", "-of", "json", str(path),
-    ], controller=controller)
+    ], controller=controller, timeout=timeout)
     packets = data.get("packets") or []
     timestamps = sorted({int(packet["pts"]) for packet in packets
                          if packet.get("pts") not in {None, "N/A"}})
@@ -112,6 +121,7 @@ def probe_video(
     path: str | os.PathLike[str], *, count_mode: str = "exact",
     strict_decode: bool = False, controller: JobController | None = None,
     inspect_timestamps: bool = False,
+    timeout: float | None = None,
 ) -> dict:
     """Probe video metadata, optionally counting decoded frames or packets.
 
@@ -119,6 +129,7 @@ def probe_video(
     Conversion paths use metadata first and pay for exact counting only as fallback.
     Strict decoding rejects decoder errors and unavailable decoded counts, even
     when ffprobe exits successfully or the container declares a positive count.
+    An optional timeout bounds each ffprobe subprocess, not full frame decoding.
     """
     if count_mode not in {"metadata", "exact", "packets"}:
         raise ValueError(f"Unknown video count mode: {count_mode!r}.")
@@ -126,7 +137,7 @@ def probe_video(
         raise ValueError("Strict decoding requires count_mode='exact'.")
     count_args = {
         "metadata": [],
-        "exact": ["-count_frames"],
+        "exact": [],
         "packets": ["-count_packets"],
     }[count_mode]
     data = _run_json(
@@ -138,13 +149,13 @@ def probe_video(
             "-select_streams",
             "v:0",
             "-show_entries",
-            "stream=index,codec_name,pix_fmt,bits_per_raw_sample,width,height,avg_frame_rate,r_frame_rate,time_base,duration,nb_frames,nb_read_frames,nb_read_packets,color_range,color_primaries,color_transfer,color_space:stream_tags=rotate:stream_side_data=rotation",
+            "stream=index,codec_name,pix_fmt,bits_per_raw_sample,width,height,avg_frame_rate,r_frame_rate,time_base,duration,nb_frames,nb_read_frames,nb_read_packets,color_range,color_primaries,color_transfer,color_space,chroma_location:stream_tags=rotate:stream_side_data=rotation",
             "-show_entries",
             "format=duration,format_name",
             "-of",
             "json",
             str(path),
-        ], strict_decode=strict_decode, controller=controller,
+        ], strict_decode=strict_decode, controller=controller, timeout=timeout,
     )
     streams = data.get("streams") or []
     if not streams:
@@ -160,6 +171,12 @@ def probe_video(
         width, height = height, width
     declared_frames = _positive_count(stream.get("nb_frames"))
     decoded_frames = _positive_count(stream.get("nb_read_frames"))
+    if count_mode == "exact":
+        from .frames import open_video_decoder
+        counter_controller = controller or JobController()
+        with open_video_decoder(path, counter_controller, pixel_format="rgba",
+                                video_filter="scale=2:2:flags=neighbor") as decoded:
+            decoded_frames = sum(1 for _ in decoded.decode(decoded.streams.video[0]))
     packet_frames = _positive_count(stream.get("nb_read_packets"))
     if count_mode == "packets":
         frames = packet_frames or declared_frames
@@ -186,7 +203,7 @@ def probe_video(
     time_base = Fraction(stream.get("time_base") or "1/1000")
     cfr = rate == nominal_rate
     if cfr and inspect_timestamps:
-        cfr = _sampled_packet_timeline_is_cfr(path, time_base, controller)
+        cfr = _sampled_packet_timeline_is_cfr(path, time_base, controller, timeout)
     transfer = stream.get("color_transfer") or "unknown"
     primaries = stream.get("color_primaries") or "unknown"
     color_space = stream.get("color_space") or "unknown"
@@ -225,12 +242,15 @@ def probe_video(
         "color_primaries": primaries,
         "color_space": color_space,
         "color_range": color_range,
+        "chroma_location": stream.get("chroma_location") or "unknown",
         "hdr": transfer in {"smpte2084", "arib-std-b67"},
     }
 
 def preview_frame_count(source: Path, seconds: float) -> int:
     """Count frames whose presentation times fall within the opening interval."""
-    container = av.open(str(source))
+    from .frames import open_video_decoder
+    from ..jobs import JobController
+    container = open_video_decoder(source, JobController())
     try:
         stream = container.streams.video[0]
         rate = float(stream.average_rate or 30)

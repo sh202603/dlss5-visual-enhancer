@@ -1,114 +1,78 @@
+"""Compact console progress, using the same whole-file updates as the desktop."""
 from __future__ import annotations
 
-import json
 import re
 import shutil
-import sys
-from pathlib import Path
-from typing import TextIO
-
-from ..core.batch_progress import TERMINAL, BatchItemUpdate
-
-_ETA_SUFFIX = re.compile(r" - Time Remaining: [0-9.]+s$")
+import threading
+import time
 
 
-class ProgressReporter:
-    """Adapt the processing layer's progress callbacks to stderr.
+class ConsoleProgress:
+    def __init__(self, paths, stream, *, quiet=False):
+        self.paths = paths
+        self.stream = stream
+        self.quiet = quiet
+        self.interactive = bool(stream.isatty())
+        self.last_print = 0.0
+        self.current_index = None
+        self.last_stage = ""
+        self.line_open = False
+        self.lock = threading.RLock()
 
-    Two callbacks feed the reporter: ``progress(value, message)`` with the
-    batch-wide fraction, and ``item_update(BatchItemUpdate)`` with one
-    file's state (Queued, Running, Complete, Failed, Cancelled, Skipped).
+    def _line(self, text):
+        if self.line_open:
+            self.stream.write("\r\033[2K")
+            self.line_open = False
+        self.stream.write(text + "\n")
+        self.stream.flush()
 
-    ``text`` rewrites one line on a terminal and prints a line whenever a
-    file reaches a terminal state; on a pipe it prints a line only when the
-    percentage or the message (minus its ETA suffix) changes, so a long
-    render does not flood a log. ``json`` prints one object per item update
-    (JSON Lines) and ignores the batch-wide fraction, which the per-item
-    progress already carries. ``none`` discards everything.
-    """
-
-    def __init__(self, mode: str, stream: TextIO | None = None) -> None:
-        if mode not in ("text", "json", "none"):
-            raise ValueError(f"Unknown progress mode: {mode!r}.")
-        self.mode = mode
-        self.stream = stream or sys.stderr
-        try:
-            self._tty = bool(self.stream.isatty())
-        except Exception:
-            self._tty = False
-        self._last: tuple[int, str] | None = None
-        self._line_length = 0
-        self._names: dict[int, str] = {}
-        self._total = 0
-
-    def __call__(self, value: float, message: str) -> None:
-        if self.mode != "text":
-            return
-        try:
-            fraction = float(value)
-        except (TypeError, ValueError):
-            fraction = 0.0
-        fraction = 0.0 if fraction < 0 else (1.0 if fraction > 1 else fraction)
-        text = str(message)
-        percent = int(fraction * 100)
-        if self._tty:
-            width = max(20, shutil.get_terminal_size((100, 20)).columns - 1)
-            line = f"{percent:3d}% {text}"
-            if len(line) > width:
-                line = line[: width - 1] + "…"
-            padded = line.ljust(self._line_length)
-            self._line_length = len(line)
-            self._write("\r" + padded)
-            return
-        key = (percent, _ETA_SUFFIX.sub("", text))
-        if key == self._last:
-            return
-        self._last = key
-        self._write(f"{percent:3d}% {key[1]}\n")
-
-    def register(self, paths: list) -> None:
-        """Remember the input names so terminal-state lines can show them."""
-        self._names = {index: Path(path).name for index, path in enumerate(paths)}
-        self._total = len(paths)
-
-    def item_update(self, update: BatchItemUpdate) -> None:
-        if self.mode == "none":
-            return
-        if self.mode == "json":
-            record = {
-                "index": update.index,
-                "state": update.state,
-                "progress": round(float(update.progress), 4),
-                "detail": update.detail,
-                "output_path": update.output_path,
-                "elapsed_seconds": round(float(update.elapsed_seconds), 3),
-            }
+    def __call__(self, update):
+        with self.lock:
             if update.index is None:
-                record["log_path"] = update.manifest_path
-            else:
-                record["input"] = self._names.get(update.index, "")
-            self._write(json.dumps(record) + "\n")
-            return
-        if update.index is None or update.state not in TERMINAL:
-            return
-        self.finish()
-        name = self._names.get(update.index, str(update.index))
-        position = f"[{update.index + 1}/{self._total}] " if self._total else ""
-        detail = update.detail.splitlines()[0] if update.detail else ""
-        if update.state == "Complete":
-            self._write(f"{position}{name}: Complete -> {update.output_path}\n")
-        else:
-            self._write(f"{position}{name}: {update.state}{': ' + detail if detail else ''}\n")
+                self.finish()
+                return
+            number = f"[{update.index + 1}/{len(self.paths)}]"
+            name = self.paths[update.index].name
+            if update.state in {"Failed", "Cancelled"}:
+                self._line(f"{number} {update.state}: {name}: {update.detail}")
+            elif update.state == "Complete":
+                if not self.quiet:
+                    self._line(f"{number} Saved: {update.output_path}")
+            elif update.state == "Running" and not self.quiet:
+                match = re.search(r"\bStage (\d+) of (\d+)\b", update.detail)
+                stage = f"Processing Stage {match[1]} of {match[2]}" if match else "Preparing"
+                part = re.search(r"\bPart (\d+)\b", update.detail)
+                if match and part:
+                    stage += f" (Part {part[1]})"
+                if self.current_index != update.index:
+                    self._line(f"{number} {name}")
+                    self.current_index = update.index
+                    self.last_stage = ""
+                if not self.interactive:
+                    if stage != self.last_stage:
+                        self._line(f"  {stage}")
+                        self.last_stage = stage
+                    return
+                now = time.monotonic()
+                if now - self.last_print < .15 and stage == self.last_stage:
+                    return
+                self.last_print, self.last_stage = now, stage
+                fraction = max(0.0, min(.99, update.progress))
+                remaining = ""
+                if update.elapsed_seconds >= 1 and fraction > .01:
+                    seconds = round(update.elapsed_seconds * (1 - fraction) / fraction)
+                    remaining = f" | ~{seconds // 60:02d}:{seconds % 60:02d} remaining"
+                filled = int(fraction * 20)
+                bar = "#" * filled + "-" * (20 - filled)
+                text = f"{number} [{bar}] {fraction:.0%} | {stage}{remaining}"
+                width = max(20, shutil.get_terminal_size((100, 25)).columns - 1)
+                self.stream.write("\r\033[2K" + text[:width])
+                self.stream.flush()
+                self.line_open = True
 
-    def finish(self) -> None:
-        """Terminate a rewritten terminal line so later output starts fresh."""
-        if self.mode == "text" and self._tty and self._line_length:
-            self._write("\n")
-            self._line_length = 0
-
-    def _write(self, text: str) -> None:
-        try:
-            self.stream.write(text)
-            self.stream.flush()
-        except (OSError, ValueError):
-            pass
+    def finish(self):
+        with self.lock:
+            if self.line_open:
+                self.stream.write("\n")
+                self.stream.flush()
+                self.line_open = False

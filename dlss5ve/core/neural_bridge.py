@@ -11,7 +11,9 @@ their diagnostics.
 
 import ctypes
 import contextlib
+import itertools
 import json
+import queue
 import threading
 import time
 from dataclasses import dataclass, field
@@ -22,9 +24,10 @@ import numpy as np
 
 from .paths import DLSSNR_BRIDGE, DLSSNR_DIR
 from .ngx_runtime import NGX_RUNTIME_LOCK
+from .cuda_dlpack import CudaDLPackPlane, LIVE_DLPACK_RECORDS, DLPACK_LOCK
 
-
-BRIDGE_ABI_VERSION = 6
+BRIDGE_ABI_VERSION = 11
+BRIDGE_FRAME_ABI_MAX_VERSION = 11
 BRIDGE_WATCHDOG_SECONDS = 45.0
 MEMORY_HOST = 0
 MEMORY_CUDA = 1
@@ -32,7 +35,7 @@ MEMORY_NONE = 2
 FORMAT_RGBA8 = 1
 FORMAT_NV12 = 2
 FORMAT_P010 = 3
-
+FORMAT_RGBA16LE = 4
 
 def _bridge_failure_requires_restart(detail: str) -> bool:
     """Return whether retrying through either memory path is unsafe/useless."""
@@ -46,9 +49,12 @@ def _bridge_failure_requires_restart(detail: str) -> bool:
             "device recovery aborted",
             "device removal",
             "reinitialization failed",
+            "gpu completion was not confirmed",
+            "native fence wait failed",
+            "cuda context is poisoned",
+            "restart the application",
         )
     )
-
 
 class FrameDescriptorV1(ctypes.Structure):
     _fields_ = [
@@ -74,72 +80,19 @@ class FrameDescriptorV1(ctypes.Structure):
         value.abi_version = BRIDGE_ABI_VERSION
         return value
 
-
-class RenderParametersV1(ctypes.Structure):
-    """Legacy ABI-v2 render controls retained for old frame entry points."""
-
+class RenderParametersV11(ctypes.Structure):
+    """Native NR controls, intensity resolve, pass count, and native RGBA mask."""
     _fields_ = [
-        ("struct_size", ctypes.c_uint32),
-        ("abi_version", ctypes.c_uint32),
-        ("style", ctypes.c_int32),
-        ("intensity", ctypes.c_float),
-        ("tone", ctypes.c_float),
-        ("structure", ctypes.c_float),
-        ("skin", ctypes.c_float),
-        ("automask", ctypes.c_int32),
-        ("reset", ctypes.c_int32),
+        ("struct_size", ctypes.c_uint32), ("abi_version", ctypes.c_uint32),
+        ("style", ctypes.c_int32), ("intensity", ctypes.c_float),
+        ("tone", ctypes.c_float), ("structure", ctypes.c_float), ("skin", ctypes.c_float),
+        ("automask", ctypes.c_int32), ("reset", ctypes.c_int32), ("nr_passes", ctypes.c_int32),
+        ("native_intensity", ctypes.c_float), ("mask_memory_type", ctypes.c_uint32),
+        ("mask_width", ctypes.c_uint32), ("mask_height", ctypes.c_uint32),
+        ("mask_stride", ctypes.c_uint32), ("motion_mode", ctypes.c_uint32),
+        ("mask_plane", ctypes.c_uint64), ("mask_revision", ctypes.c_uint64),
+        ("optical_flow_quality", ctypes.c_uint32), ("reserved", ctypes.c_uint32),
     ]
-
-
-class RenderParametersV3(ctypes.Structure):
-    _fields_ = [
-        ("struct_size", ctypes.c_uint32),
-        ("abi_version", ctypes.c_uint32),
-        ("style", ctypes.c_int32),
-        ("intensity", ctypes.c_float),
-        ("tone", ctypes.c_float),
-        ("structure", ctypes.c_float),
-        ("skin", ctypes.c_float),
-        ("automask", ctypes.c_int32),
-        ("reset", ctypes.c_int32),
-        ("color_strength", ctypes.c_float),
-        ("tone_preservation", ctypes.c_float),
-        ("mask_memory_type", ctypes.c_uint32),
-        ("mask_width", ctypes.c_uint32),
-        ("mask_height", ctypes.c_uint32),
-        ("mask_stride", ctypes.c_uint32),
-        ("mask_plane", ctypes.c_uint64),
-    ]
-
-
-class RenderParametersV4(ctypes.Structure):
-    """ABI-v4 controls; the ABI-v3 prefix is deliberately unchanged."""
-
-    _fields_ = [
-        *RenderParametersV3._fields_,
-        ("face_skin_protection", ctypes.c_float),
-        ("grain_preservation", ctypes.c_float),
-    ]
-
-
-class RenderParametersV5(ctypes.Structure):
-    """ABI-v5 controls; the ABI-v4 prefix is deliberately unchanged."""
-
-    _fields_ = [
-        *RenderParametersV4._fields_,
-        ("nr_passes", ctypes.c_int32),
-    ]
-
-
-class RenderParametersV6(ctypes.Structure):
-    """ABI-v6 controls; v5 callers retain suppression-disabled behavior."""
-
-    _fields_ = [
-        *RenderParametersV5._fields_,
-        ("shimmer_suppression", ctypes.c_float),
-        ("prefer_nvof", ctypes.c_int32),
-    ]
-
 
 class FrameResultV1(ctypes.Structure):
     _fields_ = [
@@ -163,143 +116,14 @@ class FrameResultV1(ctypes.Structure):
         value.abi_version = BRIDGE_ABI_VERSION
         return value
 
-
-class _DLDevice(ctypes.Structure):
-    _fields_ = [("device_type", ctypes.c_int), ("device_id", ctypes.c_int)]
-
-
-class _DLDataType(ctypes.Structure):
-    _fields_ = [("code", ctypes.c_uint8), ("bits", ctypes.c_uint8), ("lanes", ctypes.c_uint16)]
-
-
-class _DLTensor(ctypes.Structure):
-    _fields_ = [
-        ("data", ctypes.c_void_p),
-        ("device", _DLDevice),
-        ("ndim", ctypes.c_int),
-        ("dtype", _DLDataType),
-        ("shape", ctypes.POINTER(ctypes.c_int64)),
-        ("strides", ctypes.POINTER(ctypes.c_int64)),
-        ("byte_offset", ctypes.c_uint64),
-    ]
-
-
-class _DLManagedTensor(ctypes.Structure):
-    pass
-
-
-_DLPACK_RECORDS: dict[int, tuple[Any, ...]] = {}
-_DLPACK_LOCK = threading.Lock()
-_DL_DELETER = ctypes.CFUNCTYPE(None, ctypes.POINTER(_DLManagedTensor))
-
-
-@_DL_DELETER
-def _dlpack_deleter(pointer: ctypes.POINTER(_DLManagedTensor)) -> None:
-    address = ctypes.addressof(pointer.contents)
-    with _DLPACK_LOCK:
-        record = _DLPACK_RECORDS.pop(address, None)
-    if record is not None:
-        release = record[-1]
-        try:
-            release()
-        except Exception:
-            pass
-
-
-_DLManagedTensor._fields_ = [
-    ("dl_tensor", _DLTensor),
-    ("manager_ctx", ctypes.c_void_p),
-    ("deleter", _DL_DELETER),
-]
-
-
-_PYCAPSULE_DESTRUCTOR = ctypes.CFUNCTYPE(None, ctypes.c_void_p)
-ctypes.pythonapi.PyCapsule_New.argtypes = [
-    ctypes.c_void_p,
-    ctypes.c_char_p,
-    _PYCAPSULE_DESTRUCTOR,
-]
-ctypes.pythonapi.PyCapsule_New.restype = ctypes.py_object
-ctypes.pythonapi.PyCapsule_IsValid.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
-ctypes.pythonapi.PyCapsule_IsValid.restype = ctypes.c_int
-ctypes.pythonapi.PyCapsule_GetPointer.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
-ctypes.pythonapi.PyCapsule_GetPointer.restype = ctypes.c_void_p
-
-
-@_PYCAPSULE_DESTRUCTOR
-def _capsule_destructor(capsule: int) -> None:
-    try:
-        if ctypes.pythonapi.PyCapsule_IsValid(capsule, b"dltensor"):
-            address = ctypes.pythonapi.PyCapsule_GetPointer(capsule, b"dltensor")
-            if address:
-                _dlpack_deleter(ctypes.cast(address, ctypes.POINTER(_DLManagedTensor)))
-    except Exception:
-        pass
-
-
-class _DLPackPlane:
-    def __init__(
-        self,
-        *,
-        pointer: int,
-        shape: tuple[int, ...],
-        strides: tuple[int, ...],
-        bits: int,
-        device_id: int,
-        retain: Callable[[], None],
-        release: Callable[[], None],
-    ) -> None:
-        self.pointer = int(pointer)
-        self.shape = shape
-        self.strides = strides
-        self.bits = bits
-        self.device_id = device_id
-        self.retain = retain
-        self.release = release
-
-    def __dlpack_device__(self) -> tuple[int, int]:
-        return (2, self.device_id)  # kDLCUDA
-
-    def __dlpack__(self, stream=None, **_kwargs):
-        del stream
-        shape = (ctypes.c_int64 * len(self.shape))(*self.shape)
-        strides = (ctypes.c_int64 * len(self.strides))(*self.strides)
-        managed = _DLManagedTensor()
-        managed.dl_tensor.data = ctypes.c_void_p(self.pointer)
-        managed.dl_tensor.device = _DLDevice(2, self.device_id)
-        managed.dl_tensor.ndim = len(self.shape)
-        managed.dl_tensor.dtype = _DLDataType(1, self.bits, 1)  # kDLUInt
-        managed.dl_tensor.shape = ctypes.cast(shape, ctypes.POINTER(ctypes.c_int64))
-        managed.dl_tensor.strides = ctypes.cast(strides, ctypes.POINTER(ctypes.c_int64))
-        managed.dl_tensor.byte_offset = 0
-        managed.manager_ctx = None
-        managed.deleter = _dlpack_deleter
-        self.retain()
-        address = ctypes.addressof(managed)
-        with _DLPACK_LOCK:
-            _DLPACK_RECORDS[address] = (managed, shape, strides, self, self.release)
-        return ctypes.pythonapi.PyCapsule_New(address, b"dltensor", _capsule_destructor)
-
-
 class NeuralBridgeError(RuntimeError):
     """An actionable failure returned by the native Neural Rendering bridge."""
-
 
 class NeuralBridgePoisonedError(NeuralBridgeError):
     """The in-process native state cannot safely be reused before app restart."""
 
-
 def _text(value: bytes | None) -> str:
     return value.decode("utf-8", "replace") if value else ""
-
-
-def _json_line(event: str, **values: Any) -> str:
-    return json.dumps(
-        {"event": event, "monotonic_seconds": time.monotonic(), **values},
-        sort_keys=True,
-        separators=(",", ":"),
-    )
-
 
 class _CudaDriver:
     """Small CUDA Driver API wrapper; no CUDA toolkit or Python add-on needed."""
@@ -311,7 +135,7 @@ class _CudaDriver:
         except OSError as exc:
             raise NeuralBridgeError(
                 "CUDA interoperability is unavailable because nvcuda.dll could not be "
-                "loaded. Switch GPU OFF to use the bridge host-staging path."
+                "loaded. Neural Rendering requires CUDA/D3D12 interoperability."
             ) from exc
 
         self._bind("cuInit", [ctypes.c_uint])
@@ -320,28 +144,13 @@ class _CudaDriver:
             "cuDevicePrimaryCtxRetain",
             [ctypes.POINTER(ctypes.c_void_p), ctypes.c_int],
         )
-        self._bind_any(
-            "primary_ctx_release",
-            ("cuDevicePrimaryCtxRelease_v2", "cuDevicePrimaryCtxRelease"),
-            [ctypes.c_int],
-        )
+        self.primary_ctx_release = self._bind("cuDevicePrimaryCtxRelease_v2", [ctypes.c_int])
         self._bind("cuCtxSetCurrent", [ctypes.c_void_p])
         self._bind("cuCtxSynchronize", [])
-        self._bind_any(
-            "mem_alloc", ("cuMemAlloc_v2", "cuMemAlloc"),
-            [ctypes.POINTER(ctypes.c_uint64), ctypes.c_size_t],
-        )
-        self._bind_any(
-            "mem_free", ("cuMemFree_v2", "cuMemFree"), [ctypes.c_uint64]
-        )
-        self._bind_any(
-            "copy_htod", ("cuMemcpyHtoD_v2", "cuMemcpyHtoD"),
-            [ctypes.c_uint64, ctypes.c_void_p, ctypes.c_size_t],
-        )
-        self._bind_any(
-            "copy_dtoh", ("cuMemcpyDtoH_v2", "cuMemcpyDtoH"),
-            [ctypes.c_void_p, ctypes.c_uint64, ctypes.c_size_t],
-        )
+        self.mem_alloc = self._bind("cuMemAlloc_v2", [ctypes.POINTER(ctypes.c_uint64), ctypes.c_size_t])
+        self.mem_free = self._bind("cuMemFree_v2", [ctypes.c_uint64])
+        self.copy_htod = self._bind("cuMemcpyHtoD_v2", [ctypes.c_uint64, ctypes.c_void_p, ctypes.c_size_t])
+        self.copy_dtoh = self._bind("cuMemcpyDtoH_v2", [ctypes.c_void_p, ctypes.c_uint64, ctypes.c_size_t])
         self._bind(
             "cuGetErrorString",
             [ctypes.c_int, ctypes.POINTER(ctypes.c_char_p)],
@@ -367,18 +176,6 @@ class _CudaDriver:
         function.restype = ctypes.c_int
         setattr(self, name, function)
         return function
-
-    def _bind_any(
-        self, attribute: str, names: tuple[str, ...], argtypes: list[Any]
-    ) -> Any:
-        for name in names:
-            function = getattr(self.lib, name, None)
-            if function is not None:
-                function.argtypes = argtypes
-                function.restype = ctypes.c_int
-                setattr(self, attribute, function)
-                return function
-        raise NeuralBridgeError(f"The NVIDIA driver does not export {names[0]}.")
 
     def _check(self, result: int, operation: str) -> None:
         if result == 0:
@@ -446,7 +243,6 @@ class _CudaDriver:
             self.context = ctypes.c_void_p()
             self.closed = True
 
-
 @dataclass(slots=True)
 class CudaFrameBuffers:
     driver: _CudaDriver
@@ -470,6 +266,9 @@ class CudaFrameBuffers:
     def close(self) -> None:
         if self.closed:
             return
+        if BRIDGE_MANAGER._poisoned_reason:
+            self.closed = True
+            return
         try:
             self.driver.synchronize()
             self.driver.free(self.output_pointer)
@@ -480,18 +279,21 @@ class CudaFrameBuffers:
         finally:
             self.driver.deactivate()
 
+_MASK_REVISIONS = itertools.count(1)
 
 @dataclass(slots=True)
 class CudaMaskBuffer:
     driver: _CudaDriver
     pointer: int
     byte_count: int
+    revision: int
     closed: bool = False
 
     @classmethod
     def create(cls, driver: _CudaDriver, mask: np.ndarray) -> "CudaMaskBuffer":
-        if mask.dtype != np.float32 or mask.ndim != 2 or not mask.flags.c_contiguous:
-            raise NeuralBridgeError("Custom NR Mask must be contiguous float32 data.")
+        if (mask.dtype != np.float32 or mask.ndim != 3 or mask.shape[2] != 4
+                or not mask.flags.c_contiguous or not np.isfinite(mask).all()):
+            raise NeuralBridgeError("Native ControlMask must be contiguous finite float32 RGBA.")
         pointer = driver.alloc(mask.nbytes)
         try:
             driver.upload(pointer, mask)
@@ -499,10 +301,13 @@ class CudaMaskBuffer:
         except Exception:
             driver.free(pointer)
             raise
-        return cls(driver, pointer, int(mask.nbytes))
+        return cls(driver, pointer, int(mask.nbytes), next(_MASK_REVISIONS))
 
     def close(self) -> None:
         if self.closed:
+            return
+        if BRIDGE_MANAGER._poisoned_reason:
+            self.closed = True
             return
         try:
             self.driver.synchronize()
@@ -511,7 +316,6 @@ class CudaMaskBuffer:
             self.closed = True
         finally:
             self.driver.deactivate()
-
 
 class BridgeCudaSurface:
     """Bridge-owned NV12/P010 allocation with DLPack-managed plane lifetime."""
@@ -522,18 +326,24 @@ class BridgeCudaSurface:
         handle: int,
         descriptor: FrameDescriptorV1,
         ordinal: int,
+        released: threading.Event | None = None,
     ) -> None:
         self.library = library
         self.handle = int(handle)
         self.descriptor = descriptor
         self.ordinal = int(ordinal)
         self.closed = False
+        self.released = released
 
     def retain(self) -> None:
         self.library.dlss5nr_surface_retain(ctypes.c_void_p(self.handle))
 
     def release(self) -> None:
+        if BRIDGE_MANAGER._poisoned_reason:
+            return
         self.library.dlss5nr_surface_release(ctypes.c_void_p(self.handle))
+        if self.released is not None:
+            self.released.set()
 
     def close(self) -> None:
         if not self.closed:
@@ -546,7 +356,7 @@ class BridgeCudaSurface:
         desc = self.descriptor
         bits = 16 if desc.pixel_format == FORMAT_P010 else 8
         item_size = bits // 8
-        y_plane = _DLPackPlane(
+        y_plane = CudaDLPackPlane(
             pointer=int(desc.planes[0]),
             shape=(int(desc.height), int(desc.width)),
             strides=(int(desc.strides[0]) // item_size, 1),
@@ -555,7 +365,7 @@ class BridgeCudaSurface:
             retain=self.retain,
             release=self.release,
         )
-        uv_plane = _DLPackPlane(
+        uv_plane = CudaDLPackPlane(
             pointer=int(desc.planes[1]),
             shape=((int(desc.height) + 1) // 2, (int(desc.width) + 1) // 2, 2),
             strides=(int(desc.strides[1]) // item_size, 2, 1),
@@ -577,7 +387,6 @@ class BridgeCudaSurface:
         self.close()
         return frame
 
-
 @dataclass(slots=True)
 class BridgeSessionDiagnostics:
     gpu_mode: bool
@@ -585,6 +394,10 @@ class BridgeSessionDiagnostics:
     decode_backend: str = "software"
     encode_backend: str = "cpu"
     pixel_format: str = "rgba8"
+    source_format: str = "unknown"
+    working_format: str = "rgba8"
+    ngx_format: str = "rgba16f"
+    output_format: str = "unknown"
     frames: int = 0
     feature_evaluations: int = 0
     scene_resets: int = 0
@@ -597,11 +410,16 @@ class BridgeSessionDiagnostics:
     def as_dict(self) -> dict[str, Any]:
         return {
             "bridge_abi_version": BRIDGE_ABI_VERSION,
+            "bridge_frame_abi_max_version": BRIDGE_FRAME_ABI_MAX_VERSION,
             "gpu_mode": self.gpu_mode,
             "memory_path": self.memory_path,
             "decode_backend": self.decode_backend,
             "encode_backend": self.encode_backend,
             "pixel_format": self.pixel_format,
+            "source_format": self.source_format,
+            "working_format": self.working_format,
+            "ngx_format": self.ngx_format,
+            "output_format": self.output_format,
             "frames": self.frames,
             "feature_evaluations": self.feature_evaluations,
             "scene_resets": self.scene_resets,
@@ -615,7 +433,6 @@ class BridgeSessionDiagnostics:
             },
         }
 
-
 class NeuralBridgeManager:
     """One serialized bridge instance shared by every logical render session."""
 
@@ -628,8 +445,30 @@ class NeuralBridgeManager:
         self._poisoned_reason = ""
         self._timed_out_references: list[Any] = []
         self._active_sessions = 0
+        self._image_batches = 0
+        self._pending_session_release = False
         self._version = "unloaded"
         self._gpu_name = "unknown"
+        self._calls: queue.SimpleQueue = queue.SimpleQueue()
+        self._worker: threading.Thread | None = None
+        self._worker_lock = threading.Lock()
+        self._surface_ready = threading.Event()
+
+    def _run_calls(self) -> None:
+        while True:
+            request = self._calls.get()
+            function, references, completed, result, failure = request
+            try:
+                self._guard_poison()
+                result.append(function())
+            except BaseException as exc:
+                failure.append(exc)
+            finally:
+                # The caller owns the shared NGX lock. Taking it here would
+                # deadlock that caller. Retain arguments until native returns.
+                function = references = request = None
+                completed.set()
+                completed = result = failure = None
 
     @property
     def version(self) -> str:
@@ -646,10 +485,11 @@ class NeuralBridgeManager:
         return self._gpu_name
 
     def temporal_status(self) -> dict[str, Any]:
+        self._guard_poison()
         with self._lock:
             if self._library is None:
                 return {}
-            buffer = ctypes.create_string_buffer(2048)
+            buffer = ctypes.create_string_buffer(4096)
             try:
                 self._library.dlss5nr_temporal_status(buffer, len(buffer))
                 value = json.loads(_text(buffer.value) or "{}")
@@ -702,173 +542,28 @@ class NeuralBridgeManager:
             ctypes.c_int,
         ]
         library.dlss5nr_rebind.restype = ctypes.c_int
-        library.dlss5nr_process.argtypes = [
-            c_float_p,
-            c_float_p,
-            ctypes.c_int,
-            ctypes.c_int,
-            ctypes.c_int,
-            ctypes.c_float,
-            ctypes.c_float,
-            ctypes.c_float,
-            ctypes.c_float,
-            ctypes.c_int,
-            ctypes.c_int,
-            ctypes.c_int,
-            ctypes.c_char_p,
-            ctypes.c_int,
-        ]
-        library.dlss5nr_process.restype = ctypes.c_int
-        library.dlss5nr_process_cuda.argtypes = [
-            ctypes.c_uint64,
-            ctypes.c_uint64,
-            ctypes.c_int,
-            ctypes.c_int,
-            ctypes.c_uint64,
-            ctypes.c_int,
-            ctypes.c_float,
-            ctypes.c_float,
-            ctypes.c_float,
-            ctypes.c_float,
-            ctypes.c_int,
-            ctypes.c_int,
-            ctypes.c_char_p,
-            ctypes.c_int,
-        ]
-        library.dlss5nr_process_cuda.restype = ctypes.c_int
-        library.dlss5nr_process_v3.argtypes = [
-            c_float_p,
-            c_float_p,
-            ctypes.c_int,
-            ctypes.c_int,
-            ctypes.POINTER(RenderParametersV3),
-            ctypes.c_char_p,
-            ctypes.c_int,
-        ]
-        library.dlss5nr_process_v3.restype = ctypes.c_int
-        library.dlss5nr_process_cuda_v3.argtypes = [
-            ctypes.c_uint64,
-            ctypes.c_uint64,
-            ctypes.c_int,
-            ctypes.c_int,
-            ctypes.c_uint64,
-            ctypes.POINTER(RenderParametersV3),
-            ctypes.c_char_p,
-            ctypes.c_int,
-        ]
-        library.dlss5nr_process_cuda_v3.restype = ctypes.c_int
-        library.dlss5nr_process_v4.argtypes = [
-            c_float_p,
-            c_float_p,
-            ctypes.c_int,
-            ctypes.c_int,
-            ctypes.POINTER(RenderParametersV4),
-            ctypes.c_char_p,
-            ctypes.c_int,
-        ]
-        library.dlss5nr_process_v4.restype = ctypes.c_int
-        library.dlss5nr_process_cuda_v4.argtypes = [
-            ctypes.c_uint64,
-            ctypes.c_uint64,
-            ctypes.c_int,
-            ctypes.c_int,
-            ctypes.c_uint64,
-            ctypes.POINTER(RenderParametersV4),
-            ctypes.c_char_p,
-            ctypes.c_int,
-        ]
-        library.dlss5nr_process_cuda_v4.restype = ctypes.c_int
-        library.dlss5nr_process_v5.argtypes = [
-            c_float_p,
-            c_float_p,
-            ctypes.c_int,
-            ctypes.c_int,
-            ctypes.POINTER(RenderParametersV5),
-            ctypes.c_char_p,
-            ctypes.c_int,
-        ]
-        library.dlss5nr_process_v5.restype = ctypes.c_int
-        library.dlss5nr_process_v6.argtypes = [
-            c_float_p,
-            c_float_p,
-            ctypes.c_int,
-            ctypes.c_int,
-            ctypes.POINTER(RenderParametersV6),
-            ctypes.c_char_p,
-            ctypes.c_int,
-        ]
-        library.dlss5nr_process_v6.restype = ctypes.c_int
-        library.dlss5nr_process_cuda_v5.argtypes = [
-            ctypes.c_uint64,
-            ctypes.c_uint64,
-            ctypes.c_int,
-            ctypes.c_int,
-            ctypes.c_uint64,
-            ctypes.POINTER(RenderParametersV5),
-            ctypes.c_char_p,
-            ctypes.c_int,
-        ]
-        library.dlss5nr_process_cuda_v5.restype = ctypes.c_int
-        library.dlss5nr_process_cuda_v6.argtypes = [
-            ctypes.c_uint64,
-            ctypes.c_uint64,
-            ctypes.c_int,
-            ctypes.c_int,
-            ctypes.c_uint64,
-            ctypes.POINTER(RenderParametersV6),
-            ctypes.c_char_p,
-            ctypes.c_int,
-        ]
-        library.dlss5nr_process_cuda_v6.restype = ctypes.c_int
+        library.dlss5nr_process_v11.argtypes = [
+            c_float_p, c_float_p, ctypes.c_int, ctypes.c_int,
+            ctypes.POINTER(RenderParametersV11), ctypes.c_char_p, ctypes.c_int]
+        library.dlss5nr_process_v11.restype = ctypes.c_int
+        library.dlss5nr_process_cuda_v11.argtypes = [
+            ctypes.c_uint64, ctypes.c_uint64, ctypes.c_int, ctypes.c_int, ctypes.c_uint64,
+            ctypes.POINTER(RenderParametersV11), ctypes.c_char_p, ctypes.c_int]
+        library.dlss5nr_process_cuda_v11.restype = ctypes.c_int
         library.dlss5nr_cuda_supported.argtypes = []
         library.dlss5nr_cuda_supported.restype = ctypes.c_int
         library.dlss5nr_cuda_status.argtypes = [ctypes.c_char_p, ctypes.c_int]
         library.dlss5nr_cuda_status.restype = ctypes.c_int
-        library.dlss5nr_process_frame_v1.argtypes = [
-            ctypes.POINTER(FrameDescriptorV1),
-            ctypes.POINTER(FrameDescriptorV1),
-            ctypes.POINTER(RenderParametersV1),
-            ctypes.POINTER(FrameResultV1),
-            ctypes.c_char_p,
-            ctypes.c_int,
-        ]
-        library.dlss5nr_process_frame_v1.restype = ctypes.c_int
-        library.dlss5nr_process_frame_v3.argtypes = [
-            ctypes.POINTER(FrameDescriptorV1),
-            ctypes.POINTER(FrameDescriptorV1),
-            ctypes.POINTER(RenderParametersV3),
-            ctypes.POINTER(FrameResultV1),
-            ctypes.c_char_p,
-            ctypes.c_int,
-        ]
-        library.dlss5nr_process_frame_v3.restype = ctypes.c_int
-        library.dlss5nr_process_frame_v4.argtypes = [
-            ctypes.POINTER(FrameDescriptorV1),
-            ctypes.POINTER(FrameDescriptorV1),
-            ctypes.POINTER(RenderParametersV4),
-            ctypes.POINTER(FrameResultV1),
-            ctypes.c_char_p,
-            ctypes.c_int,
-        ]
-        library.dlss5nr_process_frame_v4.restype = ctypes.c_int
-        library.dlss5nr_process_frame_v5.argtypes = [
-            ctypes.POINTER(FrameDescriptorV1),
-            ctypes.POINTER(FrameDescriptorV1),
-            ctypes.POINTER(RenderParametersV5),
-            ctypes.POINTER(FrameResultV1),
-            ctypes.c_char_p,
-            ctypes.c_int,
-        ]
-        library.dlss5nr_process_frame_v5.restype = ctypes.c_int
-        library.dlss5nr_process_frame_v6.argtypes = [
-            ctypes.POINTER(FrameDescriptorV1),
-            ctypes.POINTER(FrameDescriptorV1),
-            ctypes.POINTER(RenderParametersV6),
-            ctypes.POINTER(FrameResultV1),
-            ctypes.c_char_p,
-            ctypes.c_int,
-        ]
-        library.dlss5nr_process_frame_v6.restype = ctypes.c_int
+        library.dlss5nr_process_frame_v11.argtypes = [
+            ctypes.POINTER(FrameDescriptorV1), ctypes.POINTER(FrameDescriptorV1),
+            ctypes.POINTER(RenderParametersV11), ctypes.POINTER(FrameResultV1), ctypes.c_char_p, ctypes.c_int]
+        library.dlss5nr_process_frame_v11.restype = ctypes.c_int
+        library.dlss5nr_process_cache_v11.argtypes = [
+            *library.dlss5nr_process_frame_v11.argtypes[:4],
+            ctypes.POINTER(ctypes.c_uint64), ctypes.c_char_p, ctypes.c_int]
+        library.dlss5nr_process_cache_v11.restype = ctypes.c_int
+        library.dlss5nr_finish_cache_v11.argtypes = [ctypes.c_uint64]
+        library.dlss5nr_finish_cache_v11.restype = ctypes.c_int
         library.dlss5nr_temporal_status.argtypes = [ctypes.c_char_p, ctypes.c_int]
         library.dlss5nr_temporal_status.restype = ctypes.c_int
         library.dlss5nr_scene_score_v1.argtypes = [
@@ -897,10 +592,8 @@ class NeuralBridgeManager:
         library.dlss5nr_surface_retain.restype = None
         library.dlss5nr_surface_release.argtypes = [ctypes.c_void_p]
         library.dlss5nr_surface_release.restype = None
-        release = getattr(library, "dlss5nr_release_session", None)
-        if release is not None:
-            release.argtypes = []
-            release.restype = ctypes.c_int
+        library.dlss5nr_release_session.argtypes = []
+        library.dlss5nr_release_session.restype = ctypes.c_int
         self._library = library
         self._version = version
 
@@ -911,30 +604,32 @@ class NeuralBridgeManager:
                 f"{self._poisoned_reason}. Restart the application before rendering again."
             )
 
+    def _check_native_failure(self, detail: str) -> None:
+        if _bridge_failure_requires_restart(detail):
+            self._poisoned_reason = detail
+            self._guard_poison()
+
     def _call_with_watchdog(
         self, label: str, function: Callable[[], Any], references: tuple[Any, ...] = (),
         *, timeout_seconds: float = BRIDGE_WATCHDOG_SECONDS,
     ) -> Any:
+        self._guard_poison()
         completed = threading.Event()
         result: list[Any] = []
         failure: list[BaseException] = []
 
-        def invoke() -> None:
-            try:
-                result.append(function())
-            except BaseException as exc:
-                failure.append(exc)
-            finally:
-                completed.set()
-
-        thread = threading.Thread(
-            target=invoke, name=f"dlssnr-{label}", daemon=True
-        )
-        thread.start()
+        with self._worker_lock:
+            if self._worker is None:
+                self._worker = threading.Thread(target=self._run_calls, name="dlssnr-native", daemon=True)
+                self._worker.start()
+        self._calls.put((function, references, completed, result, failure))
         if not completed.wait(timeout_seconds):
             self._poisoned_reason = f"{label} exceeded {timeout_seconds:g} seconds"
             # Native code may still be touching these buffers. Keep them alive
             # until process exit instead of risking use-after-free.
+            # The running request owns its arguments even after this caller
+            # leaves. Pending GPU allocations remain protected by the poison
+            # guards until application restart.
             self._timed_out_references.extend(references)
             raise NeuralBridgePoisonedError(
                 f"Neural Rendering timed out during {label}; native state may be "
@@ -948,24 +643,11 @@ class NeuralBridgeManager:
             ) from failure[0]
         return result[0]
 
-    def initialize(self, gpu: dict[str, Any], *, require_cuda: bool) -> dict[str, Any]:
+    def initialize(self, gpu: dict[str, Any]) -> dict[str, Any]:
+        self._guard_poison()
+        ordinal = int(gpu.get("cuda_ordinal", gpu.get("index", 0)))
         with self._lock:
             self._guard_poison()
-            ordinal = int(gpu.get("cuda_ordinal", gpu.get("index", 0)))
-            if self._initialized_ordinal is None:
-                # The NVIDIA D3D12 NGX core keeps the first feature search path
-                # for the lifetime of the process. If Neural Rendering starts
-                # first, a later DLSSG initialization succeeds superficially
-                # but reports Frame Generation as unavailable. Prime DLSSG on
-                # the same adapter before Feature 18; failure remains isolated
-                # so systems without the optional DLSSG runtime can still use
-                # Neural Rendering.
-                try:
-                    from ..frame_interpolation.native import initialize_bridge
-
-                    initialize_bridge(ordinal)
-                except Exception:
-                    pass
             self._load()
             if self._initialized_ordinal is None:
                 assert self._library is not None
@@ -987,8 +669,8 @@ class NeuralBridgeManager:
                     raise NeuralBridgeError(
                         "The Neural Rendering adapter cannot change while a render is active."
                     )
-                with _DLPACK_LOCK:
-                    outstanding_surfaces = len(_DLPACK_RECORDS)
+                with DLPACK_LOCK:
+                    outstanding_surfaces = len(LIVE_DLPACK_RECORDS)
                 if outstanding_surfaces:
                     raise NeuralBridgeError(
                         "The Neural Rendering adapter cannot change while encoded CUDA "
@@ -1024,13 +706,12 @@ class NeuralBridgeManager:
                 self._library.dlss5nr_cuda_status(cuda_status, len(cuda_status))
             )
             cuda_detail = _text(cuda_status.value) or "unavailable"
-            if require_cuda and not cuda_ready:
+            if not cuda_ready:
                 raise NeuralBridgeError(
                     f"CUDA/D3D12 interoperability is unavailable ({cuda_detail}). "
-                    "Switch GPU OFF to use host staging; Neural Rendering still requires "
-                    "an RTX GPU."
+                    "Neural Rendering requires a supported RTX GPU and driver."
                 )
-            if require_cuda and self._cuda_driver is None:
+            if self._cuda_driver is None:
                 try:
                     self._cuda_driver = _CudaDriver(ordinal)
                     # Do not leave the primary context current on the UI/decoder
@@ -1038,12 +719,12 @@ class NeuralBridgeManager:
                     self._cuda_driver.deactivate()
                 except Exception as exc:
                     raise NeuralBridgeError(
-                        f"CUDA/D3D12 interoperability setup failed: {exc} Switch GPU OFF "
-                        "to use host staging."
+                        f"CUDA/D3D12 interoperability setup failed: {exc}"
                     ) from exc
             return {
                 "bridge_version": self._version,
                 "bridge_abi_version": BRIDGE_ABI_VERSION,
+                "bridge_frame_abi_max_version": BRIDGE_FRAME_ABI_MAX_VERSION,
                 "gpu_name": self._gpu_name,
                 "adapter_luid": _text(self._library.dlss5nr_adapter_luid()) or "unknown",
                 "cuda_ordinal": ordinal,
@@ -1056,27 +737,50 @@ class NeuralBridgeManager:
             self._guard_poison()
             self._active_sessions += 1
 
-    def close_session(self) -> None:
+    @contextlib.contextmanager
+    def image_batch(self):
+        """Keep the current feature/resources between images in one queue run.
+
+        Native EnsureFeature still rebuilds for a new size/style; every image
+        evaluates with reset=True. Only feature-owned resources are retained,
+        and the outermost batch releases them on success, cancellation or error.
+        Logical sessions continue to free their own CUDA buffers/diagnostics.
+        """
+        with self._lock:
+            self._guard_poison()
+            self._image_batches += 1
+        try:
+            yield
+        finally:
+            with self._lock:
+                self._image_batches -= 1
+                self._release_idle_session()
+
+    def close_session(self, *, discard: bool = False) -> None:
         with self._lock:
             if self._active_sessions:
                 self._active_sessions -= 1
-            # Release feature-owned surfaces at the idle boundary, but never
-            # invoke NGX core shutdown or unload the driver/runtime modules.
-            if self._active_sessions == 0 and self._library is not None:
-                release = getattr(self._library, "dlss5nr_release_session", None)
-                if release is not None and not self._poisoned_reason:
-                    try:
-                        self._call_with_watchdog("session release", release)
-                    except NeuralBridgePoisonedError:
-                        raise
+            self._pending_session_release = True
+            self._release_idle_session(discard=discard)
+
+    def _release_idle_session(self, *, discard: bool = False) -> None:
+        # Call under the shared NGX lock. Failed sessions must discard feature
+        # state immediately so an ordinary recoverable error cannot be reused.
+        if (self._active_sessions or not self._pending_session_release
+                or (self._image_batches and not discard)
+                or self._library is None or self._poisoned_reason):
+            return
+        if not self._call_with_watchdog("session release", self._library.dlss5nr_release_session):
+            self._poisoned_reason = "GPU completion was not confirmed during session release"
+            self._guard_poison()
+        self._pending_session_release = False
 
     def create_cuda_buffers(self, width: int, height: int) -> CudaFrameBuffers:
         with self._lock:
             self._guard_poison()
             if self._cuda_driver is None:
                 raise NeuralBridgeError(
-                    "CUDA/D3D12 interoperability is not initialized. Switch GPU OFF to "
-                    "use host staging."
+                    "CUDA/D3D12 interoperability is not initialized."
                 )
             try:
                 return CudaFrameBuffers.create(self._cuda_driver, width, height)
@@ -1094,31 +798,38 @@ class NeuralBridgeManager:
                 self._cuda_driver.deactivate()
 
     def create_video_surface(
-        self, width: int, height: int, pixel_format: int
+        self, width: int, height: int, pixel_format: int, *, timeout_seconds: float = BRIDGE_WATCHDOG_SECONDS
     ) -> BridgeCudaSurface:
-        """Allocate one bridge-owned CUDA NV12/P010 output surface."""
+        """Acquire a pooled CUDA surface without replacing a retained frame."""
         with self._lock:
             self._guard_poison()
             if self._library is None or self._cuda_driver is None:
                 raise NeuralBridgeError(
-                    "CUDA/D3D12 interoperability is not initialized. Switch GPU OFF to "
-                    "use host staging."
+                    "CUDA/D3D12 interoperability is not initialized."
                 )
             if pixel_format not in (FORMAT_NV12, FORMAT_P010):
                 raise NeuralBridgeError("CUDA video output must be NV12 or P010.")
             error = ctypes.create_string_buffer(4096)
-            handle = self._call_with_watchdog(
-                "CUDA output allocation",
-                lambda: self._library.dlss5nr_surface_create(
-                    int(width), int(height), int(pixel_format), error, len(error)
-                ),
-                (error,),
-            )
+            deadline = time.monotonic() + timeout_seconds
+            while True:
+                self._surface_ready.clear()
+                handle = self._call_with_watchdog(
+                    "CUDA output allocation",
+                    lambda: self._library.dlss5nr_surface_create(
+                        int(width), int(height), int(pixel_format), error, len(error)
+                    ), (error,),
+                )
+                if handle or "pool is exhausted" not in _text(error.value):
+                    break
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise NeuralBridgeError("Neural Rendering CUDA output pool remained exhausted.")
+                self._surface_ready.wait(min(.01, remaining))
             if not handle:
                 detail = _text(error.value) or "unknown CUDA output allocation failure"
+                self._check_native_failure(detail)
                 raise NeuralBridgeError(
-                    f"CUDA/D3D12 output allocation failed: {detail}. Switch GPU OFF to "
-                    "use host staging."
+                    f"CUDA/D3D12 output allocation failed: {detail}."
                 )
             descriptor = FrameDescriptorV1.empty()
             if not self._library.dlss5nr_surface_frame_desc(
@@ -1127,7 +838,7 @@ class NeuralBridgeManager:
                 self._library.dlss5nr_surface_release(ctypes.c_void_p(handle))
                 raise NeuralBridgeError("The bridge returned an invalid CUDA output surface.")
             return BridgeCudaSurface(
-                self._library, handle, descriptor, self._cuda_driver.ordinal
+                self._library, handle, descriptor, self._cuda_driver.ordinal, self._surface_ready
             )
 
     @staticmethod
@@ -1135,10 +846,12 @@ class NeuralBridgeManager:
         settings: dict[str, int | float | bool], reset: bool,
         mask: np.ndarray | None = None,
         cuda_mask: CudaMaskBuffer | None = None,
-    ) -> RenderParametersV6:
-        value = RenderParametersV6()
-        value.struct_size = ctypes.sizeof(RenderParametersV6)
+    ) -> RenderParametersV11:
+        value = RenderParametersV11()
+        value.struct_size = ctypes.sizeof(RenderParametersV11)
         value.abi_version = BRIDGE_ABI_VERSION
+        value.motion_mode = int(settings.get("motion_mode", 1))
+        value.optical_flow_quality = int(settings.get("optical_flow_quality", 0))
         value.style = int(settings["style"])
         value.intensity = float(settings["intensity"])
         value.tone = float(settings["local_tone"])
@@ -1146,13 +859,12 @@ class NeuralBridgeManager:
         value.skin = float(settings["skin_structure"])
         value.automask = int(bool(settings["auto_mask"]))
         value.reset = int(bool(reset))
-        value.color_strength = float(settings["color_strength"])
-        value.tone_preservation = float(settings["tone_preservation"])
-        value.face_skin_protection = float(settings["face_skin_protection"])
-        value.grain_preservation = float(settings["grain_preservation"])
         value.nr_passes = int(settings.get("nr_passes", 1))
-        value.shimmer_suppression = float(settings.get("shimmer_suppression", 0.0))
-        value.prefer_nvof = int(bool(settings.get("prefer_nvof", False)))
+        value.native_intensity = float(settings.get("native_intensity", min(1.0, value.intensity)))
+        if mask is not None and (mask.dtype != np.float32 or mask.ndim != 3 or
+                mask.shape[2] != 4 or not mask.flags.c_contiguous or not np.isfinite(mask).all()):
+            raise NeuralBridgeError("Native ControlMask must be contiguous finite float32 RGBA.")
+        value.mask_revision = cuda_mask.revision if cuda_mask is not None else next(_MASK_REVISIONS)
         value.mask_memory_type = MEMORY_NONE
         if cuda_mask is not None:
             value.mask_memory_type = MEMORY_CUDA
@@ -1183,6 +895,7 @@ class NeuralBridgeManager:
         color_matrix: int = 1,
         color_range: int = 0,
         rotation: int = 0,
+        chroma_location: int = 1,
     ) -> tuple[Any, dict[str, Any], float]:
         """Evaluate a PyAV CUDA frame and return a CUDA AVFrame for NVENC.
 
@@ -1194,8 +907,7 @@ class NeuralBridgeManager:
             self._guard_poison()
             if self._library is None or self._cuda_driver is None:
                 raise NeuralBridgeError(
-                    "CUDA/D3D12 interoperability is not initialized. Switch GPU OFF to "
-                    "use host staging."
+                    "CUDA/D3D12 interoperability is not initialized."
                 )
             format_name = str(getattr(getattr(frame, "format", None), "name", ""))
             if format_name != "cuda":
@@ -1229,6 +941,7 @@ class NeuralBridgeManager:
             source.color_matrix = int(color_matrix)
             source.color_range = int(color_range)
             source.rotation = int(rotation) % 360
+            source.reserved = int(chroma_location)
             source.timestamp = int(timestamp)
 
             surface = self.create_video_surface(
@@ -1245,7 +958,7 @@ class NeuralBridgeManager:
             try:
                 ok = self._call_with_watchdog(
                     "feature-18 CUDA video evaluation",
-                    lambda: self._library.dlss5nr_process_frame_v6(
+                    lambda: self._library.dlss5nr_process_frame_v11(
                         ctypes.byref(source),
                         ctypes.byref(destination),
                         ctypes.byref(params),
@@ -1265,8 +978,7 @@ class NeuralBridgeManager:
                             f"{detail}. Restart the application before rendering again."
                         )
                     raise NeuralBridgeError(
-                        f"CUDA/D3D12 Neural Rendering failed: {detail}. Switch GPU OFF to "
-                        "use host staging."
+                        f"CUDA/D3D12 Neural Rendering failed: {detail}."
                     )
                 # AVFrame.from_dlpack establishes its own primary-context
                 # references; do not leak the bridge's current context into
@@ -1352,9 +1064,9 @@ class NeuralBridgeManager:
             self._cuda_driver.deactivate()
             if not ok:
                 detail = _text(error.value) or "unknown CUDA scene-scoring failure"
+                self._check_native_failure(detail)
                 raise NeuralBridgeError(
-                    f"CUDA reduced-luma scene scoring failed: {detail}. Switch GPU OFF "
-                    "to use host staging."
+                    f"CUDA reduced-luma scene scoring failed: {detail}."
                 )
             return float(score.value), bool(reset.value)
 
@@ -1379,16 +1091,17 @@ class NeuralBridgeManager:
             if self._library is None or self._cuda_driver is None:
                 raise NeuralBridgeError("Host-to-CUDA video processing requires GPU mode.")
             if (
-                rgba.dtype != np.uint8
+                rgba.dtype not in (np.uint8, np.uint16)
                 or rgba.ndim != 3
                 or rgba.shape[2] != 4
                 or not rgba.flags.c_contiguous
             ):
-                raise NeuralBridgeError("Host video input must be contiguous RGBA8.")
+                raise NeuralBridgeError("Host video input must be contiguous RGBA8 or RGBA16LE.")
+            high_depth = rgba.dtype == np.uint16
             height, width = rgba.shape[:2]
             source = FrameDescriptorV1.empty()
             source.memory_type = MEMORY_HOST
-            source.pixel_format = FORMAT_RGBA8
+            source.pixel_format = FORMAT_RGBA16LE if high_depth else FORMAT_RGBA8
             source.width = int(width)
             source.height = int(height)
             source.planes[0] = int(rgba.ctypes.data)
@@ -1398,7 +1111,7 @@ class NeuralBridgeManager:
             source.timestamp = int(timestamp)
 
             surface = self.create_video_surface(width, height, output_format)
-            destination = surface.descriptor
+            destination = FrameDescriptorV1.from_buffer_copy(surface.descriptor)
             destination.color_matrix = int(color_matrix)
             destination.color_range = int(color_range)
             destination.timestamp = int(timestamp)
@@ -1409,7 +1122,7 @@ class NeuralBridgeManager:
             try:
                 ok = self._call_with_watchdog(
                     "feature-18 host-to-CUDA video evaluation",
-                    lambda: self._library.dlss5nr_process_frame_v6(
+                    lambda: self._library.dlss5nr_process_frame_v11(
                         ctypes.byref(source), ctypes.byref(destination),
                         ctypes.byref(params), ctypes.byref(result), error, len(error),
                     ),
@@ -1420,9 +1133,9 @@ class NeuralBridgeManager:
                 self._cuda_driver.deactivate()
                 if not ok:
                     detail = _text(error.value) or "unknown host-to-CUDA frame failure"
+                    self._check_native_failure(detail)
                     raise NeuralBridgeError(
-                        f"CUDA/D3D12 Neural Rendering failed: {detail}. Switch GPU OFF "
-                        "to use host staging."
+                        f"CUDA/D3D12 Neural Rendering failed: {detail}."
                     )
                 output = surface.to_av_frame()
             except BaseException:
@@ -1444,12 +1157,12 @@ class NeuralBridgeManager:
                 "upload_bytes": int(result.upload_bytes),
                 "download_bytes": int(result.download_bytes),
                 "timestamp": int(result.timestamp),
-                "input_format": "rgba8",
+                "input_format": "rgba16le" if high_depth else "rgba8",
                 "output_format": "p010le" if output_format == FORMAT_P010 else "nv12",
             }
             return output, details, elapsed
 
-    def process_cuda_to_host_video_frame(
+    def process_video_to_host_frame(
         self,
         frame: Any,
         destination: np.ndarray,
@@ -1462,10 +1175,13 @@ class NeuralBridgeManager:
         color_matrix: int = 1,
         color_range: int = 0,
         rotation: int = 0,
+        chroma_location: int = 1,
+        async_transfer: bool = False,
     ) -> tuple[dict[str, Any], float]:
-        """Evaluate an NVDEC CUDA frame and download only the final RGBA result."""
+        """Evaluate CUDA NV12/P010 or host RGBA and return packed RGBA."""
         with self._lock:
             self._guard_poison()
+            host_input = isinstance(frame, np.ndarray)
             format_name = str(getattr(getattr(frame, "format", None), "name", ""))
             sw_format = str(getattr(getattr(frame, "sw_format", None), "name", ""))
             source_format = {
@@ -1473,34 +1189,47 @@ class NeuralBridgeManager:
                 "p010": FORMAT_P010,
                 "p010le": FORMAT_P010,
             }.get(sw_format)
-            if format_name != "cuda" or source_format is None or len(frame.planes) < 2:
+            if host_input:
+                if (frame.dtype not in (np.uint8, np.uint16) or frame.ndim != 3
+                        or frame.shape[2] != 4 or not frame.flags.c_contiguous):
+                    raise NeuralBridgeError("Software video input must be contiguous RGBA8 or RGBA16LE.")
+                source_format = FORMAT_RGBA16LE if frame.dtype == np.uint16 else FORMAT_RGBA8
+                sw_format = "rgba16le" if frame.dtype == np.uint16 else "rgba8"
+            elif format_name != "cuda" or source_format is None or len(frame.planes) < 2:
                 raise NeuralBridgeError(
                     f"CUDA-to-host processing supports NV12/P010, received "
                     f"{format_name or 'unknown'}/{sw_format or 'unknown'}."
                 )
             if (
-                destination.dtype != np.uint8
+                destination.dtype not in (np.uint8, np.uint16)
                 or destination.ndim != 3
                 or destination.shape[2] != 4
                 or not destination.flags.c_contiguous
             ):
-                raise NeuralBridgeError("CUDA-to-host output must be contiguous RGBA8.")
+                raise NeuralBridgeError("CUDA-to-host output must be contiguous RGBA8 or RGBA16LE.")
+            output_16bit = destination.dtype == np.uint16
+            high_depth = async_transfer or output_16bit or (host_input and frame.dtype == np.uint16)
             source = FrameDescriptorV1.empty()
-            source.memory_type = MEMORY_CUDA
+            source.memory_type = MEMORY_HOST if host_input else MEMORY_CUDA
             source.pixel_format = source_format
-            source.width = int(frame.width)
-            source.height = int(frame.height)
-            source.planes[0] = int(frame.planes[0].buffer_ptr)
-            source.planes[1] = int(frame.planes[1].buffer_ptr)
-            source.strides[0] = int(frame.planes[0].line_size)
-            source.strides[1] = int(frame.planes[1].line_size)
+            if host_input:
+                source.width, source.height = int(frame.shape[1]), int(frame.shape[0])
+                source.planes[0] = int(frame.ctypes.data)
+                source.strides[0] = int(frame.strides[0])
+            else:
+                source.width, source.height = int(frame.width), int(frame.height)
+                source.planes[0] = int(frame.planes[0].buffer_ptr)
+                source.planes[1] = int(frame.planes[1].buffer_ptr)
+                source.strides[0] = int(frame.planes[0].line_size)
+                source.strides[1] = int(frame.planes[1].line_size)
             source.color_matrix = int(color_matrix)
             source.color_range = int(color_range)
             source.rotation = int(rotation) % 360
+            source.reserved = int(chroma_location)
             source.timestamp = int(timestamp)
             output = FrameDescriptorV1.empty()
             output.memory_type = MEMORY_HOST
-            output.pixel_format = FORMAT_RGBA8
+            output.pixel_format = FORMAT_RGBA16LE if output_16bit else FORMAT_RGBA8
             output.width = int(destination.shape[1])
             output.height = int(destination.shape[0])
             output.planes[0] = int(destination.ctypes.data)
@@ -1511,13 +1240,19 @@ class NeuralBridgeManager:
             params = self._render_parameters(settings, reset, mask, cuda_mask)
             result = FrameResultV1.empty()
             error = ctypes.create_string_buffer(4096)
+            token = ctypes.c_uint64()
             started = time.perf_counter()
-            ok = self._call_with_watchdog(
-                "feature-18 CUDA-to-host video evaluation",
-                lambda: self._library.dlss5nr_process_frame_v6(
+            def evaluate():
+                if async_transfer:
+                    return self._library.dlss5nr_process_cache_v11(
+                        ctypes.byref(source), ctypes.byref(output), ctypes.byref(params),
+                        ctypes.byref(result), ctypes.byref(token), error, len(error))
+                return self._library.dlss5nr_process_frame_v11(
                     ctypes.byref(source), ctypes.byref(output), ctypes.byref(params),
-                    ctypes.byref(result), error, len(error),
-                ),
+                    ctypes.byref(result), error, len(error))
+            ok = self._call_with_watchdog(
+                "feature-18 video-to-host evaluation",
+                evaluate,
                 (frame, destination, source, output, params, result, error),
                 timeout_seconds=min(180.0, BRIDGE_WATCHDOG_SECONDS * params.nr_passes),
             )
@@ -1525,9 +1260,9 @@ class NeuralBridgeManager:
             self._cuda_driver.deactivate()
             if not ok:
                 detail = _text(error.value) or "unknown CUDA-to-host frame failure"
+                self._check_native_failure(detail)
                 raise NeuralBridgeError(
-                    f"CUDA/D3D12 Neural Rendering failed: {detail}. Switch GPU OFF to "
-                    "use host staging."
+                    f"CUDA/D3D12 Neural Rendering failed: {detail}."
                 )
             return {
                 "ngx_create_result": f"0x{int(result.ngx_create_result) & 0xFFFFFFFF:08X}",
@@ -1539,47 +1274,18 @@ class NeuralBridgeManager:
                 "download_bytes": int(result.download_bytes),
                 "timestamp": int(result.timestamp),
                 "input_format": sw_format,
-                "output_format": "rgba8",
+                "output_format": "rgba16le" if output_16bit else "rgba8",
+                "cache_token": int(token.value),
             }, elapsed
 
-    def process_host(
-        self,
-        source: np.ndarray,
-        destination: np.ndarray,
-        settings: dict[str, int | float | bool],
-        reset: bool,
-        mask: np.ndarray | None = None,
-    ) -> float:
-        with self._lock:
-            self._guard_poison()
-            assert self._library is not None
-            error = ctypes.create_string_buffer(4096)
-            started = time.perf_counter()
-            params = self._render_parameters(settings, reset, mask, None)
-            ok = self._call_with_watchdog(
-                "feature-18 host evaluation",
-                lambda: self._library.dlss5nr_process_v6(
-                    source.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
-                    destination.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
-                    source.shape[1],
-                    source.shape[0],
-                    ctypes.byref(params),
-                    error,
-                    len(error),
-                ),
-                (source, destination, mask, params, error),
-                timeout_seconds=min(180.0, BRIDGE_WATCHDOG_SECONDS * params.nr_passes),
-            )
-            elapsed = time.perf_counter() - started
-            if not ok:
-                detail = _text(error.value) or "unknown feature-18 failure"
-                if _bridge_failure_requires_restart(detail):
-                    self._poisoned_reason = detail
-                    raise NeuralBridgePoisonedError(
-                        f"{detail}. Restart the application before rendering again."
-                    )
-                raise NeuralBridgeError(f"Feature-18 evaluation failed: {detail}")
-            return elapsed
+    def finish_cache_transfer(self, token: int) -> None:
+        # Independent transfer stream; do not take the model/watchdog lock.
+        # The stage owns the mapping and joins its bounded copy queue first.
+        if not self._library.dlss5nr_finish_cache_v11(int(token)):
+            raise NeuralBridgeError("The asynchronous cache transfer failed.")
+
+    # Preserve the existing CUDA boundary for preview and external callers.
+    process_cuda_to_host_video_frame = process_video_to_host_frame
 
     def process_cuda(
         self,
@@ -1602,7 +1308,7 @@ class NeuralBridgeManager:
             params = self._render_parameters(settings, reset, mask, cuda_mask)
             ok = self._call_with_watchdog(
                 "feature-18 CUDA evaluation",
-                lambda: self._library.dlss5nr_process_cuda_v6(
+                lambda: self._library.dlss5nr_process_cuda_v11(
                     buffers.input_pointer,
                     buffers.output_pointer,
                     source.shape[1],
@@ -1624,14 +1330,12 @@ class NeuralBridgeManager:
                         f"{detail}. Restart the application before rendering again."
                     )
                 raise NeuralBridgeError(
-                    f"CUDA/D3D12 Neural Rendering failed: {detail}. Switch GPU OFF to "
-                    "use host staging."
+                    f"CUDA/D3D12 Neural Rendering failed: {detail}."
                 )
             download_started = time.perf_counter()
             buffers.driver.synchronize()
             buffers.driver.download(destination, buffers.output_pointer)
             download_seconds = time.perf_counter() - download_started
             return upload_seconds, evaluate_seconds, download_seconds
-
 
 BRIDGE_MANAGER = NeuralBridgeManager()

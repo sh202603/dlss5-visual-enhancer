@@ -1,22 +1,32 @@
 from __future__ import annotations
 
 import configparser
+import json
 import math
 import os
 import threading
 from dataclasses import replace
 from pathlib import Path
 
-from ..core.ffmpeg import HDR_ALLOWED_CODECS
+from ..core.ffmpeg import HDR_ALLOWED_CODECS, container_for_codec, containers_for_codec
+from ..core.ffmpeg.vulkan import valid_selection
+from ..core.ffmpeg.grain import GRAIN_RANGES
 from ..core.paths import CONFIG_PATH
+from ..portable import decode_app_path, encode_app_path
 from ..core.naming import RENAME_MODES, validate_rename
-from ..core.runtime import NR_STYLES, resolve_upscaling_mode
+from ..core.runtime import NR_STYLES, OPTICAL_FLOW_QUALITIES, resolve_upscaling_mode
+from ..core.dlss_modes import DLSS_METHODS, DLSS_MODES, DLSS_PRESETS
 from ..frame_interpolation.models import ENGINE_CHOICES, FPS_CHOICES, PREVIEW_LENGTH_CHOICES
 from .migration import _migrate_codec
 from .models import (
     CODEC_CHOICES, CONFIG_SECTION, CONTAINER_CHOICES, DEFAULT_SETTINGS, IMAGE_FORMAT_CHOICES,
-    PREVIEW_ENCODING_CHOICES, QUALITY_CHOICES, UPSCALE_MODE_CHOICES,
+    IMAGE_16BIT_FORMATS, IMAGE_BIT_DEPTH_CHOICES,
+    QUALITY_CHOICES, UPSCALE_MODE_CHOICES,
     UPSCALE_PREVIEW_LENGTH_CHOICES, UISettings, _validate,
+    IMAGE_STAGE_ORDER, VIDEO_STAGE_ORDER, IMAGE_SCALING_FILTERS, VIDEO_SCALING_FILTERS,
+    LEGACY_IMAGE_STAGE_ORDER, LEGACY_VIDEO_STAGE_ORDER, COLORING_MODES, SHARPENING_METHODS,
+    COLOR_MATCH_SOURCES, LUT_ADJUSTMENT_RANGES, LUT_RESOLUTIONS, migrate_stage_layout,
+    CACHE_MODES, CACHE_SIZE_CHOICES_GB,
 )
 from ..upscale.video.models import SETTING_FIELDS, options_from_settings
 from ..upscale.image.models import SETTING_FIELDS as IMAGE_UPSCALE_FIELDS, options_from_settings as image_upscale_options
@@ -39,6 +49,8 @@ def load_settings(path: str | os.PathLike[str]) -> UISettings:
             migrated = _migrate_codec(value)
             if migrated in choices:
                 return migrated
+        if key in {"nr_style", "live_nr_style"}:
+            value = {"Default": "Style 0", "Natural": "Style 1", "Cinematic": "Style 2"}.get(value, value)
         return value if value in choices else default
 
     def codec_choice(key: str, default: str) -> str:
@@ -68,6 +80,16 @@ def load_settings(path: str | os.PathLike[str]) -> UISettings:
     def integer(key: str, minimum: int, maximum: int, default: int) -> int:
         value = number(key, minimum, maximum, default)
         return int(value) if float(value).is_integer() else default
+
+    def lut_resolution() -> int:
+        value = integer("lut_resolution", min(LUT_RESOLUTIONS), max(LUT_RESOLUTIONS),
+                        DEFAULT_SETTINGS.lut_resolution)
+        return value if value in LUT_RESOLUTIONS else DEFAULT_SETTINGS.lut_resolution
+
+    def cache_size_gb() -> int:
+        value = integer("cache_size_gb", min(CACHE_SIZE_CHOICES_GB), max(CACHE_SIZE_CHOICES_GB),
+                        DEFAULT_SETTINGS.cache_size_gb)
+        return value if value in CACHE_SIZE_CHOICES_GB else DEFAULT_SETTINGS.cache_size_gb
 
     def boolean(key: str, default: bool) -> bool:
         raw_value = section.get(key)
@@ -104,6 +126,11 @@ def load_settings(path: str | os.PathLike[str]) -> UISettings:
         if value == "Experimental Cascade":
             return "Cascade"
         return value if value in ENGINE_CHOICES else DEFAULT_SETTINGS.frame_interpolation_engine
+
+    image_format = choice("image_format", IMAGE_FORMAT_CHOICES, DEFAULT_SETTINGS.image_format)
+    image_bit_depth = integer("image_bit_depth", 8, 16, DEFAULT_SETTINGS.image_bit_depth)
+    if image_bit_depth not in IMAGE_BIT_DEPTH_CHOICES or (image_bit_depth == 16 and image_format not in IMAGE_16BIT_FORMATS):
+        image_bit_depth = DEFAULT_SETTINGS.image_bit_depth
 
     image_rename_mode = choice(
         "image_rename_mode", RENAME_MODES, DEFAULT_SETTINGS.image_rename_mode
@@ -150,46 +177,65 @@ def load_settings(path: str | os.PathLike[str]) -> UISettings:
         or DEFAULT_SETTINGS.ai_gpu_uuid,
         video_gpu_uuid=section.get("video_gpu_uuid", DEFAULT_SETTINGS.video_gpu_uuid).strip()
         or DEFAULT_SETTINGS.video_gpu_uuid,
+        ffmpeg_device=section.get("ffmpeg_device", "auto") if valid_selection(section.get("ffmpeg_device", "auto")) else "auto",
+        cache_codec=choice("cache_codec", CACHE_MODES, DEFAULT_SETTINGS.cache_codec),
+        cache_size_gb=cache_size_gb(),
         nr_style=choice("nr_style", tuple(NR_STYLES), DEFAULT_SETTINGS.nr_style),
         nr_intensity=number("nr_intensity", 0.0, 2.0, DEFAULT_SETTINGS.nr_intensity),
         nr_passes=integer("nr_passes", 1, 4, DEFAULT_SETTINGS.nr_passes),
+        nr_optical_flow_quality=choice("nr_optical_flow_quality", OPTICAL_FLOW_QUALITIES, "High"),
         local_tone_strength=number(
-            "local_tone_strength", 0.0, 2.0, DEFAULT_SETTINGS.local_tone_strength
+            "local_tone_strength", 0.0, 1.0, DEFAULT_SETTINGS.local_tone_strength
         ),
         local_structure_strength=number(
-            "local_structure_strength", 0.0, 2.0, DEFAULT_SETTINGS.local_structure_strength
+            "local_structure_strength", 0.0, 1.0, DEFAULT_SETTINGS.local_structure_strength
         ),
         skin_structure_strength=number(
-            "skin_structure_strength", -1.0, 2.0, DEFAULT_SETTINGS.skin_structure_strength
+            "skin_structure_strength", 0.0, 1.0, DEFAULT_SETTINGS.skin_structure_strength
         ),
-        nr_color_strength=number(
-            "nr_color_strength", 0.0, 1.0, DEFAULT_SETTINGS.nr_color_strength
-        ),
-        tone_preservation=number(
-            "tone_preservation", 0.0, 1.0, DEFAULT_SETTINGS.tone_preservation
-        ),
-        face_skin_protection=number(
-            "face_skin_protection", 0.0, 1.0, DEFAULT_SETTINGS.face_skin_protection
-        ),
-        grain_preservation=number(
-            "grain_preservation", 0.0, 1.0, DEFAULT_SETTINGS.grain_preservation
-        ),
-        shimmer_suppression=number(
-            "shimmer_suppression", 0.0, 1.0, DEFAULT_SETTINGS.shimmer_suppression
-        ),
-        mask_feather=int(number(
-            "mask_feather", 0, 128, DEFAULT_SETTINGS.mask_feather
-        )),
+
         automatic_mask=boolean("automatic_mask", DEFAULT_SETTINGS.automatic_mask),
         upscaling_factor=upscaling_factor(),
+        image_scaling_filter=choice("image_scaling_filter", IMAGE_SCALING_FILTERS,
+                                    DEFAULT_SETTINGS.image_scaling_filter),
+        video_scaling_filter=choice(
+            "video_scaling_filter", VIDEO_SCALING_FILTERS,
+            "Lanczos" if section.get("nr_scale_method") == "Standard"
+            else DEFAULT_SETTINGS.video_scaling_filter,
+        ),
+        nr_scale_method=choice("nr_scale_method", DLSS_METHODS, DEFAULT_SETTINGS.nr_scale_method),
+        nr_dlss_mode=choice("nr_dlss_mode", tuple(DLSS_MODES), DEFAULT_SETTINGS.nr_dlss_mode),
+        nr_dlss_preset=choice("nr_dlss_preset", DLSS_PRESETS, DEFAULT_SETTINGS.nr_dlss_preset),
+        nr_preview_length=choice(
+            "nr_preview_length",
+            PREVIEW_LENGTH_CHOICES,
+            DEFAULT_SETTINGS.nr_preview_length,
+        ),
         codec=codec_choice("codec", DEFAULT_SETTINGS.codec),
         container=choice("container", CONTAINER_CHOICES, DEFAULT_SETTINGS.container),
         quality=choice("quality", QUALITY_CHOICES, DEFAULT_SETTINGS.quality),
         hdr_mode=hdr_mode_value(),
-        image_format=choice(
-            "image_format", IMAGE_FORMAT_CHOICES, DEFAULT_SETTINGS.image_format
-        ),
+        image_format=image_format,
         image_quality=image_quality(),
+        image_bit_depth=image_bit_depth,
+        cas_sharpness=integer("cas_sharpness", 0, 100, DEFAULT_SETTINGS.cas_sharpness),
+        **{key: (number(key, *bounds, getattr(DEFAULT_SETTINGS, key)) if key == "grain_size"
+                 else integer(key, *bounds, getattr(DEFAULT_SETTINGS, key)))
+           for key, bounds in GRAIN_RANGES.items()},
+        grain_animated=boolean("grain_animated", DEFAULT_SETTINGS.grain_animated),
+        sharpening_method=choice("sharpening_method", SHARPENING_METHODS,
+                                 DEFAULT_SETTINGS.sharpening_method),
+        coloring_mode=("LUT" if section.get("coloring_mode") == "Mode 2" else
+                       choice("coloring_mode", COLORING_MODES, DEFAULT_SETTINGS.coloring_mode)),
+        color_match_source=choice("color_match_source", COLOR_MATCH_SOURCES,
+                                  DEFAULT_SETTINGS.color_match_source),
+        color_match_reference=decode_app_path(section.get("color_match_reference", ""))[:4096],
+        lut_path=decode_app_path(section.get("lut_path", ""))[:4096],
+        lut_reference_image=decode_app_path(section.get("lut_reference_image", ""))[:4096],
+        lut_resolution=lut_resolution(),
+        **{key: (number(key, *bounds, getattr(DEFAULT_SETTINGS, key)) if key == "lut_exposure"
+                 else integer(key, *bounds, getattr(DEFAULT_SETTINGS, key)))
+           for key, bounds in LUT_ADJUSTMENT_RANGES.items()},
         image_rename_mode=image_rename_mode,
         image_custom_suffix=image_custom_suffix,
         video_rename_mode=video_rename_mode,
@@ -200,6 +246,8 @@ def load_settings(path: str | os.PathLike[str]) -> UISettings:
             DEFAULT_SETTINGS.frame_interpolation_target_fps,
         ),
         frame_interpolation_engine=frame_interpolation_engine(),
+        frame_interpolation_optical_flow_quality=choice(
+            "frame_interpolation_optical_flow_quality", ("High", "Medium", "Low"), "High"),
         frame_interpolation_codec=codec_choice(
             "frame_interpolation_codec",
             DEFAULT_SETTINGS.frame_interpolation_codec,
@@ -222,11 +270,6 @@ def load_settings(path: str | os.PathLike[str]) -> UISettings:
         ),
         frame_interpolation_rename_mode=frame_interpolation_rename_mode,
         frame_interpolation_custom_suffix=frame_interpolation_custom_suffix,
-        preview_encoding=choice(
-            "preview_encoding",
-            PREVIEW_ENCODING_CHOICES,
-            DEFAULT_SETTINGS.preview_encoding,
-        ),
         upscale_mode=choice(
             "upscale_mode",
             UPSCALE_MODE_CHOICES,
@@ -252,33 +295,17 @@ def load_settings(path: str | os.PathLike[str]) -> UISettings:
         live_nr_style=choice("live_nr_style", tuple(NR_STYLES), settings.nr_style),
         live_nr_intensity=number("live_nr_intensity", 0.0, 2.0, settings.nr_intensity),
         live_nr_passes=integer("live_nr_passes", 1, 4, settings.nr_passes),
+        live_nr_optical_flow_quality=choice("live_nr_optical_flow_quality", OPTICAL_FLOW_QUALITIES, "High"),
         live_local_tone_strength=number(
-            "live_local_tone_strength", 0.0, 2.0, settings.local_tone_strength
+            "live_local_tone_strength", 0.0, 1.0, settings.local_tone_strength
         ),
         live_local_structure_strength=number(
-            "live_local_structure_strength", 0.0, 2.0, settings.local_structure_strength
+            "live_local_structure_strength", 0.0, 1.0, settings.local_structure_strength
         ),
         live_skin_structure_strength=number(
-            "live_skin_structure_strength", -1.0, 2.0, settings.skin_structure_strength
+            "live_skin_structure_strength", 0.0, 1.0, settings.skin_structure_strength
         ),
-        live_nr_color_strength=number(
-            "live_nr_color_strength", 0.0, 1.0, settings.nr_color_strength
-        ),
-        live_tone_preservation=number(
-            "live_tone_preservation", 0.0, 1.0, settings.tone_preservation
-        ),
-        live_face_skin_protection=number(
-            "live_face_skin_protection", 0.0, 1.0, settings.face_skin_protection
-        ),
-        live_grain_preservation=number(
-            "live_grain_preservation", 0.0, 1.0, settings.grain_preservation
-        ),
-        live_shimmer_suppression=number(
-            "live_shimmer_suppression", 0.0, 1.0, settings.shimmer_suppression
-        ),
-        live_mask_feather=int(number(
-            "live_mask_feather", 0, 128, settings.mask_feather
-        )),
+
         live_automatic_mask=boolean("live_automatic_mask", settings.automatic_mask),
         live_upscaling_factor=live_upscaling_factor(),
     )
@@ -290,10 +317,19 @@ def load_settings(path: str | os.PathLike[str]) -> UISettings:
             settings = replace(settings, frame_interpolation_hdr_mode=False)
     except Exception:
         pass
-    upscale_values = {}
+    # Read codec/container together before validating the remaining upscale
+    # fields; manual ProRes settings may change both from their defaults.
+    upscale_codec = codec_choice("upscale_codec", DEFAULT_SETTINGS.upscale_codec)
+    upscale_container = choice("upscale_container", CONTAINER_CHOICES, DEFAULT_SETTINGS.upscale_container)
+    legacy_automatic_container = "automatic_container" in section and boolean("automatic_container", True)
+    if legacy_automatic_container or upscale_container not in containers_for_codec(upscale_codec):
+        upscale_container = container_for_codec(upscale_codec)
+    upscale_values = {"upscale_codec": upscale_codec, "upscale_container": upscale_container}
     for prefix, names, factory in (("upscale_", SETTING_FIELDS, options_from_settings),
                                     ("upscale_image_", IMAGE_UPSCALE_FIELDS, image_upscale_options)):
         for name in names:
+            if prefix == "upscale_" and name in {"codec", "container"}:
+                continue
             key = prefix + name
             default = getattr(DEFAULT_SETTINGS, key)
             raw = section.get(key)
@@ -315,8 +351,60 @@ def load_settings(path: str | os.PathLike[str]) -> UISettings:
                 upscale_values[key] = value
             except (ValueError, TypeError, OverflowError):
                 continue
-    return replace(settings, **upscale_values)
+    settings = replace(settings, **upscale_values)
+    # Preserve the effective selections from the retired automatic mode once.
+    # Invalid combinations in an edited INI recover to a supported default.
+    container_changes = {}
+    for codec_key, container_key in (("codec", "container"),
+                                     ("frame_interpolation_codec", "frame_interpolation_container"),
+                                     ("upscale_codec", "upscale_container")):
+        codec = getattr(settings, codec_key)
+        if legacy_automatic_container or getattr(settings, container_key) not in containers_for_codec(codec):
+            container_changes[container_key] = container_for_codec(codec)
+    settings = replace(settings, **container_changes)
 
+    def stage_values(order_key: str, enabled_key: str, default_order: tuple[str, ...], video: bool):
+        try:
+            order = tuple(json.loads(section.get(order_key, json.dumps(default_order))))
+            enabled = tuple(json.loads(section.get(enabled_key, "[]")))
+            legacy_order = LEGACY_VIDEO_STAGE_ORDER if video else LEGACY_IMAGE_STAGE_ORDER
+            legacy = len(order) == len(legacy_order) and set(order) == set(legacy_order)
+            engine = settings.upscale_engine if video else settings.upscale_image_engine
+            migrated = migrate_stage_layout(order, enabled, video=video,
+                                            scale_method=settings.nr_scale_method,
+                                            upscale_engine=engine,
+                                            upscale_vsr_enabled=settings.upscale_vsr_enabled,
+                                            upscale_hdr_enabled=settings.upscale_hdr_enabled)
+            return migrated[0], migrated[1], (order, enabled) if legacy else None
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return default_order, (), None
+
+    image_order, image_enabled, old_image = stage_values("image_stage_order", "image_enabled_stages", IMAGE_STAGE_ORDER, False)
+    video_order, video_enabled, old_video = stage_values("video_stage_order", "video_enabled_stages", VIDEO_STAGE_ORDER, True)
+
+    def scale_dlss_wins(old_layout, engine: str) -> bool:
+        if not old_layout or settings.nr_scale_method != "DLSS":
+            return False
+        order, enabled = old_layout
+        return ("scale_method" in enabled and
+                ("super_resolution" not in enabled or engine != "DLSS" or
+                 order.index("scale_method") < order.index("super_resolution")))
+
+    image_scale_wins = scale_dlss_wins(old_image, settings.upscale_image_engine)
+    video_scale_wins = scale_dlss_wins(old_video, settings.upscale_engine)
+    return replace(
+        settings,
+        image_stage_order=image_order, image_enabled_stages=image_enabled,
+        video_stage_order=video_order, video_enabled_stages=video_enabled,
+        upscale_image_dlss_mode=settings.nr_dlss_mode if image_scale_wins else settings.upscale_image_dlss_mode,
+        upscale_image_dlss_preset=settings.nr_dlss_preset if image_scale_wins else settings.upscale_image_dlss_preset,
+        upscale_dlss_mode=settings.nr_dlss_mode if video_scale_wins else settings.upscale_dlss_mode,
+        upscale_dlss_preset=settings.nr_dlss_preset if video_scale_wins else settings.upscale_dlss_preset,
+        upscale_image_engine="RTX Video Super Resolution",
+        upscale_engine="RTX Video Super Resolution",
+        upscale_vsr_enabled=settings.upscale_vsr_enabled or not settings.upscale_hdr_enabled,
+        nr_scale_method="Standard",
+    )
 
 def save_settings(path: str | os.PathLike[str], settings: UISettings) -> None:
     settings = _validate(settings)
@@ -324,38 +412,54 @@ def save_settings(path: str | os.PathLike[str], settings: UISettings) -> None:
     config_path.parent.mkdir(parents=True, exist_ok=True)
     parser = configparser.ConfigParser()
     parser[CONFIG_SECTION] = {
+        "image_stage_order": json.dumps(settings.image_stage_order),
+        "video_stage_order": json.dumps(settings.video_stage_order),
+        "image_enabled_stages": json.dumps(settings.image_enabled_stages),
+        "video_enabled_stages": json.dumps(settings.video_enabled_stages),
+        "cas_sharpness": str(settings.cas_sharpness),
+        **{key: str(getattr(settings, key)) for key in GRAIN_RANGES},
+        "grain_animated": str(settings.grain_animated),
+        "sharpening_method": settings.sharpening_method,
+        "coloring_mode": settings.coloring_mode,
+        "color_match_source": settings.color_match_source,
+        "color_match_reference": encode_app_path(settings.color_match_reference).replace("%", "%%"),
+        "lut_path": encode_app_path(settings.lut_path).replace("%", "%%"),
+        "lut_reference_image": encode_app_path(settings.lut_reference_image).replace("%", "%%"),
+        "lut_resolution": str(settings.lut_resolution),
+        **{key: str(getattr(settings, key)) for key in LUT_ADJUSTMENT_RANGES},
         **{"upscale_image_" + name: str(getattr(settings, "upscale_image_" + name)) for name in IMAGE_UPSCALE_FIELDS},
         **{"upscale_" + name: str(getattr(settings, "upscale_" + name)) for name in SETTING_FIELDS},
         "upscale_mode": settings.upscale_mode,
         "upscale_preview_length": settings.upscale_preview_length,
         "ai_gpu_uuid": settings.ai_gpu_uuid,
         "video_gpu_uuid": settings.video_gpu_uuid,
+        "ffmpeg_device": settings.ffmpeg_device,
+        "cache_codec": settings.cache_codec,
+        "cache_size_gb": str(settings.cache_size_gb),
         "nr_style": settings.nr_style,
         "nr_intensity": f"{settings.nr_intensity:.2f}",
         "nr_passes": str(settings.nr_passes),
+        "nr_optical_flow_quality": settings.nr_optical_flow_quality,
         "local_tone_strength": f"{settings.local_tone_strength:.2f}",
         "local_structure_strength": f"{settings.local_structure_strength:.2f}",
         "skin_structure_strength": f"{settings.skin_structure_strength:.2f}",
-        "nr_color_strength": f"{settings.nr_color_strength:.2f}",
-        "tone_preservation": f"{settings.tone_preservation:.2f}",
-        "face_skin_protection": f"{settings.face_skin_protection:.2f}",
-        "grain_preservation": f"{settings.grain_preservation:.2f}",
-        "shimmer_suppression": f"{settings.shimmer_suppression:.2f}",
-        "mask_feather": str(settings.mask_feather),
+
         "automatic_mask": str(settings.automatic_mask).lower(),
         "upscaling_factor": f"{settings.upscaling_factor:g}",
+        "image_scaling_filter": settings.image_scaling_filter,
+        "video_scaling_filter": settings.video_scaling_filter,
+        "nr_scale_method": settings.nr_scale_method,
+        "nr_dlss_mode": settings.nr_dlss_mode,
+        "nr_dlss_preset": settings.nr_dlss_preset,
+        "nr_preview_length": settings.nr_preview_length,
         "live_nr_style": settings.live_nr_style,
         "live_nr_intensity": f"{settings.live_nr_intensity:.2f}",
         "live_nr_passes": str(settings.live_nr_passes),
+        "live_nr_optical_flow_quality": settings.live_nr_optical_flow_quality,
         "live_local_tone_strength": f"{settings.live_local_tone_strength:.2f}",
         "live_local_structure_strength": f"{settings.live_local_structure_strength:.2f}",
         "live_skin_structure_strength": f"{settings.live_skin_structure_strength:.2f}",
-        "live_nr_color_strength": f"{settings.live_nr_color_strength:.2f}",
-        "live_tone_preservation": f"{settings.live_tone_preservation:.2f}",
-        "live_face_skin_protection": f"{settings.live_face_skin_protection:.2f}",
-        "live_grain_preservation": f"{settings.live_grain_preservation:.2f}",
-        "live_shimmer_suppression": f"{settings.live_shimmer_suppression:.2f}",
-        "live_mask_feather": str(settings.live_mask_feather),
+
         "live_automatic_mask": str(settings.live_automatic_mask).lower(),
         "live_upscaling_factor": f"{settings.live_upscaling_factor:g}",
         "codec": settings.codec,
@@ -364,12 +468,14 @@ def save_settings(path: str | os.PathLike[str], settings: UISettings) -> None:
         "hdr_mode": str(settings.hdr_mode).lower(),
         "image_format": settings.image_format,
         "image_quality": str(settings.image_quality),
+        "image_bit_depth": str(settings.image_bit_depth),
         "image_rename_mode": settings.image_rename_mode,
         "image_custom_suffix": settings.image_custom_suffix,
         "video_rename_mode": settings.video_rename_mode,
         "video_custom_suffix": settings.video_custom_suffix,
         "frame_interpolation_target_fps": settings.frame_interpolation_target_fps,
         "frame_interpolation_engine": settings.frame_interpolation_engine,
+        "frame_interpolation_optical_flow_quality": settings.frame_interpolation_optical_flow_quality,
         "frame_interpolation_codec": settings.frame_interpolation_codec,
         "frame_interpolation_container": settings.frame_interpolation_container,
         "frame_interpolation_quality": settings.frame_interpolation_quality,
@@ -377,7 +483,6 @@ def save_settings(path: str | os.PathLike[str], settings: UISettings) -> None:
         "frame_interpolation_preview_length": settings.frame_interpolation_preview_length,
         "frame_interpolation_rename_mode": settings.frame_interpolation_rename_mode,
         "frame_interpolation_custom_suffix": settings.frame_interpolation_custom_suffix,
-        "preview_encoding": settings.preview_encoding,
     }
 
     temporary = config_path.with_name(f".{config_path.name}.tmp")
@@ -389,31 +494,14 @@ def save_settings(path: str | os.PathLike[str], settings: UISettings) -> None:
         if temporary.exists():
             temporary.unlink()
 
-
 class _SettingsState:
     def __init__(self) -> None:
         self.lock = threading.Lock()
         self.current: UISettings | None = None
 
-
 SETTINGS_STATE = _SettingsState()
 
-
-def current_settings() -> UISettings:
-    """Return the settings the UI last persisted, or config.ini when none were."""
-    with SETTINGS_STATE.lock:
-        return SETTINGS_STATE.current or load_settings(CONFIG_PATH)
-
-
 def processing_gpu_settings() -> tuple[str, str]:
-    settings = current_settings()
-    return settings.ai_gpu_uuid, settings.video_gpu_uuid
-
-
-def current_preview_encoding() -> str:
-    from ..core.ffmpeg.preview import normalize_preview_encoding
-
     with SETTINGS_STATE.lock:
         settings = SETTINGS_STATE.current or load_settings(CONFIG_PATH)
-    return normalize_preview_encoding(settings.preview_encoding)
-
+    return settings.ai_gpu_uuid, settings.video_gpu_uuid

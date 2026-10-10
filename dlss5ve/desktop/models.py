@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
+import math
+import re
+import time
 from pathlib import Path
 from typing import Any
 
-from PySide6.QtCore import QAbstractListModel, QByteArray, QModelIndex, Property, Qt, Signal, Slot
+from PySide6.QtCore import QAbstractListModel, QByteArray, QModelIndex, Property, Qt, QTimer, Signal, Slot
 
 
 @dataclass
@@ -20,10 +24,31 @@ class BatchEntry:
     output_dimensions: str = ""
     thumbnail_url: str = ""
     selected: bool = False
+    file_size_bytes: int = 0
+    duration_seconds: float = 0.0
+    frame_count: int = 0
+    processed_frames: int = 0
+    processing_total_frames: int = 0
+    processing_fps: float = 0.0
+    _frame_sample: tuple[str, int, float] | None = None
+    _structured_metrics: bool = False
+    _clock_origin: float | None = None
+    _paused_at: float | None = None
+    _paused_elapsed: float | None = None
+    _paused_seconds: float = 0.0
 
     @property
     def file_name(self) -> str:
         return Path(self.input_path).name
+
+    @property
+    def remaining_seconds(self) -> float:
+        """Estimate the entire file job from job progress, never stage frame counters."""
+        elapsed = (self._paused_elapsed if self._paused_elapsed is not None else
+                   self.elapsed_seconds) - self._paused_seconds
+        if self.state != "Running" or elapsed < 1 or self.progress <= 0:
+            return -1.0
+        return elapsed * (1 - self.progress) / self.progress
 
 
 class BatchListModel(QAbstractListModel):
@@ -44,11 +69,79 @@ class BatchListModel(QAbstractListModel):
     ThumbnailUrlRole = Qt.ItemDataRole.UserRole + 10
     IndexRole = Qt.ItemDataRole.UserRole + 11
     SelectedRole = Qt.ItemDataRole.UserRole + 12
+    FileSizeBytesRole = Qt.ItemDataRole.UserRole + 13
+    DurationSecondsRole = Qt.ItemDataRole.UserRole + 14
+    FrameCountRole = Qt.ItemDataRole.UserRole + 15
+    ProcessedFramesRole = Qt.ItemDataRole.UserRole + 16
+    ProcessingTotalFramesRole = Qt.ItemDataRole.UserRole + 17
+    ProcessingFpsRole = Qt.ItemDataRole.UserRole + 18
+    RemainingSecondsRole = Qt.ItemDataRole.UserRole + 19
+
+    # Native stages include a total, while rolling pipelines and FFmpeg with
+    # incomplete container metadata may only report the processed frame count.
+    # Throughput needs the count and elapsed time, never a known total.
+    _frame_counter = re.compile(r"(\d[\d,]*)(?:\s*/\s*(\d[\d,]*))?\s+frames\b", re.IGNORECASE)
 
     def __init__(self, parent: Any = None) -> None:
         super().__init__(parent)
         self._entries: list[BatchEntry] = []
         self._selected_index = -1
+        self._progress_timer = QTimer(self)
+        self._progress_timer.setInterval(250)
+        self._progress_timer.timeout.connect(self._refresh_running_times)
+
+    @staticmethod
+    def _reset_processing(entry: BatchEntry) -> None:
+        entry.processed_frames = entry.processing_total_frames = 0
+        entry.processing_fps = 0.0
+        entry._frame_sample = None
+        entry._structured_metrics = False
+        entry._clock_origin = entry._paused_at = entry._paused_elapsed = None
+        entry._paused_seconds = 0.0
+
+    @staticmethod
+    def _advance_clock(entry: BatchEntry, now: float) -> None:
+        if entry._clock_origin is not None:
+            entry.elapsed_seconds = max(entry.elapsed_seconds, now - entry._clock_origin)
+
+    def _refresh_running_times(self) -> None:
+        now = time.monotonic()
+        running = False
+        for row, entry in enumerate(self._entries):
+            if entry.state != "Running":
+                continue
+            running = True
+            self._advance_clock(entry, now)
+            idx = self.index(row)
+            self.dataChanged.emit(idx, idx, [self.ElapsedSecondsRole, self.RemainingSecondsRole])
+        if not running:
+            self._progress_timer.stop()
+
+    def update_running_metrics(self, values: dict) -> None:
+        """Apply control-protocol telemetry without parsing the display message."""
+        now = time.monotonic()
+        for row, entry in enumerate(self._entries):
+            if entry.state != "Running":
+                continue
+            self._advance_clock(entry, now)
+            entry._structured_metrics = entry._structured_metrics or "frames" in values
+            state = values.get("state")
+            if state == "paused":
+                if entry._paused_at is None:
+                    entry._paused_at, entry._paused_elapsed = now, entry.elapsed_seconds
+            elif entry._paused_at is not None:
+                entry._paused_seconds += max(0.0, now - entry._paused_at)
+                entry._paused_at = entry._paused_elapsed = None
+            try:
+                fps = float(values.get("fps") or 0)
+            except (TypeError, ValueError):
+                fps = 0.0
+            entry.processing_fps = fps if state == "process" and math.isfinite(fps) and fps > 0 else 0.0
+            entry.processed_frames = max(0, int(values.get("frames") or 0))
+            entry.processing_total_frames = max(0, int(values.get("total_frames") or 0))
+            idx = self.index(row)
+            self.dataChanged.emit(idx, idx, [self.ElapsedSecondsRole, self.ProcessedFramesRole,
+                self.ProcessingTotalFramesRole, self.ProcessingFpsRole, self.RemainingSecondsRole])
 
     def rowCount(self, parent: QModelIndex = QModelIndex()) -> int:
         return 0 if parent.isValid() else len(self._entries)
@@ -78,6 +171,13 @@ class BatchListModel(QAbstractListModel):
             self.ThumbnailUrlRole: entry.thumbnail_url,
             self.IndexRole: entry.index,
             self.SelectedRole: entry.selected,
+            self.FileSizeBytesRole: float(entry.file_size_bytes),
+            self.DurationSecondsRole: entry.duration_seconds,
+            self.FrameCountRole: entry.frame_count,
+            self.ProcessedFramesRole: entry.processed_frames,
+            self.ProcessingTotalFramesRole: entry.processing_total_frames,
+            self.ProcessingFpsRole: entry.processing_fps,
+            self.RemainingSecondsRole: entry.remaining_seconds,
         }
         return mapping.get(role)
 
@@ -86,7 +186,7 @@ class BatchListModel(QAbstractListModel):
             self.FileNameRole: QByteArray(b"fileName"),
             self.InputPathRole: QByteArray(b"inputPath"),
             self.OutputPathRole: QByteArray(b"outputPath"),
-            self.StateRole: QByteArray(b"state"),
+            self.StateRole: QByteArray(b"itemState"),
             self.ProgressRole: QByteArray(b"progress"),
             self.DetailRole: QByteArray(b"detail"),
             self.ElapsedSecondsRole: QByteArray(b"elapsedSeconds"),
@@ -95,12 +195,28 @@ class BatchListModel(QAbstractListModel):
             self.ThumbnailUrlRole: QByteArray(b"thumbnailUrl"),
             self.IndexRole: QByteArray(b"itemIndex"),
             self.SelectedRole: QByteArray(b"selected"),
+            self.FileSizeBytesRole: QByteArray(b"fileSizeBytes"),
+            self.DurationSecondsRole: QByteArray(b"durationSeconds"),
+            self.FrameCountRole: QByteArray(b"frameCount"),
+            self.ProcessedFramesRole: QByteArray(b"processedFrames"),
+            self.ProcessingTotalFramesRole: QByteArray(b"processingTotalFrames"),
+            self.ProcessingFpsRole: QByteArray(b"processingFps"),
+            self.RemainingSecondsRole: QByteArray(b"remainingSeconds"),
         }
+
+    @staticmethod
+    def _new_entry(index: int, path: str) -> BatchEntry:
+        try:
+            size = Path(path).stat().st_size
+        except OSError:
+            size = 0
+        return BatchEntry(index=index, input_path=path, file_size_bytes=size)
 
     @Slot(list)
     def set_items(self, paths: list[str]) -> None:
         self.beginResetModel()
-        self._entries = [BatchEntry(index=i, input_path=p) for i, p in enumerate(paths) if p and Path(p).is_file()]
+        valid_paths = [p for p in paths if p and Path(p).is_file()]
+        self._entries = [self._new_entry(i, p) for i, p in enumerate(valid_paths)]
         self._selected_index = 0 if self._entries else -1
         if self._selected_index >= 0:
             self._entries[0].selected = True
@@ -124,7 +240,32 @@ class BatchListModel(QAbstractListModel):
         start = len(self._entries)
         self.beginInsertRows(QModelIndex(), start, start + len(new_paths) - 1)
         for i, path in enumerate(new_paths):
-            self._entries.append(BatchEntry(index=start + i, input_path=path))
+            self._entries.append(self._new_entry(start + i, path))
+        self.endInsertRows()
+        self.countChanged.emit()
+        if self._selected_index < 0:
+            self.select(0)
+
+    def add_scanned_items(self, paths: list[str], file_sizes: dict[str, int]) -> None:
+        """Accept canonical paths already checked by the input scan worker.
+
+        Do not stat or resolve files on the GUI thread again: offline network
+        drives, cloud hydration and file scanners can block those operations.
+        """
+        existing = {os.path.normcase(os.path.abspath(e.input_path)) for e in self._entries}
+        new_paths = []
+        for path in paths:
+            key = os.path.normcase(os.path.abspath(path))
+            if path and key not in existing:
+                existing.add(key)
+                new_paths.append(path)
+        if not new_paths:
+            return
+        start = len(self._entries)
+        self.beginInsertRows(QModelIndex(), start, start + len(new_paths) - 1)
+        for offset, path in enumerate(new_paths):
+            self._entries.append(BatchEntry(index=start + offset, input_path=path,
+                                           file_size_bytes=max(0, int(file_sizes.get(path, 0)))))
         self.endInsertRows()
         self.countChanged.emit()
         if self._selected_index < 0:
@@ -156,6 +297,8 @@ class BatchListModel(QAbstractListModel):
         for i, e in enumerate(self._entries):
             e.index = i
         self.endRemoveRows()
+        if row < len(self._entries):
+            self.dataChanged.emit(self.index(row), self.index(len(self._entries) - 1), [self.IndexRole])
         if not self._entries:
             new_selected = -1
         elif self._selected_index == row:
@@ -194,7 +337,8 @@ class BatchListModel(QAbstractListModel):
         return None
 
     def update_metadata(self, row: int, *, input_dimensions: str | None = None,
-                        output_dimensions: str | None = None, thumbnail_url: str | None = None) -> None:
+                        output_dimensions: str | None = None, thumbnail_url: str | None = None,
+                        duration_seconds: float | None = None, frame_count: int | None = None) -> None:
         if not (0 <= row < len(self._entries)):
             return
         entry = self._entries[row]
@@ -208,6 +352,12 @@ class BatchListModel(QAbstractListModel):
         if thumbnail_url is not None:
             entry.thumbnail_url = thumbnail_url
             roles.append(self.ThumbnailUrlRole)
+        if duration_seconds is not None:
+            entry.duration_seconds = max(0.0, float(duration_seconds))
+            roles.append(self.DurationSecondsRole)
+        if frame_count is not None:
+            entry.frame_count = max(0, int(frame_count))
+            roles.append(self.FrameCountRole)
         if roles:
             idx = self.index(row)
             self.dataChanged.emit(idx, idx, roles)
@@ -220,16 +370,58 @@ class BatchListModel(QAbstractListModel):
         state = state_aliases.get(state, state)
         entry = self._entries[index]
         entry.state = state
-        entry.progress = max(0.0, min(1.0, float(progress)))
-        if detail:
-            entry.detail = detail
+        # Backend fractions cover the whole file, including export. Stage changes
+        # must never rewind the bar, and only a published result can reach 100%.
+        if state in {"Completed", "CompletedWithWarnings"}:
+            entry.progress = 1.0
+        elif state == "Queued":
+            entry.progress = 0.0
+        elif math.isfinite(progress):
+            limit = 0.99 if state == "Running" else 1.0
+            entry.progress = max(entry.progress, max(0.0, min(limit, float(progress))))
+        entry.detail = detail
         if output_path:
             entry.output_path = output_path
-        if elapsed_seconds >= 0:
-            entry.elapsed_seconds = elapsed_seconds
+        if math.isfinite(elapsed_seconds) and elapsed_seconds >= 0:
+            entry.elapsed_seconds = max(entry.elapsed_seconds, elapsed_seconds)
+        if state == "Running":
+            now = time.monotonic()
+            if entry._clock_origin is None:
+                entry._clock_origin = now - entry.elapsed_seconds
+            self._advance_clock(entry, now)
+            if not self._progress_timer.isActive():
+                self._progress_timer.start()
+        else:
+            self._reset_processing(entry)
+            if not any(item.state == "Running" for item in self._entries):
+                self._progress_timer.stop()
+        counter = self._frame_counter.search(detail) if state == "Running" and not entry._structured_metrics else None
+        if counter:
+            current = int(counter.group(1).replace(",", ""))
+            total = int((counter.group(2) or "0").replace(",", ""))
+            stage = detail[:counter.start()].rstrip(" :·–-")
+            sample = entry._frame_sample
+            sample_time = entry.elapsed_seconds
+            if not sample or sample[0] != stage or current < sample[1]:
+                entry.processing_fps = 0.0
+                entry._frame_sample = (stage, current, sample_time)
+            elif sample_time > sample[2]:
+                measured = (current - sample[1]) / (sample_time - sample[2])
+                entry.processing_fps = measured if entry.processing_fps <= 0 else (
+                    0.35 * measured + 0.65 * entry.processing_fps)
+                entry._frame_sample = (stage, current, sample_time)
+            # Repeated/invalid timestamps cannot measure a rate. Retain the
+            # baseline so the next timed update includes all intervening frames.
+            entry.processed_frames, entry.processing_total_frames = current, total
+        elif not entry._structured_metrics:
+            entry._frame_sample = None
+            entry.processing_fps = 0.0
+            entry.processed_frames = 0
+            entry.processing_total_frames = 0
         idx = self.index(index)
         self.dataChanged.emit(idx, idx, [self.StateRole, self.ProgressRole, self.DetailRole,
-                                         self.OutputPathRole, self.ElapsedSecondsRole])
+                                         self.OutputPathRole, self.ElapsedSecondsRole, self.ProcessedFramesRole,
+                                         self.ProcessingTotalFramesRole, self.ProcessingFpsRole, self.RemainingSecondsRole])
 
 
     @Slot()
@@ -237,8 +429,9 @@ class BatchListModel(QAbstractListModel):
         remove = [i for i, e in enumerate(self._entries) if e.state in {"Completed", "CompletedWithWarnings", "Cancelled"}]
         if not remove:
             return
-        keep = [e.input_path for i, e in enumerate(self._entries) if i not in set(remove)]
-        self.set_items(keep)
+        # Remove rows in place so retained files keep their metadata and progress.
+        for row in reversed(remove):
+            self.remove_item(row)
 
     @Slot()
     def retry_failed(self) -> None:
@@ -250,8 +443,11 @@ class BatchListModel(QAbstractListModel):
                 entry.detail = ""
                 entry.output_path = ""
                 entry.elapsed_seconds = 0.0
+                self._reset_processing(entry)
                 idx = self.index(row)
-                self.dataChanged.emit(idx, idx, [self.StateRole, self.ProgressRole, self.DetailRole, self.OutputPathRole, self.ElapsedSecondsRole])
+                self.dataChanged.emit(idx, idx, [self.StateRole, self.ProgressRole, self.DetailRole,
+                                                self.OutputPathRole, self.ElapsedSecondsRole, self.ProcessedFramesRole,
+                                                self.ProcessingTotalFramesRole, self.ProcessingFpsRole, self.RemainingSecondsRole])
                 changed = True
         if changed and self._selected_index < 0 and self._entries:
             self.select(0)
@@ -265,6 +461,9 @@ class BatchListModel(QAbstractListModel):
             e.detail = ""
             e.output_path = ""
             e.elapsed_seconds = 0.0
+            self._reset_processing(e)
+        self._progress_timer.stop()
         self.dataChanged.emit(self.index(0), self.index(len(self._entries) - 1),
                               [self.StateRole, self.ProgressRole, self.DetailRole,
-                               self.OutputPathRole, self.ElapsedSecondsRole])
+                               self.OutputPathRole, self.ElapsedSecondsRole, self.ProcessedFramesRole,
+                               self.ProcessingTotalFramesRole, self.ProcessingFpsRole, self.RemainingSecondsRole])

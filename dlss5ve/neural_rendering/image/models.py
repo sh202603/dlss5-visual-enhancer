@@ -15,19 +15,17 @@ RAW_EXTENSIONS = {
 @dataclass(slots=True)
 class ImageConversionOptions:
     ai_gpu_uuid: str = "auto"
-    nr_style: str = "Default"
+    nr_style: str = "Style 0"
     nr_intensity: float = 1.0
     nr_passes: int = 1
     local_tone_strength: float = 1.0
     local_structure_strength: float = 1.0
-    skin_structure_strength: float = -1.0
-    nr_color_strength: float = 1.0
-    tone_preservation: float = 0.0
-    face_skin_protection: float = 0.0
-    grain_preservation: float = 0.0
-    mask_feather: int = 0
+    skin_structure_strength: float = 1.0
     nr_mask: object | None = None
     upscaling_factor: float = 1.0
+    scale_method: str = "Standard"
+    dlss_mode: str = "Quality"
+    dlss_preset: str = "Default"
     output_format: str = "PNG"
     quality: int = 95
     preserve_metadata: bool = True
@@ -40,12 +38,11 @@ class ImageConversionOptions:
         # Image already carries every shared neural-rendering field needed by core.runtime.
         return self
 
-
 @dataclass(slots=True)
 class ImageConversionResult:
     input_path: str
     output_path: str
-    report_path: str
+    report_path: str  # Shared session log; field name is kept for existing callers.
     elapsed_seconds: float
     gpu: str
     input_width: int
@@ -58,22 +55,20 @@ class ImageConversionResult:
     output_format: str
     neural_dimensions: dict[str, int] | None = None
     resize_method: str = "none"
-    memory_path: str = "host_staging"
+    memory_path: str = "host_cuda_d3d12_shared"
     bridge_status: dict | None = None
     warnings: list[str] = field(default_factory=list)
     timings: dict[str, float] = field(default_factory=dict)
-
 
 @dataclass(slots=True)
 class ImageConversionFailure:
     input_path: str
     error: str
 
-
 @dataclass(slots=True)
 class ImageBatchResult:
     successes: list[ImageConversionResult]
     failures: list[ImageConversionFailure]
     cancelled: bool
-    manifest_path: str
+    manifest_path: str  # Shared session log; field name is kept for existing callers.
     zip_path: str | None

@@ -4,18 +4,15 @@ import math
 
 
 ENCODING_QUALITIES = ("Auto (Default)", "Max", "Best", "Good")
+CONTAINER_CHOICES = ("MP4", "MKV", "MOV")
 
-# User-facing codec choices: plain = CPU (libx264/libx265/libsvtav1), suffixed = NVIDIA NVENC.
+# Plain codecs use the selected FFmpeg/Vulkan backend. Explicit NVIDIA choices
+# keep decoded, processed, and encoded video in CUDA where the pipeline allows it.
 CODEC_CHOICES = (
-    "H.264",
-    "H.264 (NVIDIA NVENC)",
-    "H.265",
-    "H.265 (NVIDIA NVENC)",
-    "AV1",
-    "AV1 (NVIDIA NVENC)",
-    "ProRes Proxy",
-    "ProRes HQ",
-    "FFV1 Lossless RGB 10-bit",
+    "H.264", "H.264 (NVIDIA NVENC)",
+    "H.265", "H.265 (NVIDIA NVENC)",
+    "AV1", "AV1 (NVIDIA NVENC)",
+    "ProRes Proxy", "ProRes HQ", "FFV1 Lossless RGB 10-bit",
 )
 
 _CODEC_ALIASES = {
@@ -49,7 +46,7 @@ _NVENC_ENCODERS = {
     "AV1 (NVIDIA NVENC)": "av1_nvenc",
 }
 
-_AUTOMATIC_CONTAINERS = {
+_DEFAULT_CONTAINERS = {
     "H.264": "MP4",
     "H.264 (NVIDIA NVENC)": "MP4",
     "H.265": "MKV",
@@ -113,12 +110,29 @@ def hdr_mode_supported(codec: str) -> bool:
 
 
 def container_for_codec(codec: str) -> str:
-    """Return the single application container selected for a video codec."""
+    """Return a supported default when a codec needs a new container selection."""
     normalized = _normalize_codec(codec)
     try:
-        return _AUTOMATIC_CONTAINERS[normalized]
+        return _DEFAULT_CONTAINERS[normalized]
     except KeyError as exc:
         raise ValueError(f"Unknown video codec: {codec!r}.") from exc
+
+
+def _prores_color_metadata(metadata: dict | None, *, hdr_mode: bool = False) -> dict:
+    """Describe the limited-range YUV delivery signal, independently of source range."""
+    colors = dict(metadata or {})
+    hdr = hdr_mode or bool(colors.get("hdr"))
+    defaults = {"color_primaries": "bt2020" if hdr else "bt709",
+                "color_transfer": "smpte2084" if hdr else "bt709"}
+    for field, fallback in defaults.items():
+        if colors.get(field) in (None, "", "unknown", "unspecified", "reserved"):
+            colors[field] = fallback
+    if colors.get("color_space") in (None, "", "unknown", "unspecified", "reserved", "gbr", "0", 0):
+        colors["color_space"] = "bt2020nc" if hdr or colors["color_primaries"] == "bt2020" else "bt709"
+    # MOV/ProRes decoders interpret YUV samples as limited range. Convert the
+    # pixels to that range; copying a full-range input tag is not sufficient.
+    colors["color_range"] = "tv"
+    return colors
 
 
 def _hdr_color_args(metadata: dict | None) -> list[str]:
@@ -135,20 +149,18 @@ def _hdr_color_args(metadata: dict | None) -> list[str]:
     cs = metadata.get("color_space")
     if isinstance(cs, str) and cs not in ("unknown", "", None):
         # ffmpeg expects 'bt709', 'bt2020nc', 'bt2020c', etc. Probe already returns that.
-        args.extend(["-colorspace", cs])
+        args.extend(["-colorspace", "0" if cs == "gbr" else cs])
     cp = metadata.get("color_primaries")
     if isinstance(cp, str) and cp not in ("unknown", "", None):
         args.extend(["-color_primaries", cp])
     trc = metadata.get("color_transfer")
     if isinstance(trc, str) and trc not in ("unknown", "", None):
         args.extend(["-color_trc", trc])
-    # color_range is not probed currently; default tv for HDR
-    # If HDR, ensure range is tv
-    if metadata.get("hdr"):
-        # Ensure we signal full vs limited correctly – probe doesn't give range, use tv
-        # Don't double-add if already present
-        if "-color_range" not in args:
-            args.extend(["-color_range", "tv"])
+    color_range = str(metadata.get("color_range") or "").lower()
+    if color_range in {"pc", "jpeg", "full"}:
+        args.extend(["-color_range", "pc"])
+    elif color_range in {"tv", "mpeg", "limited"}:
+        args.extend(["-color_range", "tv"])
     return args
 
 
@@ -169,19 +181,39 @@ def _x265_hdr_params(metadata: dict | None) -> str | None:
     cmat = mapping["color_space"] if mapping["color_space"] not in ("unknown", "", None) else "bt709"
     # x265 colormatrix for bt2020nc is bt2020nc, for bt709 is bt709
     # Ensure x265-compatible values: bt2020nc is valid, bt709 is valid
-    return f"colorprim={prim}:transfer={trc}:colormatrix={cmat}:range=limited"
+    color_range = str(metadata.get("color_range") or "").lower()
+    range_name = "full" if color_range in {"pc", "jpeg", "full"} else "limited"
+    return f"colorprim={prim}:transfer={trc}:colormatrix={cmat}:range={range_name}"
 
 
 def validate_codec_container(codec: str, container: str) -> None:
+    if container not in CONTAINER_CHOICES:
+        raise ValueError(f"Unknown output container: {container!r}.")
     norm = _normalize_codec(codec)
-    if norm == "ProRes Proxy" and container == "MP4":
-        raise ValueError("ProRes Proxy is not supported in MP4. Choose the MOV or MKV container.")
-    if norm in FIXED_QUALITY_CODECS and container != container_for_codec(norm):
-        raise ValueError(f"{norm} requires the {container_for_codec(norm)} container.")
-    if norm not in CODEC_CHOICES and norm not in _CODEC_ALIASES.values():
-        # Allow alias but error on truly unknown for early feedback; _codec_command will also validate.
-        if norm not in _BASE_CODEC_MAP:
-            raise ValueError(f"Unknown video codec: {codec!r}.")
+    base = _base_codec(norm)
+    if norm in {"ProRes Proxy", "ProRes HQ"} and container == "MP4":
+        raise ValueError(f"{norm} is not supported in MP4. Choose the MOV or MKV container.")
+    if base == "AV1" and container == "MOV":
+        raise ValueError("AV1 is not supported in MOV. Choose the MP4 or MKV container.")
+
+
+def containers_for_codec(codec: str) -> tuple[str, ...]:
+    """Offer only containers accepted by the application's export paths."""
+    container_for_codec(codec)
+    choices = []
+    for container in CONTAINER_CHOICES:
+        try:
+            validate_codec_container(codec, container)
+        except ValueError:
+            continue
+        choices.append(container)
+    return tuple(choices)
+
+
+def resolve_container(codec: str, container: str) -> str:
+    """Validate and honor the user's selected export container."""
+    validate_codec_container(codec, container)
+    return container
 
 
 def calculate_auto_bitrate_kbps(
@@ -254,7 +286,9 @@ def resolve_encoding_quality(
             "selection": quality_name,
             "mode": "constant-quality",
             "target_bitrate_kbps": None,
-            "cq": 0,
+            # FFmpeg NVENC reserves CQ 0 for automatic rate control. The
+            # highest explicit integer quality is 1; software CRF keeps 0.
+            "cq": 1 if _is_nvenc_codec(norm) else 0,
         }
     multiplier = {"Auto (Default)": 1, "Good": 2, "Best": 4}[quality_name]
     bit_depth = 10 if hdr_mode and _is_hdr_allowed_codec(codec) else 8
@@ -267,3 +301,28 @@ def resolve_encoding_quality(
         "target_bitrate_kbps": auto * multiplier,
         "cq": None,
     }
+
+
+def nvenc_rate_control_options(quality: dict) -> dict[str, str]:
+    """Keep NVENC Max explicit and independent of preset rate-control defaults."""
+    values = {"rc": "vbr"}
+    if quality["mode"] == "constant-quality":
+        cq = int(quality["cq"])
+        if cq <= 0:
+            raise ValueError("NVENC constant quality requires an explicit positive CQ.")
+        # CQ is a quality target, not a hard quantizer bound. Driver presets
+        # can otherwise choose much coarser QPs, even with a CQ target of 1.
+        values.update(cq=str(cq), qmin="0", qmax=str(cq))
+    return values
+
+
+def software_max_quality_options(encoder: str) -> dict[str, str]:
+    """Express the lowest quality factor through each software encoder's API."""
+    values = {"crf": "0"}
+    if encoder == "libsvtav1":
+        # FFmpeg's CRF/qp options only override SVT defaults when positive.
+        # The native parameter parser accepts zero and actually applies it.
+        values["svtav1-params"] = "crf=0"
+    elif encoder == "libaom-av1":
+        values["b"] = "0"
+    return values

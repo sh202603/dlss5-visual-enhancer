@@ -1,856 +1,472 @@
-"""``dlss5ve-cli`` command-line entry point.
+"""Small CLI surface over the application's existing processing workflow.
 
-Conventions:
-- stdout is reserved for machine-readable output (``--json`` payloads, ``info``).
-- progress and diagnostics go to stderr.
-- defaults come from config.ini, replaced by ``--preset`` when given; flags
-  override individual values on top of that. Validation of the values lives
-  in the processing layer and is not repeated here.
-- the effective UISettings are published to ``settings.storage.SETTINGS_STATE``
-  so that the GPU lookups the processors and previews do see the same values
-  the flags produced.
-- the ``--json`` payload is built from the batch result the processing layer
-  returns; since v8 the processing layer writes no manifest files, only the
-  session log (``logs/app-<stamp>.log``), whose path the payload carries as
-  ``log_path``.
-- since v9 the container follows the codec and, since v10, the memory path is
-  decided by the processing layer for every command (NVENC codecs stay on
-  CUDA, CPU codecs stage through system memory, images stay GPU-resident).
-  There are no flags for either.
-- ``--output-dir`` and ``--same-as-input`` are the two output destinations;
-  with the latter the batch publishes each file next to its source and the
-  payload reports ``"same as input"`` instead of a single directory.
-
-Exit codes: 0 all inputs succeeded, 1 some or all inputs failed, 2 usage error
-or missing input, 3 runtime or GPU unavailable, 130 interrupted by the user.
+Only the standard library is imported at startup. Help and version work without
+initializing Qt, GPU engines, logs, or application settings.
 """
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager, redirect_stdout
+from dataclasses import replace
+import glob
 import json
+import math
+import os
+from pathlib import Path
+import re
 import signal
 import sys
+import time
 import traceback
-from dataclasses import asdict, replace
-from pathlib import Path
-from typing import Any, Sequence
 
-from ..core.ffmpeg import CODEC_CHOICES, ENCODING_QUALITIES, FIXED_QUALITY_CODECS, container_for_codec
-from ..core.jobs import cancel_active_job
-from ..core.naming import RENAME_MODES
-from ..core.paths import CONFIG_PATH, ROOT
-from ..core.runtime import NR_STYLES, UPSCALING_MODES
-from ..frame_interpolation.models import ENGINE_CHOICES, FPS_CHOICES
-from ..settings.models import IMAGE_FORMAT_CHOICES, UISettings
-from ..settings.presets import import_settings_preset
-from ..settings.storage import SETTINGS_STATE, load_settings
-from ..upscale.video.models import HDR_PRECISIONS, SCALE_FACTORS
-from ..version import APP_VERSION, __version__
-from .progress import ProgressReporter
+from . import VERSION
+from .progress import ConsoleProgress
 
-EXIT_OK = 0
-EXIT_PARTIAL = 1
-EXIT_USAGE = 2
-EXIT_RUNTIME = 3
-EXIT_CANCELLED = 130
-
-# Ascending, unlike the UPSCALING_MODES mapping (which leads with Source), so
-# that --help, the argparse error message, and info --json all read in order.
-NR_SCALE_CHOICES = tuple(sorted(UPSCALING_MODES))
-
+IMAGE_FORMATS = {"png": "PNG", "jpg": "JPEG", "jpeg": "JPEG", "webp": "WebP",
+                 "avif": "AVIF", "tif": "TIFF", "tiff": "TIFF"}
+VIDEO_CODECS = {"h264": "H.264", "hevc": "H.265", "av1": "AV1",
+                "prores": "ProRes HQ", "ffv1": "FFV1 Lossless RGB 10-bit"}
+QUALITIES = {"auto": "Auto (Default)", "good": "Good", "best": "Best", "max": "Max"}
+DLSS_MODES = {"dlaa": "DLAA", "quality": "Quality", "balanced": "Balanced",
+              "performance": "Performance", "ultra-performance": "Ultra Performance"}
 
 class UsageError(ValueError):
-    """A problem the caller can fix by changing arguments or inputs."""
+    """Invalid arguments or configuration; exit status 2."""
 
+class Parser(argparse.ArgumentParser):
+    def error(self, message):
+        raise UsageError(message)
 
-# --------------------------------------------------------------------------- parser
+def finite_float(value):
+    try:
+        result = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("expected a number") from exc
+    if not math.isfinite(result):
+        raise argparse.ArgumentTypeError("expected a finite number")
+    return result
 
+def dimensions(value):
+    match = re.fullmatch(r"(\d+)[xX](\d+)", value)
+    if not match or not all(2 <= int(v) <= 16384 for v in match.groups()):
+        raise argparse.ArgumentTypeError("use WIDTHxHEIGHT, with each dimension from 2 to 16384")
+    return tuple(int(v) for v in match.groups())
 
-def _load_settings(argv: Sequence[str]) -> UISettings:
-    """Resolve config.ini plus an optional --preset before the real parser runs.
-
-    The full parser shows these values as defaults, so the preset must be known
-    before it is built.
-    """
-    pre = argparse.ArgumentParser(add_help=False)
-    pre.add_argument("--preset")
-    known, _rest = pre.parse_known_args(argv)
-    settings = load_settings(CONFIG_PATH)
-    if known.preset:
-        try:
-            _name, settings = import_settings_preset(known.preset, settings)
-        except ValueError as exc:
-            raise UsageError(f"--preset: {exc}") from exc
-    return settings
-
-
-def _add_common(parser: argparse.ArgumentParser, settings: UISettings) -> None:
-    group = parser.add_argument_group("common")
-    destination = group.add_mutually_exclusive_group()
-    destination.add_argument(
-        "--output-dir", metavar="DIR", default=None,
-        help="Directory for rendered files (default: outputs/ next to the runtime).",
-    )
-    destination.add_argument(
-        "--same-as-input", action="store_true",
-        help="Publish each rendered file next to its source instead of one output directory; a batch ZIP still goes to outputs/.",
-    )
-    group.add_argument(
-        "--preset", metavar="FILE",
-        help="Settings preset JSON exported from Settings; replaces config.ini values before flags apply.",
-    )
-    group.add_argument(
-        "--ai-gpu", metavar="UUID", default=settings.ai_gpu_uuid,
-        help="AI Processing GPU UUID from 'dlss5ve-cli info', or auto (default: %(default)s).",
-    )
-    group.add_argument(
-        "--video-gpu", metavar="UUID", default=settings.video_gpu_uuid,
-        help="Video Processing (NVENC) GPU UUID, or auto (default: %(default)s). Neural Rendering video with an NVENC codec encodes on the AI GPU and ignores this.",
-    )
-    group.add_argument("--json", action="store_true", help="Write the batch result as JSON to stdout.")
-    group.add_argument(
-        "--progress", choices=("text", "json", "none"), default="text",
-        help="Progress on stderr: text (one updating line plus a line per finished file), json (JSON Lines per file state), none (default: %(default)s).",
-    )
-    group.add_argument("--quiet", action="store_true", help="Suppress progress and the per-file summary on stderr.")
-
-
-def _add_neural(parser: argparse.ArgumentParser, settings: UISettings, *, video: bool) -> None:
-    group = parser.add_argument_group("neural rendering")
-    group.add_argument("--nr-style", choices=tuple(NR_STYLES), default=settings.nr_style, help="(default: %(default)s)")
-    group.add_argument("--nr-intensity", type=float, metavar="0..2", default=settings.nr_intensity, help="(default: %(default)s)")
-    group.add_argument("--nr-passes", type=int, metavar="1..4", default=settings.nr_passes, help="Multi Pass: number of Neural Rendering passes (default: %(default)s)")
-    group.add_argument("--local-tone", type=float, metavar="0..2", default=settings.local_tone_strength, help="Local Tone Strength (default: %(default)s)")
-    group.add_argument("--local-structure", type=float, metavar="0..2", default=settings.local_structure_strength, help="Local Structure Strength (default: %(default)s)")
-    group.add_argument("--skin-structure", type=float, metavar="-1..2", default=settings.skin_structure_strength, help="Skin Structure Strength; -1 is the native default (default: %(default)s)")
-    group.add_argument("--automatic-mask", action=argparse.BooleanOptionalAction, default=settings.automatic_mask, help="Experimental runtime-generated mask.")
-    scales = ", ".join(f"{factor:g}" for factor in NR_SCALE_CHOICES)
-    group.add_argument(
-        "--nr-scale", type=float, choices=NR_SCALE_CHOICES, metavar="FACTOR", default=settings.upscaling_factor,
-        help=f"Resolution entering Neural Rendering relative to the source: {scales}; below 1 is a Lanczos downscale, above 1 a Lanczos upscale, and the output keeps that size (default: %(default)s)",
-    )
-
-    composition = parser.add_argument_group("composition")
-    composition.add_argument("--color-strength", type=float, metavar="0..1", default=settings.nr_color_strength, help="NR Color Strength; 0 keeps the source colour (default: %(default)s)")
-    composition.add_argument("--tone-preservation", type=float, metavar="0..1", default=settings.tone_preservation, help="Tone Preservation; 1 keeps the source tone (default: %(default)s)")
-    composition.add_argument("--face-skin-protection", type=float, metavar="0..1", default=settings.face_skin_protection, help="(default: %(default)s)")
-    composition.add_argument("--grain-preservation", type=float, metavar="0..1", default=settings.grain_preservation, help="(default: %(default)s)")
-    composition.add_argument("--nr-mask", metavar="FILE", default=None, help="Custom NR Mask image; luminance times alpha limits where Neural Rendering is applied.")
-    composition.add_argument("--mask-feather", type=int, metavar="0..128", default=settings.mask_feather, help="Blur radius of the Custom NR Mask in output pixels (default: %(default)s)")
-    if video:
-        composition.add_argument("--shimmer-suppression", type=float, metavar="0..1", default=settings.shimmer_suppression, help="Temporal stabilization of fine detail between frames (default: %(default)s)")
-
-
-def _add_encoding(parser: argparse.ArgumentParser, codec: str, quality: str, hdr: bool | None) -> None:
-    """Codec flags; ``hdr`` is the HDR Mode default, or None when the command defines its own --hdr."""
-    group = parser.add_argument_group("encoding")
-    group.add_argument(
-        "--codec", choices=CODEC_CHOICES, default=codec,
-        help="(default: %(default)s); the container follows the codec: H.264 to MP4, H.265, AV1 and FFV1 to MKV, ProRes Proxy and ProRes HQ to MOV.",
-    )
-    fixed = ", ".join(sorted(FIXED_QUALITY_CODECS))
-    group.add_argument(
-        "--encoding-quality", choices=ENCODING_QUALITIES, default=quality,
-        help=f"(default: %(default)s); ignored by the fixed-quality codecs: {fixed}.",
-    )
-    if hdr is not None:
-        group.add_argument("--hdr", action=argparse.BooleanOptionalAction, default=hdr, help="10-bit output that keeps HDR metadata; 10-bit codecs only (H.265, AV1, ProRes Proxy, ProRes HQ, FFV1).")
-
-
-def _add_naming(parser: argparse.ArgumentParser, mode: str, suffix: str) -> None:
-    group = parser.add_argument_group("naming")
-    group.add_argument("--rename", choices=RENAME_MODES, default=mode, help="Auto adds a timestamp; Copy keeps the source name; Custom appends --suffix (default: %(default)s)")
-    group.add_argument("--suffix", default=suffix, help="Suffix for --rename Custom (default: %(default)s)")
-
-
-def _add_upscale_sizing(parser: argparse.ArgumentParser, settings: UISettings, prefix: str) -> None:
-    """RTX VSR quality and output size; defaults come from the upscale_* or upscale_image_* settings."""
-    def saved(name: str) -> Any:
-        return getattr(settings, prefix + name)
-
-    if saved("size_mode") == "Scale factor":
-        saved_size = f"{saved('scale_factor'):g}x from settings"
-    elif saved("aspect_lock"):
-        saved_size = f"{saved('width')} px wide from settings"
-    else:
-        saved_size = f"{saved('width')}x{saved('height')} from settings"
-    factors = ", ".join(f"{factor:g}" for _label, factor in SCALE_FACTORS)
-    group = parser.add_argument_group("sizing")
-    group.add_argument("--vsr-quality", type=int, metavar="1..4", default=saved("vsr_quality"), help="RTX Video Super Resolution quality (default: %(default)s)")
-    group.add_argument("--scale", type=float, metavar="FACTOR", default=None, help=f"Output size as a multiple of the source, at least 1; the app offers {factors} (default: {saved_size})")
-    group.add_argument("--width", type=int, metavar="PX", default=None, help="Output width in pixels instead of --scale; the height follows the source aspect ratio unless --no-aspect-lock.")
-    group.add_argument("--height", type=int, metavar="PX", default=None, help="Output height in pixels; used with --width and --no-aspect-lock.")
-    group.add_argument("--aspect-lock", action=argparse.BooleanOptionalAction, default=saved("aspect_lock"), help="Derive the height from --width and the source aspect ratio.")
-
-
-def _sizing_overrides(args: argparse.Namespace) -> dict[str, Any]:
-    """Translate --scale / --width / --height into the size_mode the Options use."""
-    overrides: dict[str, Any] = {"aspect_lock": bool(args.aspect_lock)}
-    custom = args.width is not None or args.height is not None
-    if args.scale is not None and custom:
-        raise UsageError("Use either --scale or --width/--height, not both.")
-    if args.scale is not None:
-        overrides.update(size_mode="Scale factor", scale_factor=args.scale)
-    elif custom:
-        if args.width is None:
-            raise UsageError("--height needs --width; with --aspect-lock the height follows the width.")
-        overrides.update(size_mode="Custom dimensions", width=args.width)
-        if args.height is not None:
-            overrides["height"] = args.height
-    return overrides
-
-
-_BANNER = f"dlss5ve-cli {__version__} (Visual Enhancer {APP_VERSION})"
-
-
-def _command(commands: Any, name: str, help_text: str) -> argparse.ArgumentParser:
-    """Add a subcommand whose --help and --version also show the version banner."""
-    parser = commands.add_parser(name, help=help_text, description=f"{_BANNER}: {help_text}")
-    parser.add_argument("--version", action="version", version=_BANNER)
+def build_parser():
+    parser = Parser(prog="VE_CLI.exe", description="Visual Enhancer for images and videos, from your terminal.",
+                    epilog="Run VE_CLI.exe COMMAND --help for options. Advanced settings: export a JSON preset from the app.")
+    parser.add_argument("--version", action="version", version=f"Visual Enhancer CLI {VERSION}")
+    commands = parser.add_subparsers(dest="command", metavar="COMMAND")
+    descriptions = {
+        "render": "Enhance images or videos with Neural Rendering or a GUI pipeline preset.",
+        "upscale": "Upscale images or videos with RTX Super Resolution or DLSS.",
+        "interpolate": "Increase video frame rate with DLSS Frame Generation.",
+    }
+    for name, description in descriptions.items():
+        command = commands.add_parser(name, help=description, description=description)
+        command.add_argument("inputs", nargs="+", metavar="INPUT", help="files, folders, or quoted wildcards")
+        command.add_argument("-o", "--output", metavar="PATH", help="output folder, or output filename for one input (default: app's outputs folder)")
+        command.add_argument("--preset", metavar="JSON", help="settings preset exported from the app; flags override its values")
+        command.add_argument("--recursive", action="store_true", help="include subfolders when scanning input folders")
+        command.add_argument("--gpu", metavar="ID", help="AI/video GPU: auto, NVIDIA index, or GPU UUID (see devices)")
+        if name != "interpolate":
+            command.add_argument("--format", choices=("png", "jpeg", "webp", "avif", "tiff"), help="image output format (default: PNG or preset value)")
+        command.add_argument("--codec", choices=tuple(VIDEO_CODECS), help="video codec (default: command/preset value)")
+        command.add_argument("--container", choices=("mp4", "mkv", "mov"), help="supported video container (default: command/preset value)")
+        command.add_argument("--quality", choices=tuple(QUALITIES), help="video encoding quality (default: auto or preset value)")
+        command.add_argument("--dry-run", action="store_true", help="show planned inputs, stages and output sizes without rendering")
+        command.add_argument("--quiet", action="store_true", help="hide progress; keep errors and the final result")
+        command.add_argument("--json", action="store_true", help="write one JSON result to stdout; progress/errors go to stderr")
+        if name == "render":
+            command.add_argument("--style", choices=("0", "1", "2"), help="Neural Rendering style (default: 0 or preset value)")
+            command.add_argument("--strength", type=finite_float, metavar="0..2", help="Neural Rendering intensity (default: 1 or preset value)")
+        elif name == "upscale":
+            command.add_argument("--engine", choices=("rtx", "dlss"), help="upscaling engine (default: rtx or preset value)")
+            size = command.add_mutually_exclusive_group()
+            size.add_argument("--scale", type=finite_float, metavar="FACTOR", help="RTX scale factor, at least 1 (default: 2 or preset value)")
+            size.add_argument("--size", type=dimensions, metavar="WIDTHxHEIGHT", help="RTX output dimensions; uses the exact size")
+            command.add_argument("--mode", choices=tuple(DLSS_MODES), help="DLSS mode (default: quality or preset value); controls output size")
+        else:
+            command.add_argument("--fps", metavar="FPS", help="target frame rate (default: 60 or preset value; e.g. 59.94, 120, 240)")
+    devices = commands.add_parser("devices", help="List NVIDIA GPUs and IDs for --gpu.", description="List NVIDIA GPUs and IDs for --gpu.")
+    devices.add_argument("--json", action="store_true", help="write GPU information as JSON")
     return parser
 
-
-def build_parser(settings: UISettings) -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        prog="dlss5ve-cli",
-        description=f"{_BANNER}: Neural Rendering for images and videos, DLSS Frame Generation, and RTX Video Super Resolution / HDR.",
-        epilog="Defaults come from config.ini (or --preset). Exit codes: 0 ok, 1 some inputs failed, 2 usage, 3 runtime/GPU unavailable, 130 interrupted.",
-    )
-    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__} (Visual Enhancer {APP_VERSION})")
-    commands = parser.add_subparsers(dest="command", metavar="COMMAND", required=True)
-    inputs_help = "Files, or folders whose supported files are processed in name order (subfolders excluded)."
-
-    image = _command(commands, "image", "Neural Rendering for images.")
-    image.add_argument("inputs", nargs="+", metavar="PATH", help=inputs_help)
-    _add_common(image, settings)
-    _add_neural(image, settings, video=False)
-    output = image.add_argument_group("output")
-    output.add_argument("--format", choices=IMAGE_FORMAT_CHOICES, default=settings.image_format, help="(default: %(default)s)")
-    output.add_argument("--quality", type=int, metavar="1..100", default=settings.image_quality, help="Lossy quality for JPEG, WebP, AVIF (default: %(default)s)")
-    output.add_argument("--zip", action="store_true", help="Also write a ZIP of the successful outputs next to them.")
-    _add_naming(image, settings.image_rename_mode, settings.image_custom_suffix)
-
-    video = _command(commands, "video", "Neural Rendering for videos.")
-    video.add_argument("inputs", nargs="+", metavar="PATH", help=inputs_help)
-    _add_common(video, settings)
-    _add_neural(video, settings, video=True)
-    _add_encoding(video, settings.codec, settings.quality, settings.hdr_mode)
-    _add_naming(video, settings.video_rename_mode, settings.video_custom_suffix)
-    output = video.add_argument_group("output")
-    output.add_argument("--zip", action="store_true", help="Also write a ZIP of the successful outputs next to them (two or more inputs).")
-    output.add_argument("--preview-seconds", type=float, metavar="SEC", help="Render only the first SEC seconds with the chosen codec.")
-    output.add_argument("--preview-frames", type=int, metavar="N", help="Render only the first N frames with the chosen codec.")
-
-    interpolate = _command(commands, "interpolate", "DLSS Frame Generation to a target frame rate.")
-    interpolate.add_argument("inputs", nargs="+", metavar="PATH", help=inputs_help)
-    _add_common(interpolate, settings)
-    frame = interpolate.add_argument_group("frame generation")
-    frame.add_argument("--fps", choices=FPS_CHOICES, default=settings.frame_interpolation_target_fps, help="(default: %(default)s)")
-    frame.add_argument("--engine", choices=ENGINE_CHOICES, default=settings.frame_interpolation_engine, help="(default: %(default)s)")
-    _add_encoding(
-        interpolate, settings.frame_interpolation_codec,
-        settings.frame_interpolation_quality, settings.frame_interpolation_hdr_mode,
-    )
-    _add_naming(interpolate, settings.frame_interpolation_rename_mode, settings.frame_interpolation_custom_suffix)
-    interpolate.add_argument("--preview-seconds", type=float, metavar="SEC", help="Interpolate only the first SEC seconds with the chosen codec.")
-
-    upscale_image = _command(commands, "upscale-image", "RTX Video Super Resolution for images.")
-    upscale_image.add_argument("inputs", nargs="+", metavar="PATH", help=inputs_help)
-    _add_common(upscale_image, settings)
-    _add_upscale_sizing(upscale_image, settings, "upscale_image_")
-    output = upscale_image.add_argument_group("output")
-    output.add_argument("--format", choices=IMAGE_FORMAT_CHOICES, default=settings.upscale_image_output_format, help="(default: %(default)s)")
-    output.add_argument("--quality", type=int, metavar="1..100", default=settings.upscale_image_quality, help="Lossy quality for JPEG, WebP, AVIF (default: %(default)s)")
-    output.add_argument("--preserve-metadata", action=argparse.BooleanOptionalAction, default=settings.upscale_image_preserve_metadata, help="Keep EXIF, DPI, and XMP metadata from the source.")
-    output.add_argument("--zip", action="store_true", help="Also write a ZIP of the successful outputs next to them.")
-    _add_naming(upscale_image, settings.upscale_image_rename_mode, settings.upscale_image_custom_suffix)
-
-    upscale_video = _command(commands, "upscale-video", "RTX Video Super Resolution and RTX Video HDR for videos.")
-    upscale_video.add_argument("inputs", nargs="+", metavar="PATH", help=inputs_help)
-    _add_common(upscale_video, settings)
-    _add_upscale_sizing(upscale_video, settings, "upscale_")
-    upscale_video.add_argument("--vsr", action=argparse.BooleanOptionalAction, default=settings.upscale_vsr_enabled, help="RTX Video Super Resolution; --no-vsr keeps the source size and applies only RTX Video HDR.")
-    hdr = upscale_video.add_argument_group("RTX Video HDR")
-    hdr.add_argument("--hdr", action=argparse.BooleanOptionalAction, default=settings.upscale_hdr_enabled, help="Convert SDR to HDR10 with RTX Video HDR; 10-bit codecs only (H.265, AV1, ProRes Proxy, ProRes HQ, FFV1).")
-    hdr.add_argument("--hdr-contrast", type=int, metavar="0..200", default=settings.upscale_hdr_contrast, help="(default: %(default)s)")
-    hdr.add_argument("--hdr-saturation", type=int, metavar="0..200", default=settings.upscale_hdr_saturation, help="(default: %(default)s)")
-    hdr.add_argument("--hdr-middle-gray", type=int, metavar="10..100", default=settings.upscale_hdr_middle_gray, help="(default: %(default)s)")
-    hdr.add_argument("--hdr-peak-luminance", type=int, metavar="400..2000", default=settings.upscale_hdr_peak_luminance, help="Display peak in nits (default: %(default)s)")
-    hdr.add_argument("--hdr-precision", choices=HDR_PRECISIONS, default=settings.upscale_hdr_precision, help="Frame format handed to the encoder (default: %(default)s)")
-    _add_encoding(upscale_video, settings.upscale_codec, settings.upscale_quality, None)
-    _add_naming(upscale_video, settings.upscale_rename_mode, settings.upscale_custom_suffix)
-    upscale_video.add_argument("--preview-seconds", type=float, metavar="SEC", help="Process only the first SEC seconds.")
-
-    info = _command(commands, "info", "Show the version, GPUs, encoders, the Neural Rendering bridge, frame-generation and RTX Video capabilities, and choices.")
-    info.add_argument("--json", action="store_true", help="Write the report as JSON instead of text.")
-    info.add_argument("--ai-gpu", metavar="UUID", default=settings.ai_gpu_uuid, help="GPU to probe for frame generation (default: %(default)s).")
-    info.add_argument("--preset", metavar="FILE", help=argparse.SUPPRESS)
-    return parser
-
-
-# --------------------------------------------------------------------------- commands
-
-
-def _resolve_inputs(values: Sequence[str], kind: str) -> list[Path]:
-    """Expand folders to their supported files; every file must exist."""
+def media_mode(path):
     from ..core.disk_paths import supported_file
 
-    paths: list[Path] = []
-    missing: list[str] = []
+    if supported_file(path, "image"):
+        return "Image"
+    if supported_file(path, "video"):
+        return "Video"
+    return None
+
+def collect_inputs(values, *, recursive=False, exclude=None):
+    paths, seen = [], set()
+    excluded = Path(exclude).resolve() if exclude else None
     for value in values:
-        path = Path(value)
-        if path.is_dir():
-            files = sorted(
-                (item for item in path.iterdir() if item.is_file() and supported_file(item, kind)),
-                key=lambda item: (item.name.casefold(), item.name),
-            )
-            if not files:
-                raise UsageError(f"No supported {kind} files in {path} (subfolders are excluded).")
-            paths.extend(files)
-        elif path.is_file():
-            paths.append(path)
-        else:
-            missing.append(str(path))
-    if missing:
-        raise UsageError("Input not found:\n" + "\n".join(missing))
+        if not value.strip():
+            raise UsageError("Input path cannot be empty.")
+        path = Path(value).expanduser()
+        literal = path.exists()
+        matches = [path] if literal else [Path(p) for p in sorted(glob.glob(str(path), recursive=recursive))]
+        if not matches:
+            raise UsageError(f"Input does not exist or wildcard matched no files: {value}")
+        accepted = 0
+        for match in matches:
+            if match.is_dir():
+                root = match.resolve()
+                if not literal and excluded and root.is_relative_to(excluded):
+                    continue
+                files = match.rglob("*") if recursive else match.iterdir()
+                candidates = sorted((p for p in files if p.is_file()), key=lambda p: (str(p).casefold(), str(p)))
+                candidates = [p for p in candidates if not (excluded and excluded != root and p.resolve().is_relative_to(excluded))]
+            elif match.is_file():
+                candidates = [match]
+                if not media_mode(match):
+                    if literal:
+                        raise UsageError(f"Unsupported image/video input: {match}")
+                    continue
+                if not literal and excluded and match.resolve().is_relative_to(excluded):
+                    continue
+            else:
+                raise UsageError(f"Input is not a file or folder: {match}")
+            for candidate in candidates:
+                if not media_mode(candidate):
+                    continue
+                accepted += 1
+                resolved = candidate.resolve()
+                key = os.path.normcase(str(resolved))
+                if key not in seen:
+                    seen.add(key)
+                    paths.append(resolved)
+        if not accepted:
+            raise UsageError(f"No supported images or videos found: {value}")
     return paths
 
-
-def _publish_settings(settings: UISettings, args: argparse.Namespace) -> UISettings:
-    """Make the effective settings visible to the processing layer.
-
-    The previews and the Live pipeline look up GPUs through settings.storage,
-    not through the Options they receive.
-    """
-    effective = replace(
-        settings,
-        ai_gpu_uuid=args.ai_gpu,
-        video_gpu_uuid=getattr(args, "video_gpu", settings.video_gpu_uuid),
-    )
-    with SETTINGS_STATE.lock:
-        SETTINGS_STATE.current = effective
-    return effective
-
-
-def _neural_overrides(args: argparse.Namespace) -> dict[str, Any]:
-    """The Neural Rendering flags as Options fields; the mask file is validated here."""
-    from ..core.nr_composition import inspect_nr_mask
-
-    try:
-        nr_mask = inspect_nr_mask(args.nr_mask)
-    except ValueError as exc:
-        raise UsageError(f"--nr-mask: {exc}") from exc
-    overrides = {
-        "ai_gpu_uuid": args.ai_gpu,
-        "nr_style": args.nr_style,
-        "nr_intensity": args.nr_intensity,
-        "nr_passes": args.nr_passes,
-        "local_tone_strength": args.local_tone,
-        "local_structure_strength": args.local_structure,
-        "skin_structure_strength": args.skin_structure,
-        "nr_color_strength": args.color_strength,
-        "tone_preservation": args.tone_preservation,
-        "face_skin_protection": args.face_skin_protection,
-        "grain_preservation": args.grain_preservation,
-        "mask_feather": args.mask_feather,
-        "nr_mask": nr_mask,
-        "automatic_mask": bool(args.automatic_mask),
-        "upscaling_factor": args.nr_scale,
-    }
-    if hasattr(args, "shimmer_suppression"):
-        overrides["shimmer_suppression"] = args.shimmer_suppression
-    return overrides
-
-
-def _check_video_like(options: Any, *, neural: bool) -> None:
-    """Reject bad arguments before any GPU work starts.
-
-    The batch functions turn per-file exceptions into failures (exit 1); an
-    argument typo should surface as a usage error instead, so the processing
-    layer's own validators run here first.
-    """
-    from ..core.ffmpeg import validate_codec_container
-    from ..core.naming import validate_rename
-    from ..core.runtime import resolve_native_settings, resolve_upscaling_mode
-
-    validate_codec_container(options.codec, options.container)
-    validate_rename(options.rename_mode, options.custom_suffix)
-    if neural:
-        resolve_native_settings(options)
-        resolve_upscaling_mode(options.upscaling_factor)
-    preview = getattr(options, "preview_seconds", None)
-    if preview is not None and not preview > 0:
-        raise UsageError("--preview-seconds must be a positive number of seconds.")
-    frames = getattr(options, "preview_frames", None)
-    if frames is not None and frames <= 0:
-        raise UsageError("--preview-frames must be a positive number of frames.")
-    if preview is not None and frames is not None:
-        raise UsageError("Use either --preview-seconds or --preview-frames, not both.")
-
-
-def _check_output_dir(value: str | None) -> str:
-    """Create or validate the output directory before any GPU work starts."""
-    from ..core.disk_paths import prepare_output_dir
-
-    try:
-        return str(prepare_output_dir(value))
-    except (OSError, ValueError) as exc:
-        raise UsageError(f"--output-dir: {exc}") from exc
-
-
-def _output_target(args: argparse.Namespace, *, archive: bool = False) -> tuple[bool, str]:
-    """Resolve the destination into (same_as_input, the reported directory).
-
-    ``--same-as-input`` publishes every item next to its own source, so no
-    single directory describes the batch and the payload carries a marker
-    instead. A batch ZIP still needs one directory, which stays --output-dir
-    (outputs/ by default) and is validated here even in that mode; ``zip_path``
-    then names the archive.
-    """
-    same = bool(getattr(args, "same_as_input", False))
-    if not same:
-        return False, _check_output_dir(args.output_dir)
-    if archive:
-        _check_output_dir(args.output_dir)
-    return True, "same as input"
-
-
-def _payload(command: str, result: Any, options: Any, output_directory: str, **extra: Any) -> dict[str, Any]:
-    """The batch result as one JSON document.
-
-    ``successes`` and ``failures`` are the processing layer's result
-    dataclasses; ``status`` uses one vocabulary for every command
-    (``success``, ``partial``, ``cancelled``). ``options`` replaces a Custom
-    NR Mask selection with its summary so no temporary path leaks.
-    """
-    from ..core.nr_composition import report_options
-
-    successes = [asdict(item) for item in result.successes]
-    failures = [asdict(item) for item in result.failures]
-    cancelled = bool(result.cancelled)
-    status = "cancelled" if cancelled else ("partial" if failures else "success")
-    has_mask = any(field == "nr_mask" for field in getattr(type(options), "__dataclass_fields__", {}))
-    return {
-        "command": command,
-        "status": status,
-        "cancelled": cancelled,
-        "output_directory": output_directory,
-        "log_path": result.manifest_path,
-        "options": report_options(options) if has_mask else asdict(options),
-        "successes": successes,
-        "failures": failures,
-        **extra,
-    }
-
-
-def run_image(args: argparse.Namespace, settings: UISettings, reporter: ProgressReporter) -> dict[str, Any]:
-    inputs = _resolve_inputs(args.inputs, "image")
-    try:
-        from ..neural_rendering.image import convert_images
-    except ImportError as exc:
-        raise RuntimeError(
-            f"Image decoding packages are missing ({exc.name}). Install with the 'image' extra: uv sync --extra image"
-        ) from exc
-    from ..core.runtime import resolve_native_settings, resolve_upscaling_mode
-    from ..settings.factory import image_options
-
-    options = image_options(
-        settings,
-        **_neural_overrides(args),
-        output_format=args.format,
-        quality=args.quality,
-        rename_mode=args.rename,
-        custom_suffix=args.suffix,
-    )
-    resolve_native_settings(options)
-    resolve_upscaling_mode(options.upscaling_factor)
-    same_as_input, output_directory = _output_target(args, archive=bool(args.zip))
-    reporter.register(inputs)
-    result = convert_images(
-        inputs, options, reporter, output_dir=args.output_dir, on_item_update=reporter.item_update,
-        # Preview thumbnails are a concern of the app's media viewer only.
-        generate_previews=False, create_zip=bool(args.zip), same_as_input=same_as_input,
-    )
-    return _payload("image", result, options, output_directory, zip_path=result.zip_path)
-
-
-def run_video(args: argparse.Namespace, settings: UISettings, reporter: ProgressReporter) -> dict[str, Any]:
-    inputs = _resolve_inputs(args.inputs, "video")
-    from ..settings.factory import video_options
-    from ..neural_rendering.video import convert_videos
-
-    options = video_options(
-        settings,
-        **_neural_overrides(args),
-        video_gpu_uuid=args.video_gpu,
-        codec=args.codec,
-        quality=args.encoding_quality,
-        hdr_mode=bool(args.hdr),
-        rename_mode=args.rename,
-        custom_suffix=args.suffix,
-        preview_seconds=args.preview_seconds,
-        preview_frames=args.preview_frames,
-        # The CLI has no browser to please: previews keep the caller's codec.
-        preview_compat=False,
-    )
-    _check_video_like(options, neural=True)
-    same_as_input, output_directory = _output_target(args, archive=bool(args.zip))
-    reporter.register(inputs)
-    result = convert_videos(
-        inputs, options, reporter, output_dir=args.output_dir, on_item_update=reporter.item_update,
-        create_archive=bool(args.zip), same_as_input=same_as_input,
-    )
-    return _payload(
-        "video", result, options, output_directory,
-        zip_path=result.archive_path, zip_error=result.archive_error or None,
-    )
-
-
-def run_interpolate(args: argparse.Namespace, settings: UISettings, reporter: ProgressReporter) -> dict[str, Any]:
-    inputs = _resolve_inputs(args.inputs, "video")
-    from ..frame_interpolation import interpolate_videos
-    from ..settings.factory import frame_interpolation_options
-
-    options = frame_interpolation_options(
-        settings,
-        ai_gpu_uuid=args.ai_gpu,
-        video_gpu_uuid=args.video_gpu,
-        target_fps=args.fps,
-        engine=args.engine,
-        codec=args.codec,
-        quality=args.encoding_quality,
-        hdr_mode=bool(args.hdr),
-        rename_mode=args.rename,
-        custom_suffix=args.suffix,
-        preview_seconds=args.preview_seconds,
-        preview_compat=False,
-    )
-    _check_video_like(options, neural=False)
-    options.target_rate  # raises ValueError for an unsupported FPS choice
-    same_as_input, output_directory = _output_target(args)
-    reporter.register(inputs)
-    result = interpolate_videos(
-        inputs, options, reporter, output_dir=args.output_dir, on_item_update=reporter.item_update,
-        same_as_input=same_as_input,
-    )
-    return _payload("interpolate", result, options, output_directory)
-
-
-def run_upscale_image(args: argparse.Namespace, settings: UISettings, reporter: ProgressReporter) -> dict[str, Any]:
-    inputs = _resolve_inputs(args.inputs, "image")
-    try:
-        from ..upscale.image.batch import upscale_images
-    except ImportError as exc:
-        raise RuntimeError(
-            f"Image decoding packages are missing ({exc.name}). Install with the 'image' extra: uv sync --extra image"
-        ) from exc
-    from ..settings.factory import upscale_image_options
-
-    options = upscale_image_options(
-        settings,
-        ai_gpu_uuid=args.ai_gpu,
-        vsr_quality=args.vsr_quality,
-        **_sizing_overrides(args),
-        output_format=args.format,
-        quality=args.quality,
-        preserve_metadata=bool(args.preserve_metadata),
-        rename_mode=args.rename,
-        custom_suffix=args.suffix,
-    )
-    options.validate()
-    same_as_input, output_directory = _output_target(args, archive=bool(args.zip))
-    reporter.register(inputs)
-    result = upscale_images(
-        inputs, options, reporter, output_dir=args.output_dir, on_item_update=reporter.item_update,
-        generate_previews=False, same_as_input=same_as_input,
-    )
-    zip_path = None
-    if args.zip and result.successes and not result.cancelled:
-        # The Upscale batch leaves the archive to its caller, unlike Neural Rendering.
-        from ..core.disk_paths import create_media_archive
-
-        zip_path = create_media_archive(
-            [item.output_path for item in result.successes], args.output_dir, "RTXVIDEO_IMAGE_BATCH",
-        )
-    return _payload("upscale-image", result, options, output_directory, zip_path=zip_path)
-
-
-def run_upscale_video(args: argparse.Namespace, settings: UISettings, reporter: ProgressReporter) -> dict[str, Any]:
-    inputs = _resolve_inputs(args.inputs, "video")
-    from ..settings.factory import upscale_video_options
-    from ..upscale.video.batch import upscale_videos
-
-    options = upscale_video_options(
-        settings,
-        ai_gpu_uuid=args.ai_gpu,
-        video_gpu_uuid=args.video_gpu,
-        vsr_enabled=bool(args.vsr),
-        vsr_quality=args.vsr_quality,
-        **_sizing_overrides(args),
-        hdr_enabled=bool(args.hdr),
-        hdr_contrast=args.hdr_contrast,
-        hdr_saturation=args.hdr_saturation,
-        hdr_middle_gray=args.hdr_middle_gray,
-        hdr_peak_luminance=args.hdr_peak_luminance,
-        hdr_precision=args.hdr_precision,
-        codec=args.codec,
-        quality=args.encoding_quality,
-        rename_mode=args.rename,
-        custom_suffix=args.suffix,
-        preview_seconds=args.preview_seconds,
-    )
-    options.validate()
-    same_as_input, output_directory = _output_target(args)
-    reporter.register(inputs)
-    result = upscale_videos(
-        inputs, options, reporter, output_dir=args.output_dir, on_item_update=reporter.item_update,
-        same_as_input=same_as_input,
-    )
-    return _payload("upscale-video", result, options, output_directory)
-
-
-def collect_info(ai_gpu_uuid: str) -> dict[str, Any]:
-    """Gather what a caller needs to choose arguments; each probe fails independently."""
-    from ..core.ffmpeg import probe_nvenc_codecs
+def selected_gpu(value):
     from ..core.gpu_detection import detect_gpus
-    from ..core.runtime import prepare_runtime, validate_runtime_files
-    from ..frame_interpolation.capabilities import probe_frame_interpolation_capabilities
 
-    report: dict[str, Any] = {
-        "version": __version__, "app_version": APP_VERSION, "root": str(ROOT), "config": str(CONFIG_PATH),
-    }
+    if value.casefold() == "auto":
+        return "auto"
+    for gpu in detect_gpus():
+        if value.casefold() in {str(gpu["index"]), gpu["uuid"].casefold()}:
+            if not gpu["ai_compatible"]:
+                raise UsageError(f"{gpu['name']} cannot run RTX processing. {gpu['compatibility_error']}")
+            return gpu["uuid"]
+    raise UsageError(f"Unknown GPU: {value}. Run VE_CLI.exe devices for available IDs.")
+
+def settings_for(args, modes):
+    from ..core.ffmpeg import container_for_codec, containers_for_codec
+    from ..settings.models import UISettings, _validate
+    from ..settings.presets import import_settings_preset
+
+    base = replace(UISettings(), image_rename_mode="Copy", video_rename_mode="Copy",
+                   upscale_image_rename_mode="Copy", upscale_rename_mode="Copy",
+                   frame_interpolation_rename_mode="Copy")
     try:
-        validate_runtime_files()
-        report["runtime_files"] = "ok"
-    except Exception as exc:
-        report["runtime_files"] = str(exc)
-    try:
-        gpus = [dict(gpu) for gpu in detect_gpus()]
-        for gpu in gpus:
-            try:
-                gpu["nvenc_codecs"] = list(probe_nvenc_codecs(int(gpu.get("cuda_ordinal", gpu["index"]))))
-            except Exception as exc:
-                gpu["nvenc_codecs"] = str(exc)
-        report["gpus"] = gpus
-    except Exception as exc:
-        report["gpus"] = str(exc)
-    try:
-        report["encoders"] = dict(prepare_runtime().encoder_inventory)
-    except Exception as exc:
-        report["encoders"] = str(exc)
-    try:
-        # Loading the bridge DLL reads its version and checks the frame ABI;
-        # NGX itself is initialized only by a render session (preload binds no
-        # adapter, unlike the frame-generation and RTX Video probes below).
-        from ..core.neural_bridge import BRIDGE_ABI_VERSION, BRIDGE_MANAGER
-        from ..core.paths import DLSSNR_BRIDGE
-
-        BRIDGE_MANAGER.preload()
-        report["neural_bridge"] = {
-            "path": str(DLSSNR_BRIDGE), "version": BRIDGE_MANAGER.version, "abi_version": BRIDGE_ABI_VERSION,
-        }
-    except Exception as exc:
-        report["neural_bridge"] = str(exc)
-    try:
-        report["frame_generation"] = asdict(probe_frame_interpolation_capabilities(ai_gpu_uuid))
-    except Exception as exc:
-        report["frame_generation"] = str(exc)
-    try:
-        from ..upscale.video.native import probe_capabilities
-
-        report["rtx_video"] = asdict(probe_capabilities(ai_gpu_uuid))
-    except Exception as exc:
-        report["rtx_video"] = str(exc)
-    report["choices"] = {
-        "nr_scale": list(NR_SCALE_CHOICES),
-        "nr_style": list(NR_STYLES),
-        "nr_passes": [1, 2, 3, 4],
-        "codec": list(CODEC_CHOICES),
-        "container_by_codec": {codec: container_for_codec(codec) for codec in CODEC_CHOICES},
-        "encoding_quality": list(ENCODING_QUALITIES),
-        "fixed_quality_codec": sorted(FIXED_QUALITY_CODECS),
-        "image_format": list(IMAGE_FORMAT_CHOICES),
-        "fps": list(FPS_CHOICES),
-        "engine": list(ENGINE_CHOICES),
-        "rename": list(RENAME_MODES),
-        "vsr_quality": [1, 2, 3, 4],
-        "upscale_scale": [factor for _label, factor in SCALE_FACTORS],
-        "hdr_precision": list(HDR_PRECISIONS),
-    }
-    return report
-
-
-def _print_info(report: dict[str, Any]) -> None:
-    out = sys.stdout
-    out.write(f"dlss5ve-cli {report['version']} | Visual Enhancer {report['app_version']}\n")
-    out.write(f"Root: {report['root']}\nConfig: {report['config']}\nRuntime files: {report['runtime_files']}\n\n")
-    gpus = report["gpus"]
-    if isinstance(gpus, str):
-        out.write(f"GPUs: {gpus}\n\n")
-    else:
-        out.write("GPUs:\n")
-        for gpu in gpus:
-            memory = float(gpu.get("memory_mb", 0)) / 1024
-            flag = "AI-compatible" if gpu.get("ai_compatible") else str(gpu.get("compatibility_error") or "not compatible")
-            out.write(f"  [{gpu.get('index')}] {gpu.get('name')} | {memory:.0f} GB | driver {gpu.get('driver')} | {flag}\n")
-            out.write(f"      uuid {gpu.get('uuid')} | PCI {gpu.get('pci_bus_id') or '?'} | CUDA ordinal {gpu.get('cuda_ordinal')}\n")
-            nvenc = gpu.get("nvenc_codecs")
-            out.write(f"      NVENC: {', '.join(nvenc) if isinstance(nvenc, list) and nvenc else (nvenc if isinstance(nvenc, str) else 'none')}\n")
-        out.write("\n")
-    encoders = report["encoders"]
-    if isinstance(encoders, dict):
-        available = [name for name, ok in encoders.items() if ok]
-        out.write(f"FFmpeg encoders: {', '.join(available) or 'none'}\n")
-    else:
-        out.write(f"FFmpeg encoders: {encoders}\n")
-    bridge = report["neural_bridge"]
-    if isinstance(bridge, dict):
-        out.write(f"Neural Rendering bridge: {bridge.get('version')} | frame ABI {bridge.get('abi_version')}\n")
-    else:
-        out.write(f"Neural Rendering bridge: {bridge}\n")
-    capabilities = report["frame_generation"]
-    if isinstance(capabilities, dict):
-        state = "available" if capabilities.get("available") else "unavailable"
-        out.write(
-            f"Frame generation: {state} | native {capabilities.get('native_multiplier')}x "
-            f"| cascade {'yes' if capabilities.get('cascade_available') else 'no'} "
-            f"| HAGS {'on' if capabilities.get('hags_enabled') else 'off'} "
-            f"| NVOF {'yes' if capabilities.get('nvof_available') else 'no'} "
-            f"| runtime {capabilities.get('runtime_version')} "
-            f"| bridge {capabilities.get('bridge_version')} (ABI {capabilities.get('bridge_abi_version')}) "
-            f"| CUDA interop {'yes' if capabilities.get('cuda_interop') else 'no'}\n"
-        )
-        if capabilities.get("detail"):
-            out.write(f"  {capabilities['detail']}\n")
-    else:
-        out.write(f"Frame generation: {capabilities}\n")
-    rtx_video = report["rtx_video"]
-    if isinstance(rtx_video, dict):
-        def state(capability: dict[str, Any]) -> str:
-            if capability.get("available"):
-                return "available"
-            return (
-                f"unavailable (needs driver {capability.get('min_driver_major', 0)}.{capability.get('min_driver_minor', 0)}, "
-                f"init result 0x{int(capability.get('init_result', 0) or 0):08X})"
-            )
-        out.write(
-            f"RTX Video: VSR {state(rtx_video.get('vsr') or {})} | HDR {state(rtx_video.get('hdr') or {})} "
-            f"| SDK {rtx_video.get('sdk_version')} | bridge {rtx_video.get('bridge_version')}\n"
-        )
-    else:
-        out.write(f"RTX Video: {rtx_video}\n")
-    out.write("\nChoices:\n")
-    for key, values in report["choices"].items():
-        if isinstance(values, dict):
-            out.write(f"  {key}: {', '.join(f'{name}={value}' for name, value in values.items())}\n")
-            continue
-        out.write(f"  {key}: {', '.join(f'{v:g}' if isinstance(v, float) else str(v) for v in values)}\n")
-
-
-def _summarize(payload: dict[str, Any], stream) -> None:
-    for item in payload["successes"]:
-        result = item.get("result", item)
-        stream.write(f"OK    {Path(item['input_path']).name} -> {result['output_path']}\n")
-    for item in payload["failures"]:
-        state = "STOP " if item.get("cancelled") else "FAIL "
-        error = str(item["error"]).splitlines()[0] if item["error"] else ""
-        stream.write(f"{state} {Path(item['input_path']).name}: {error}\n")
-    extra = f" | zip: {payload['zip_path']}" if payload.get("zip_path") else ""
-    if payload.get("zip_error"):
-        extra += f" | zip failed: {payload['zip_error']}"
-    stream.write(
-        f"{payload['status']}: {len(payload['successes'])} ok, {len(payload['failures'])} failed"
-        f" | output: {payload['output_directory']} | log: {payload['log_path']}{extra}\n"
-    )
-
-
-# --------------------------------------------------------------------------- entry
-
-
-class _StopOnInterrupt:
-    """First Ctrl+C asks the running batch to stop cleanly; the second one aborts."""
-
-    def __init__(self) -> None:
-        self.count = 0
-
-    def __call__(self, _signum: int, _frame: Any) -> None:
-        self.count += 1
-        if self.count == 1:
-            sys.stderr.write("\nStop requested; the current file is being cleaned up (Ctrl+C again to abort).\n")
-            cancel_active_job()
-            return
-        raise KeyboardInterrupt
-
-
-def _configure_streams() -> None:
-    for stream, kwargs in ((sys.stdout, {"encoding": "utf-8"}), (sys.stderr, {"errors": "replace"})):
-        try:
-            stream.reconfigure(**kwargs)  # type: ignore[attr-defined]
-        except (AttributeError, ValueError):
-            pass
-
-
-def main(argv: Sequence[str] | None = None) -> int:
-    argv = list(sys.argv[1:] if argv is None else argv)
-    _configure_streams()
-    try:
-        settings = _load_settings(argv)
-    except UsageError as exc:
-        sys.stderr.write(f"dlss5ve-cli: error: {exc}\n")
-        return EXIT_USAGE
-    parser = build_parser(settings)
-    args = parser.parse_args(argv)
-
-    if args.command == "info":
-        report = collect_info(args.ai_gpu)
-        if args.json:
-            sys.stdout.write(json.dumps(report, indent=2, default=str) + "\n")
+        settings = import_settings_preset(Path(args.preset).expanduser().resolve(), base)[1] if args.preset else base
+        if args.command == "render":
+            if not args.preset:
+                settings = replace(settings, image_enabled_stages=("neural_model",), video_enabled_stages=("neural_model",))
+            changes = {}
+            if args.style:
+                changes["nr_style"] = "Style " + args.style
+            if args.strength is not None:
+                changes["nr_intensity"] = args.strength
+            if changes and any("neural_model" not in (settings.image_enabled_stages if mode == "Image" else settings.video_enabled_stages) for mode in modes):
+                raise UsageError("The preset disables Neural Rendering. Enable it in the preset before using --style or --strength.")
+            settings = replace(settings, **changes)
+        elif args.command == "upscale":
+            image_engine = settings.upscale_image_engine
+            video_engine = settings.upscale_engine
+            if args.engine:
+                image_engine = video_engine = "DLSS" if args.engine == "dlss" else "RTX Video Super Resolution"
+            engines = [image_engine if mode == "Image" else video_engine for mode in modes]
+            if any(engine == "DLSS" for engine in engines) and (args.scale is not None or args.size):
+                raise UsageError("DLSS output size is set by --mode. --scale and --size require --engine rtx.")
+            if args.mode and any(engine != "DLSS" for engine in engines):
+                raise UsageError("--mode requires --engine dlss.")
+            settings = replace(settings,
+                image_enabled_stages=("dlss_super_resolution" if image_engine == "DLSS" else "super_resolution",),
+                video_enabled_stages=("dlss_super_resolution" if video_engine == "DLSS" else "super_resolution",),
+                upscale_image_engine=image_engine, upscale_engine=video_engine,
+                image_format=settings.upscale_image_output_format, image_quality=settings.upscale_image_quality,
+                codec=settings.upscale_codec, container=settings.upscale_container,
+                quality=settings.upscale_quality, hdr_mode=False,
+                image_rename_mode=settings.upscale_image_rename_mode, image_custom_suffix=settings.upscale_image_custom_suffix,
+                video_rename_mode=settings.upscale_rename_mode, video_custom_suffix=settings.upscale_custom_suffix)
+            if args.scale is not None:
+                settings = replace(settings, upscale_image_size_mode="Scale factor", upscale_size_mode="Scale factor",
+                                   upscale_image_scale_factor=args.scale, upscale_scale_factor=args.scale)
+            if args.size:
+                width, height = args.size
+                settings = replace(settings, upscale_image_size_mode="Custom dimensions", upscale_size_mode="Custom dimensions",
+                                   upscale_image_width=width, upscale_image_height=height, upscale_width=width, upscale_height=height,
+                                   upscale_image_aspect_lock=False, upscale_aspect_lock=False)
+            if args.mode:
+                settings = replace(settings, upscale_image_dlss_mode=DLSS_MODES[args.mode], upscale_dlss_mode=DLSS_MODES[args.mode])
         else:
-            _print_info(report)
-        return EXIT_OK
+            if "Image" in modes:
+                raise UsageError("interpolate accepts videos only. Use render or upscale for images.")
+            settings = replace(settings, video_enabled_stages=("frame_generation",),
+                               frame_interpolation_target_fps=args.fps or settings.frame_interpolation_target_fps,
+                               codec=settings.frame_interpolation_codec, container=settings.frame_interpolation_container,
+                               quality=settings.frame_interpolation_quality, hdr_mode=settings.frame_interpolation_hdr_mode,
+                               video_rename_mode=settings.frame_interpolation_rename_mode,
+                               video_custom_suffix=settings.frame_interpolation_custom_suffix)
+        changes = {}
+        if getattr(args, "format", None):
+            if "Image" not in modes:
+                raise UsageError("--format is for image output. Use --container for video output.")
+            changes["image_format"] = IMAGE_FORMATS[args.format]
+        if args.codec or args.container or args.quality:
+            if "Video" not in modes:
+                raise UsageError("--codec, --container and --quality are video options; use --format for images.")
+        if args.codec:
+            changes["codec"] = VIDEO_CODECS[args.codec]
+            if not args.container and settings.container not in containers_for_codec(changes["codec"]):
+                changes["container"] = container_for_codec(changes["codec"])
+        if args.container:
+            changes["container"] = args.container.upper()
+        if args.quality:
+            changes["quality"] = QUALITIES[args.quality]
+        if args.gpu:
+            gpu_uuid = selected_gpu(args.gpu)
+            changes.update(ai_gpu_uuid=gpu_uuid, video_gpu_uuid=gpu_uuid)
+        return _validate(replace(settings, **changes))
+    except ValueError as exc:
+        raise UsageError(str(exc)) from exc
 
-    settings = _publish_settings(settings, args)
-    reporter = ProgressReporter("none" if args.quiet else args.progress)
-    handlers = {
-        "image": run_image, "video": run_video, "interpolate": run_interpolate,
-        "upscale-image": run_upscale_image, "upscale-video": run_upscale_video,
-    }
-    interrupt = _StopOnInterrupt()
-    previous = signal.signal(signal.SIGINT, interrupt)
+def plan_outputs(paths, settings, output, args):
+    from ..core.ffmpeg import resolve_container
+    from ..core.naming import output_filename, unique_output_path
+    from ..core.paths import OUTPUTS
+    from ..neural_rendering.image.models import IMAGE_EXTENSIONS
+    from ..settings.models import _validate
+
+    target = Path(output).expanduser().resolve() if output else OUTPUTS
+    explicit = bool(output and not target.is_dir() and target.suffix.lower()[1:] in {*IMAGE_FORMATS, "mp4", "mkv", "mov"})
+    if target.exists() and not target.is_dir():
+        raise UsageError(f"Output already exists: {target}. Choose another name.")
+    if explicit:
+        if len(paths) != 1:
+            raise UsageError("An output filename requires exactly one input. Use an output folder for batches.")
+        extension = target.suffix.lower()[1:]
+        if media_mode(paths[0]) == "Image":
+            if extension not in IMAGE_FORMATS:
+                raise UsageError("Image input requires an image output filename.")
+            if args.format and IMAGE_FORMATS[args.format] != IMAGE_FORMATS[extension]:
+                raise UsageError("--format does not match the output filename extension.")
+            settings = replace(settings, image_format=IMAGE_FORMATS[extension])
+        else:
+            if extension not in {"mp4", "mkv", "mov"}:
+                raise UsageError("Video input requires an MP4, MKV or MOV output filename.")
+            if args.container and args.container != extension:
+                raise UsageError("--container does not match the output filename extension.")
+            settings = replace(settings, container=extension.upper())
+        try:
+            settings = _validate(settings)
+        except ValueError as exc:
+            raise UsageError(str(exc)) from exc
+        return settings, [target], target.parent
+    reserved, destinations = set(), []
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    for source in paths:
+        image = media_mode(source) == "Image"
+        extension = IMAGE_EXTENSIONS[settings.image_format] if image else "." + resolve_container(
+            settings.codec, settings.container).lower()
+        filename = output_filename(source, extension,
+                                   settings.image_rename_mode if image else settings.video_rename_mode,
+                                   settings.image_custom_suffix if image else settings.video_custom_suffix,
+                                   f"{source.stem}_Pipeline_{stamp}")
+        destination = unique_output_path(target / filename, reserved)
+        reserved.add(destination)
+        destinations.append(destination)
+    return settings, destinations, target
+
+@contextmanager
+def cancellation_signals(controller):
+    old = {}
+
+    def cancel(_signum, _frame):
+        # The processors poll this event and terminate their registered children.
+        # Do not take the controller's process-list lock inside a signal handler.
+        controller.cancel.set()
+
     try:
-        payload = handlers[args.command](args, settings, reporter)
-    except KeyboardInterrupt:
-        reporter.finish()
-        sys.stderr.write("Aborted.\n")
-        return EXIT_CANCELLED
-    except UsageError as exc:
-        reporter.finish()
-        sys.stderr.write(f"dlss5ve-cli: error: {exc}\n")
-        return EXIT_USAGE
-    except (ValueError, FileNotFoundError, TypeError) as exc:
-        reporter.finish()
-        sys.stderr.write(f"dlss5ve-cli: error: {exc}\n")
-        return EXIT_USAGE
-    except RuntimeError as exc:
-        reporter.finish()
-        sys.stderr.write(f"dlss5ve-cli: runtime error: {exc}\n")
-        return EXIT_RUNTIME
-    except Exception:
-        reporter.finish()
-        traceback.print_exc()
-        return EXIT_PARTIAL
+        for name in ("SIGINT", "SIGBREAK"):
+            if hasattr(signal, name):
+                sig = getattr(signal, name)
+                old[sig] = signal.signal(sig, cancel)
+        yield
     finally:
-        signal.signal(signal.SIGINT, previous)
+        for sig, handler in old.items():
+            signal.signal(sig, handler)
 
-    reporter.finish()
-    if not args.quiet:
-        _summarize(payload, sys.stderr)
-    if args.json:
-        sys.stdout.write(json.dumps(payload, indent=2, default=str) + "\n")
-    if payload["status"] == "cancelled":
-        return EXIT_CANCELLED
-    return EXIT_PARTIAL if payload["failures"] else EXIT_OK
+def dry_run(paths, destinations, settings):
+    from ..core.ffmpeg import probe_video
+    from ..desktop.workflow import enabled_stages, estimate_pipeline
+    from ..neural_rendering.image.decoder import _open_pillow_source
 
+    jobs = []
+    for path, output in zip(paths, destinations):
+        mode = media_mode(path)
+        if mode == "Image":
+            image, _ = _open_pillow_source(path)
+            try:
+                width, height = image.size
+                if image.getexif().get(274) in {5, 6, 7, 8}:
+                    width, height = height, width
+            finally:
+                image.close()
+            fps, hdr = 0.0, False
+        else:
+            metadata = probe_video(path, count_mode="metadata")
+            width, height, fps, hdr = (int(metadata["width"]), int(metadata["height"]),
+                                       float(metadata["fps"]), bool(metadata.get("hdr")))
+        estimate = estimate_pipeline(width, height, fps, hdr, settings, mode)
+        jobs.append({"input_path": str(path), "output_path": str(output), "media_type": mode.lower(),
+                     "stages": [*enabled_stages(settings, mode), "export"],
+                     "width": estimate.width, "height": estimate.height, "fps": estimate.fps, "hdr": estimate.hdr})
+    return jobs
 
-if __name__ == "__main__":
-    raise SystemExit(main())
+def run_jobs(paths, destinations, settings, console):
+    from ..core import app_log
+    from ..core.batch_progress import BatchProgress
+    from ..core.disk_paths import prepare_output_dir
+    from ..core.jobs import Cancelled, JobController, use_job_controller
+    from ..desktop.workflow import preflight_capabilities, render_item
+
+    controller = JobController()
+    reporter = BatchProgress(paths, console)
+    capability_errors, checked = {}, set()
+    started = time.monotonic()
+    log_path = str(app_log.init_session())
+    app_log.info("cli", f"start: {len(paths)} file(s)")
+    try:
+        with cancellation_signals(controller), use_job_controller(controller):
+            for index, (source, destination) in enumerate(zip(paths, destinations)):
+                if controller.cancel.is_set():
+                    break
+                reporter.advance(index)
+                mode = media_mode(source)
+                try:
+                    if mode not in checked:
+                        try:
+                            preflight_capabilities(settings, mode, controller)
+                        except Exception as exc:
+                            capability_errors[mode] = exc
+                        checked.add(mode)
+                    if mode in capability_errors:
+                        raise capability_errors[mode]
+                    if controller.cancel.is_set():
+                        raise Cancelled("Stopped by user.")
+                    prepare_output_dir(destination.parent)
+                    rendered = render_item(source, settings, mode, destination, controller,
+                        lambda value, detail, i=index: reporter.advance(i, value, detail),
+                        capabilities_checked=True)
+                    reporter.complete(index, rendered)
+                except Exception as exc:
+                    cancelled = isinstance(exc, Cancelled) or controller.cancel.is_set()
+                    reporter.fail(index, exc, cancelled=cancelled)
+                    app_log.fail("cli", f"cli-{time.time_ns()}", exc, {"traceback": traceback.format_exc()})
+                    if cancelled:
+                        controller.cancel.set()
+                        break
+        if controller.cancel.is_set():
+            reporter.skip_from(0)
+        reporter.finish(cancelled=controller.cancel.is_set(), manifest_path=log_path)
+    finally:
+        controller.terminate_processes()
+        console.finish()
+    items = [{"input_path": item.input_path, "output_path": item.output_path,
+              "state": item.state.lower(), "error": item.detail if item.state in {"Failed", "Cancelled"} else "",
+              "elapsed_seconds": round(item.elapsed_seconds, 3)} for item in reporter.items]
+    failed = sum(item.state == "Failed" for item in reporter.items)
+    completed = sum(item.state == "Complete" for item in reporter.items)
+    cancelled = controller.cancel.is_set()
+    status = 130 if cancelled else 1 if failed else 0
+    app_log.info("cli", f"done: {completed} completed, {failed} failed, cancelled={cancelled}")
+    return status, {"total": len(paths), "completed": completed, "failed": failed,
+                    "skipped": sum(item.state == "Skipped" for item in reporter.items),
+                    "cancelled": cancelled, "elapsed_seconds": round(time.monotonic() - started, 3),
+                    "items": items, "log_path": log_path}
+
+def emit_error(message, *, status, json_output):
+    if json_output:
+        print(json.dumps({"schema_version": 1, "ok": False, "exit_code": status, "error": str(message)}, ensure_ascii=False))
+    print(f"Error: {message}", file=sys.stderr)
+    if status == 2 and not json_output:
+        print("Run VE_CLI.exe COMMAND --help for usage.", file=sys.stderr)
+    return status
+
+def main(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    parser = build_parser()
+    json_output = "--json" in argv
+    try:
+        if not argv:
+            parser.print_help()
+            return 0
+        try:
+            args = parser.parse_args(argv)
+        except SystemExit as exc:
+            return int(exc.code or 0)
+        if not args.command:
+            raise UsageError("Choose a command: render, upscale, interpolate, or devices.")
+        if args.command == "devices":
+            from ..core.gpu_detection import detect_gpus
+
+            gpus = list(detect_gpus())
+            if json_output:
+                print(json.dumps({"schema_version": 1, "ok": True, "devices": gpus}, ensure_ascii=False))
+            else:
+                for gpu in gpus:
+                    print(f"{gpu['index']}  {gpu['name']}  ({gpu['memory_mb'] / 1024:.1f} GB VRAM)")
+                    print(f"   {gpu['uuid']} | Driver {gpu['driver']} | RTX processing: {'yes' if gpu['ai_compatible'] else 'unavailable'}")
+            return 0
+        from ..core.paths import OUTPUTS
+
+        output = Path(args.output).expanduser().resolve() if args.output else OUTPUTS
+        paths = collect_inputs(args.inputs, recursive=args.recursive, exclude=output)
+        settings = settings_for(args, {media_mode(p) for p in paths})
+        settings, destinations, folder = plan_outputs(paths, settings, args.output, args)
+        if args.dry_run:
+            try:
+                jobs = dry_run(paths, destinations, settings)
+            except (ValueError, OSError) as exc:
+                raise UsageError(str(exc)) from exc
+            result = {"schema_version": 1, "ok": True, "command": args.command, "dry_run": True, "total": len(paths), "items": jobs}
+            if json_output:
+                print(json.dumps(result, ensure_ascii=False))
+            else:
+                for index, job in enumerate(jobs):
+                    fps = f" | {job['fps']:g} FPS" if job["fps"] else ""
+                    print(f"[{index + 1}/{len(jobs)}] {job['input_path']}\n  -> {job['output_path']}\n  {job['width']}x{job['height']}{fps} | {' -> '.join(job['stages'])}")
+                print("Plan only. Hardware availability is checked when rendering.")
+            return 0
+        from ..core import app_log
+
+        console = ConsoleProgress(paths, sys.stderr, quiet=args.quiet)
+        # Engine chatter belongs in the application log. stdout stays usable by
+        # scripts, including when the shared engines emit diagnostic messages.
+        with redirect_stdout(app_log.SessionStream()):
+            status, result = run_jobs(paths, destinations, settings, console)
+        result.update(schema_version=1, ok=status == 0, exit_code=status, command=args.command)
+        if json_output:
+            print(json.dumps(result, ensure_ascii=False))
+        else:
+            label = "Cancelled" if result["cancelled"] else "Completed"
+            print(f"{label}: {result['completed']}/{result['total']} files in {result['elapsed_seconds']:.1f}s; {result['failed']} failed.")
+            if result["completed"]:
+                print(f"Output: {destinations[0] if len(paths) == 1 else folder}")
+            if status:
+                print(f"Log: {result['log_path']}")
+        return status
+    except UsageError as exc:
+        return emit_error(exc, status=2, json_output=json_output)
+    except KeyboardInterrupt:
+        return emit_error("Stopped by user.", status=130, json_output=json_output)
+    except Exception as exc:
+        return emit_error(exc, status=1, json_output=json_output)

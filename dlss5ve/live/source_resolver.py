@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import av
 import subprocess
 import time
 from fractions import Fraction
@@ -9,7 +10,7 @@ from urllib.parse import urlparse
 
 from ..core import app_log
 from ..core.jobs import Cancelled, JobController
-from ..core.paths import FFPROBE, YTDLP
+from ..core.paths import FFPROBE, YTDLP, APP_TEMP
 from .models import LIVE_SOURCE_QUALITY_CHOICES, ResolvedSource
 
 
@@ -92,7 +93,8 @@ def resolve_source(raw: str, max_height: int,
     if not YTDLP.is_file():
         raise RuntimeError(f"yt-dlp is missing: {YTDLP}")
     source_height = max_height if source_quality == "Auto" else int(source_quality)
-    result = run_capture([str(YTDLP), "--no-playlist", "--no-warnings", "--skip-download",
+    result = run_capture([str(YTDLP), "--cache-dir", str(APP_TEMP / "yt-dlp"),
+        "--no-playlist", "--no-warnings", "--skip-download",
         "--dump-single-json", "--socket-timeout", "15", "--retries", "2", "-f",
         f"bv*[height<={source_height}]+ba/b[height<={source_height}]/b", text], controller, 90)
     if result.returncode:
@@ -152,9 +154,15 @@ def probe_source(source: ResolvedSource, controller: JobController, timeout: flo
     duration = float((data.get("format") or {}).get("duration") or video.get("duration") or 0)
     if source.kind == "direct" and duration > 0:
         source.is_live = False
+    pixel_format = video.get("pix_fmt") or "unknown"
+    try:
+        depth = max(component.bits for component in av.VideoFormat(pixel_format).components)
+    except (ValueError, TypeError):
+        depth = int(video.get("bits_per_raw_sample") or 8)
     return {"width": width, "height": height, "coded_width": int(video["width"]),
             "coded_height": int(video["height"]), "rotation": rotation % 360,
-            "rate": fps, "duration": duration,
+            "rate": fps, "duration": duration, "pixel_format": pixel_format, "depth": depth,
+            "chroma_location": video.get("chroma_location") or "unknown",
             "color_space": video.get("color_space") or "unknown",
             "color_range": video.get("color_range") or "unknown",
             "color_primaries": video.get("color_primaries") or "unknown",

@@ -4,8 +4,10 @@ import math
 from dataclasses import dataclass, field, fields
 from fractions import Fraction
 
-from ...core.ffmpeg import CODEC_CHOICES, ENCODING_QUALITIES, container_for_codec, hdr_mode_supported, validate_codec_container
+from ...core.ffmpeg import CODEC_CHOICES, ENCODING_QUALITIES, hdr_mode_supported, resolve_container, validate_codec_container
 from ...core.naming import validate_rename
+from ...core.dlss_modes import UPSCALE_ENGINES, dlss_output_size, validate_dlss
+from ...core.runtime import OPTICAL_FLOW_QUALITIES
 
 VSR_QUALITIES = [("1 - Low", 1), ("2 - Medium", 2), ("3 - High", 3), ("4 - Ultra", 4)]
 SCALE_FACTORS = [("1×", 1.0), ("1.5×", 1.5), ("2×", 2.0), ("3×", 3.0), ("4×", 4.0)]
@@ -17,6 +19,10 @@ TEXTURE_LIMIT = 16384
 
 @dataclass(slots=True)
 class UpscaleOptions:
+    engine: str = "RTX Video Super Resolution"
+    dlss_mode: str = "Quality"
+    dlss_preset: str = "Default"
+    optical_flow_quality: str = "High"
     vsr_enabled: bool = True
     vsr_quality: int = 4
     size_mode: str = "Scale factor"
@@ -30,18 +36,24 @@ class UpscaleOptions:
     hdr_middle_gray: int = 50
     hdr_peak_luminance: int = 1000
     hdr_precision: str = "Packed 10-bit"
-    codec: str = "H.265 (NVIDIA NVENC)"
+    codec: str = "H.265"
     container: str = "MKV"
     quality: str = "Auto (Default)"
     rename_mode: str = "Auto"
     custom_suffix: str = "_Upscale"
     ai_gpu_uuid: str = "auto"
     video_gpu_uuid: str = "auto"
+    prefer_nvenc: bool = True
     preview_seconds: float | None = None
     preview_frames: int | None = None
 
     def validate(self, *, for_render: bool = True) -> None:
-        for name in ("vsr_enabled", "hdr_enabled", "aspect_lock"):
+        if self.engine not in UPSCALE_ENGINES:
+            raise ValueError(f"Unknown upscale engine: {self.engine!r}.")
+        validate_dlss(self.dlss_mode, self.dlss_preset)
+        if not isinstance(self.optical_flow_quality, str) or self.optical_flow_quality not in OPTICAL_FLOW_QUALITIES:
+            raise ValueError("Optical Flow Quality must be High, Medium, or Low.")
+        for name in ("vsr_enabled", "hdr_enabled", "aspect_lock", "prefer_nvenc"):
             if not isinstance(getattr(self, name), bool):
                 raise ValueError(f"{name} must be on or off.")
         for name, low, high in (
@@ -63,7 +75,7 @@ class UpscaleOptions:
         if for_render:
             validate_codec_container(self.codec, self.container)
         validate_rename(self.rename_mode, self.custom_suffix)
-        if for_render and not (self.vsr_enabled or self.hdr_enabled):
+        if for_render and self.engine != "DLSS" and not (self.vsr_enabled or self.hdr_enabled):
             raise ValueError("Enable RTX Video Super Resolution or RTX Video HDR.")
         if self.hdr_enabled and not hdr_mode_supported(self.codec):
             raise ValueError("RTX Video HDR requires a 10-bit or higher video codec.")
@@ -81,21 +93,29 @@ class UpscaleOptions:
 
 
 SETTING_FIELDS = tuple(f.name for f in fields(UpscaleOptions) if f.name not in {
-    "ai_gpu_uuid", "video_gpu_uuid", "preview_seconds", "preview_frames",
+    "ai_gpu_uuid", "video_gpu_uuid", "prefer_nvenc", "preview_seconds", "preview_frames",
 })
 
 
 def options_from_settings(settings) -> UpscaleOptions:
+    from ...core.gpu_selection import prefer_cuda_video
+
     values = {name: getattr(settings, "upscale_" + name) for name in SETTING_FIELDS}
-    values["container"] = container_for_codec(values["codec"])
+    values["container"] = resolve_container(values["codec"], values["container"])
     return UpscaleOptions(**values,
-                          ai_gpu_uuid=settings.ai_gpu_uuid, video_gpu_uuid=settings.video_gpu_uuid)
+                          ai_gpu_uuid=settings.ai_gpu_uuid, video_gpu_uuid=settings.video_gpu_uuid,
+                           prefer_nvenc=prefer_cuda_video(settings.ffmpeg_device,
+                                                           settings.ai_gpu_uuid,
+                                                           settings.video_gpu_uuid))
 
 
 def output_size(width: int, height: int, options: UpscaleOptions, sar: Fraction = Fraction(1)) -> tuple[int, int, str]:
     """Return square-pixel output dimensions; width drives a locked custom size."""
     options.validate()
     display_width = width * float(sar)
+    if options.engine == "DLSS":
+        ow, oh = dlss_output_size(math.ceil(display_width), height, options.dlss_mode, even=True)
+        return ow, oh, ""
     if not options.vsr_enabled:
         w, h = display_width, float(height)
     elif options.size_mode == "Scale factor":
@@ -104,7 +124,7 @@ def output_size(width: int, height: int, options: UpscaleOptions, sar: Fraction 
         w = float(options.width)
         h = w * height / display_width if options.aspect_lock else float(options.height)
     if not math.isfinite(w) or not math.isfinite(h) or max(w, h) > TEXTURE_LIMIT:
-        raise ValueError("Requested output exceeds D3D11's 16384-pixel texture dimension. Choose a smaller size.")
+        raise ValueError("Requested output exceeds RTX Video's 16384-pixel texture limit. Choose a smaller size.")
     # All offered delivery codecs accept even dimensions. Never round below source.
     ow, oh = max(2, math.ceil(w / 2) * 2), max(2, math.ceil(h / 2) * 2)
     if options.vsr_enabled and (ow < math.ceil(display_width) or oh < height):
@@ -120,7 +140,6 @@ class UpscaleCapabilities:
     vsr: dict
     hdr: dict
     sdk_version: str = "1.1.0"
-    worker_version: str = "1.0.0"
     bridge_version: str = ""
     bridge_status: dict = field(default_factory=dict)
 
